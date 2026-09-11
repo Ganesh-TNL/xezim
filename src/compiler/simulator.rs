@@ -5373,6 +5373,12 @@ pub struct Simulator {
     /// This avoids O(num_signals) scan in settle_combinatorial.
     dirty_list: Vec<usize>,
     dirty_any: bool,
+    /// Set while the settle loop runs a two-state entry: its stores append
+    /// to `dirty_list` directly, without the `dirty_signals` dedup flag (a
+    /// random access into a 35M-entry table per store on c906). The loop
+    /// re-reads and clears that span right after the entry, and
+    /// `trigger_deps!` dedups by entry, so duplicates are harmless.
+    ts_direct_writes: bool,
     /// When true, signal_table has been modified and signals HashMap is stale.
     table_modified: bool,
     /// Scratch buffer reused across event_loop iters: positions (into
@@ -8831,6 +8837,7 @@ impl Simulator {
             dirty_signals: vec![false; num_signals],
             dirty_list: Vec::new(),
             dirty_any: false,
+            ts_direct_writes: false,
             table_modified: false,
             toggled_clock_positions: Vec::new(),
             edge_scan_scanned: 0,
@@ -20875,11 +20882,15 @@ impl Simulator {
     /// Wide writeback: mirrors ts_store's bookkeeping via Value::set_words128.
     fn ts_store_wide(&mut self, id: usize, v: [u64; 2]) {
         if self.signal_table[id].set_words128(v) {
-            if !self.dirty_signals[id] {
+            if self.ts_direct_writes {
+                if self.dirty_list.last() != Some(&id) {
+                    self.dirty_list.push(id);
+                }
+            } else if !self.dirty_signals[id] {
                 self.dirty_signals[id] = true;
                 self.dirty_list.push(id);
+                self.dirty_any = true;
             }
-            self.dirty_any = true;
             self.table_modified = true;
             self.after_signal_write(id);
         }
@@ -22033,11 +22044,15 @@ impl Simulator {
             return;
         }
         self.sync_mirror(id);
-        if !self.dirty_signals[id] {
+        if self.ts_direct_writes {
+            if self.dirty_list.last() != Some(&id) {
+                self.dirty_list.push(id);
+            }
+        } else if !self.dirty_signals[id] {
             self.dirty_signals[id] = true;
             self.dirty_list.push(id);
+            self.dirty_any = true;
         }
-        self.dirty_any = true;
         self.table_modified = true;
         self.after_signal_write(id);
     }
@@ -22057,11 +22072,15 @@ impl Simulator {
             self.signal_table[id] = val;
         }
         self.sync_mirror(id);
-        if !self.dirty_signals[id] {
+        if self.ts_direct_writes {
+            if self.dirty_list.last() != Some(&id) {
+                self.dirty_list.push(id);
+            }
+        } else if !self.dirty_signals[id] {
             self.dirty_signals[id] = true;
             self.dirty_list.push(id);
+            self.dirty_any = true;
         }
-        self.dirty_any = true;
         self.table_modified = true;
         self.after_signal_write(id);
     }
@@ -22079,11 +22098,15 @@ impl Simulator {
             self.signal_table[id] = val;
         }
         self.sync_mirror(id);
-        if !self.dirty_signals[id] {
+        if self.ts_direct_writes {
+            if self.dirty_list.last() != Some(&id) {
+                self.dirty_list.push(id);
+            }
+        } else if !self.dirty_signals[id] {
             self.dirty_signals[id] = true;
             self.dirty_list.push(id);
+            self.dirty_any = true;
         }
-        self.dirty_any = true;
         self.table_modified = true;
         self.after_signal_write(id);
     }
@@ -22103,11 +22126,15 @@ impl Simulator {
                 self.signal_table[id] = val;
                 self.sync_mirror(id);
             }
-            if !self.dirty_signals[id] {
+            if self.ts_direct_writes {
+                if self.dirty_list.last() != Some(&id) {
+                    self.dirty_list.push(id);
+                }
+            } else if !self.dirty_signals[id] {
                 self.dirty_signals[id] = true;
                 self.dirty_list.push(id);
+                self.dirty_any = true;
             }
-            self.dirty_any = true;
             self.table_modified = true;
             self.after_signal_write(id);
         }
@@ -49539,7 +49566,10 @@ impl Simulator {
                 if self.proc_depth == 0 {
                     let arena_kind = self.ts_hdr.get(eidx).map_or(0, |h| h.kind());
                     if arena_kind != 0 {
-                        if self.ts_guard_and_exec_arena(eidx) {
+                        self.ts_direct_writes = true;
+                        let ok = self.ts_guard_and_exec_arena(eidx);
+                        self.ts_direct_writes = false;
+                        if ok {
                             ts_fast = true;
                             n_dc += 1;
                             if self.trace_comb_paths {
@@ -49548,7 +49578,10 @@ impl Simulator {
                         }
                     } else if let Some(CombPlan::Ts(ts)) = self.comb_plan.get(eidx) {
                         let tp: *const super::bytecode::TwoStateBlock = std::sync::Arc::as_ptr(ts);
-                        if self.ts_guard_and_exec(unsafe { &*tp }) {
+                        self.ts_direct_writes = true;
+                        let ok = self.ts_guard_and_exec(unsafe { &*tp });
+                        self.ts_direct_writes = false;
+                        if ok {
                             ts_fast = true;
                             n_dc += 1;
                             if self.trace_comb_paths {
@@ -50012,8 +50045,12 @@ impl Simulator {
                         let sig_id = self.dirty_list[di];
                         // Consume the dirty flag — we're propagating it now.
                         // If the signal gets dirtied again later, it'll be
-                        // re-pushed to dirty_list with a fresh flag.
-                        self.dirty_signals[sig_id] = false;
+                        // re-pushed to dirty_list with a fresh flag. A
+                        // two-state entry never set the flag (direct
+                        // writes), so it skips the clear.
+                        if !ts_fast {
+                            self.dirty_signals[sig_id] = false;
+                        }
                         trigger_deps!(sig_id, eidx);
                     }
                 }
