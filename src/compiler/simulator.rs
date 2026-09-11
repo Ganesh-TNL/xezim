@@ -20366,6 +20366,9 @@ impl Simulator {
                         self.comb_plan_abortn[eidx].saturating_add(1);
                     if self.comb_plan_abortn[eidx] >= TS_ABORT_DEMOTE {
                         self.comb_plan[eidx] = CombPlan::Interp;
+                        if let Some(h) = self.ts_hdr.get_mut(eidx) {
+                            h.kind = 0;
+                        }
                     }
                 }
                 // Dynamic guard bail (force on a target, X input): the
@@ -49008,9 +49011,7 @@ impl Simulator {
                 if self.proc_depth == 0 {
                     let arena_kind = self.ts_hdr.get(eidx).map_or(0, |h| h.kind);
                     if arena_kind != 0 {
-                        if matches!(self.comb_plan.get(eidx), Some(CombPlan::Ts(_)))
-                            && self.ts_guard_and_exec_arena(eidx)
-                        {
+                        if self.ts_guard_and_exec_arena(eidx) {
                             ts_fast = true;
                             n_dc += 1;
                             if self.trace_comb_paths {
