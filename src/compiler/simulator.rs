@@ -5403,6 +5403,10 @@ pub struct Simulator {
     census_enabled: bool,
     census_counts: Vec<u64>,
     census_pairs: Vec<u64>,
+    /// Two-state executor census (opcode-census builds only): adjacent
+    /// opcode pairs and singles by variant name.
+    #[cfg(feature = "opcode-census")]
+    ts_census: std::collections::HashMap<(&'static str, &'static str), u64>,
     /// Clock-tree dedup (see `build_edge_sig_groups`). `edge_group_of` is
     /// parallel to `edge_signal_ids`: the group a POSITION belongs to, or
     /// `u32::MAX` for a signal that must be checked on its own. Members of one
@@ -5760,7 +5764,13 @@ pub struct Simulator {
     /// XEZIM_COMB_PATHS=1: per-comb-entry settle-path counters
     /// [two_state, jit, interpreter], dumped ranked at end of sim.
     trace_comb_paths: bool,
-    comb_path_counts: Vec<[u64; 3]>,
+    /// Per entry: [two-state execs, jit execs, interp execs, interp insns].
+    comb_path_counts: Vec<[u64; 4]>,
+    /// Last interp-path entry noted and the VM insn counter at that point
+    /// (the delta at the next note is charged to it).
+    comb_path_last: Option<(usize, u64)>,
+    /// XEZIM_COMB_PATHS: per edge block [interp fires, interp VM insns].
+    edge_path_counts: Vec<[u64; 2]>,
     prof_fallback_by_reason: HashMap<Arc<str>, (u64, u64)>,
     prof_settle_dc_ns: u64,
     prof_settle_ca_ns: u64,
@@ -8831,6 +8841,8 @@ impl Simulator {
             census_enabled: std::env::var_os("XEZIM_OPCODE_CENSUS").is_some(),
             census_counts: Vec::new(),
             census_pairs: Vec::new(),
+            #[cfg(feature = "opcode-census")]
+            ts_census: std::collections::HashMap::new(),
             sig_to_edge_pos: Vec::new(),
             edge_group_of: Vec::new(),
             edge_group_memo: Vec::new(),
@@ -8975,6 +8987,8 @@ impl Simulator {
                 || std::env::var("XEZIM_PROFILE_REPORT").ok().as_deref() == Some("1"),
             trace_comb_paths: std::env::var("XEZIM_COMB_PATHS").ok().as_deref() == Some("1"),
             comb_path_counts: Vec::new(),
+            comb_path_last: None,
+            edge_path_counts: Vec::new(),
             prof_fallback_by_reason: HashMap::default(),
             prof_settle_dc_ns: 0,
             prof_settle_ca_ns: 0,
@@ -20496,9 +20510,15 @@ impl Simulator {
     #[inline]
     fn note_comb_path(&mut self, eidx: usize, path: usize) {
         if eidx >= self.comb_path_counts.len() {
-            self.comb_path_counts.resize(eidx + 1, [0; 3]);
+            self.comb_path_counts.resize(eidx + 1, [0; 4]);
+        }
+        if let Some((last, at)) = self.comb_path_last.take() {
+            self.comb_path_counts[last][3] += self.prof_insns_executed.saturating_sub(at);
         }
         self.comb_path_counts[eidx][path] += 1;
+        if path == 2 {
+            self.comb_path_last = Some((eidx, self.prof_insns_executed));
+        }
     }
 
     /// XEZIM_COMB_PATHS=1 end-of-sim report: comb entries ranked by
@@ -20509,23 +20529,27 @@ impl Simulator {
         if !self.trace_comb_paths {
             return;
         }
-        let mut ranked: Vec<(usize, [u64; 3])> = self
+        let mut ranked: Vec<(usize, [u64; 4])> = self
             .comb_path_counts
             .iter()
             .enumerate()
             .filter(|(_, c)| c[2] > 0)
             .map(|(i, c)| (i, *c))
             .collect();
-        ranked.sort_by_key(|(_, c)| std::cmp::Reverse(c[2]));
-        let tot: [u64; 3] = self.comb_path_counts.iter().fold([0; 3], |mut a, c| {
+        // XEZIM_COMB_PATHS_BY=insns ranks by interpreted VM instructions
+        // (the cost proxy) instead of interp-path evaluations.
+        let by_insns = std::env::var("XEZIM_COMB_PATHS_BY").as_deref() == Ok("insns");
+        ranked.sort_by_key(|(_, c)| std::cmp::Reverse(if by_insns { c[3] } else { c[2] }));
+        let tot: [u64; 4] = self.comb_path_counts.iter().fold([0; 4], |mut a, c| {
             a[0] += c[0];
             a[1] += c[1];
             a[2] += c[2];
+            a[3] += c[3];
             a
         });
         eprintln!(
-            "[COMBPATH] totals: two_state={} jit={} interp={} ({} entries interp-bound)",
-            tot[0], tot[1], tot[2], ranked.len()
+            "[COMBPATH] totals: two_state={} jit={} interp={} interp_insns={} ({} entries interp-bound)",
+            tot[0], tot[1], tot[2], tot[3], ranked.len()
         );
         let mut bail_hist: HashMap<&'static str, u64> = HashMap::default();
         let mut jit_bail_hist: HashMap<&'static str, u64> = HashMap::default();
@@ -20567,6 +20591,11 @@ impl Simulator {
                 let (bi, op) = super::bytecode::ts_last_bail();
                 (op, bi)
             };
+            if rank < 6 && bail == "RawHazard" {
+                for (k, insn) in compiled.instructions.iter().enumerate() {
+                    eprintln!("[COMBPATH]     insn[{k}]  {:?}", insn);
+                }
+            }
             if rank < 12 && bail_i != usize::MAX {
                 let lo = bail_i.saturating_sub(2);
                 let hi = (bail_i + 2).min(compiled.instructions.len());
@@ -20624,8 +20653,8 @@ impl Simulator {
             }
             let scope = entry.cold.scope_hint.as_deref().unwrap_or("?");
             eprintln!(
-                "[COMBPATH] #{rank} eidx={eidx} interp={} ts={} jit={} insns={} bail={} scope={}",
-                c[2], c[0], c[1], compiled.instructions.len(), bail, scope
+                "[COMBPATH] #{rank} eidx={eidx} interp={} ts={} jit={} insns={} vm_insns={} bail={} scope={}",
+                c[2], c[0], c[1], compiled.instructions.len(), c[3], bail, scope
             );
         }
         let mut bh: Vec<_> = bail_hist.into_iter().collect();
@@ -20906,7 +20935,17 @@ impl Simulator {
                 bail!();
             }};
         }
+        #[cfg(feature = "opcode-census")]
+        let census_on = self.census_enabled;
+        #[cfg(feature = "opcode-census")]
+        let mut census_prev: &'static str = "^";
         while pc < insns_len {
+            #[cfg(feature = "opcode-census")]
+            if census_on {
+                let nm = super::bytecode::ts_insn_name(unsafe { &*insns_ptr.add(pc) });
+                *self.ts_census.entry((census_prev, nm)).or_insert(0) += 1;
+                census_prev = nm;
+            }
             match unsafe { &*insns_ptr.add(pc) } {
                 TsInsn::LoadSig { d, sig } => {
                     // Plane-direct: one flat load vs the Value discriminant
@@ -21025,6 +21064,30 @@ impl Simulator {
                 }
                 TsInsn::Neq { d, a, b } => {
                     regs[*d as usize] = (regs[*a as usize] != regs[*b as usize]) as u64;
+                }
+                TsInsn::CmpS { d, a, b, kind, sa, sb } => {
+                    let x = ((regs[*a as usize] << *sa) as i64) >> *sa;
+                    let y = ((regs[*b as usize] << *sb) as i64) >> *sb;
+                    regs[*d as usize] = match *kind {
+                        0 => x < y,
+                        1 => x <= y,
+                        2 => x > y,
+                        _ => x >= y,
+                    } as u64;
+                }
+                TsInsn::BitStoreNbaDyn { sig, i, s, w } => {
+                    let idx = regs[*i as usize];
+                    if idx < *w as u64 {
+                        let bit = regs[*s as usize] & 1;
+                        self.ts_bit_store_nba(*sig as usize, idx as u32, bit);
+                    }
+                }
+                TsInsn::BitDyn { d, s, i, w } => {
+                    let idx = regs[*i as usize];
+                    if idx >= *w as u64 {
+                        return false;
+                    }
+                    regs[*d as usize] = (regs[*s as usize] >> idx) & 1;
                 }
                 TsInsn::Lt { d, a, b } => {
                     regs[*d as usize] = ((regs[*a as usize]) < (regs[*b as usize])) as u64;
@@ -21434,7 +21497,17 @@ impl Simulator {
                 return false;
             }};
         }
+        #[cfg(feature = "opcode-census")]
+        let census_on = self.census_enabled;
+        #[cfg(feature = "opcode-census")]
+        let mut census_prev: &'static str = "^";
         for insn in insns {
+            #[cfg(feature = "opcode-census")]
+            if census_on {
+                let nm = super::bytecode::ts_insn_name(insn);
+                *self.ts_census.entry((census_prev, nm)).or_insert(0) += 1;
+                census_prev = nm;
+            }
             unsafe { match insn {
                 TsInsn::LoadSig { d, sig } => {
                     // Plane-direct: one flat load vs the Value discriminant
@@ -21553,6 +21626,30 @@ impl Simulator {
                 }
                 TsInsn::Neq { d, a, b } => {
                     r!(*d) = (r!(*a) != r!(*b)) as u64;
+                }
+                TsInsn::CmpS { d, a, b, kind, sa, sb } => {
+                    let x = ((r!(*a) << *sa) as i64) >> *sa;
+                    let y = ((r!(*b) << *sb) as i64) >> *sb;
+                    r!(*d) = match *kind {
+                        0 => x < y,
+                        1 => x <= y,
+                        2 => x > y,
+                        _ => x >= y,
+                    } as u64;
+                }
+                TsInsn::BitStoreNbaDyn { sig, i, s, w } => {
+                    let idx = r!(*i);
+                    if idx < *w as u64 {
+                        let bit = r!(*s) & 1;
+                        self.ts_bit_store_nba(*sig as usize, idx as u32, bit);
+                    }
+                }
+                TsInsn::BitDyn { d, s, i, w } => {
+                    let idx = r!(*i);
+                    if idx >= *w as u64 {
+                        return false;
+                    }
+                    r!(*d) = (r!(*s) >> idx) & 1;
                 }
                 TsInsn::Lt { d, a, b } => {
                     r!(*d) = (r!(*a) < r!(*b)) as u64;
@@ -21900,6 +21997,34 @@ impl Simulator {
         }
     }
 
+    /// `sig[idx] <= bit` from the two-state executors: merge into the
+    /// pending NBA entry when one exists, else seed from the signal with
+    /// eval-time elision (mirrors `RangeStoreNba` for a one-bit window).
+    fn ts_bit_store_nba(&mut self, id: usize, idx: u32, bit: u64) {
+        if let Some(i) = self.nba_fast_index.get(id) {
+            let target = &mut self.nba_fast[i].value;
+            let (base_v, base_x) = target.raw_bits();
+            let (new_v, new_x) = Self::compose_inline_range_bits(base_v, base_x, bit, 0, idx, idx);
+            target.set_inline_bits(new_v, new_x);
+            target.is_signed = self.signal_signed[id];
+        } else {
+            let (base_v, base_x) = self.signal_table[id].raw_bits();
+            let (new_v, new_x) = Self::compose_inline_range_bits(base_v, base_x, bit, 0, idx, idx);
+            if new_v == base_v && new_x == base_x {
+                self.prof_nba_elided += 1;
+            } else {
+                let mut nv = Value::from_inline(new_v, new_x, self.signal_widths[id]);
+                nv.is_signed = self.signal_signed[id];
+                self.nba_fast_index.insert(id, self.nba_fast.len());
+                self.nba_fast.push(NbaFast {
+                    block_index: 0,
+                    signal_id: id,
+                    value: nv,
+                });
+            }
+        }
+    }
+
     fn ts_store_nba(&mut self, id: usize, v: u64, w: u32) {
         let val = Value::from_u64(v, w);
         if let Some(i) = self.nba_fast_index.get(id) {
@@ -21939,7 +22064,17 @@ impl Simulator {
         let insns_ptr = insns.as_ptr();
         let insns_len = insns.len();
         let mut pc = 0usize;
+        #[cfg(feature = "opcode-census")]
+        let census_on = self.census_enabled;
+        #[cfg(feature = "opcode-census")]
+        let mut census_prev: &'static str = "^";
         while pc < insns_len {
+            #[cfg(feature = "opcode-census")]
+            if census_on {
+                let nm = super::bytecode::ts_insn_name(unsafe { &*insns_ptr.add(pc) });
+                *self.ts_census.entry((census_prev, nm)).or_insert(0) += 1;
+                census_prev = nm;
+            }
             match unsafe { &*insns_ptr.add(pc) } {
                 TsInsn::LoadSig { d, sig } => {
                     // Plane-direct: one flat load vs the Value discriminant
@@ -22058,6 +22193,30 @@ impl Simulator {
                 }
                 TsInsn::Neq { d, a, b } => {
                     regs[*d as usize] = (regs[*a as usize] != regs[*b as usize]) as u64;
+                }
+                TsInsn::CmpS { d, a, b, kind, sa, sb } => {
+                    let x = ((regs[*a as usize] << *sa) as i64) >> *sa;
+                    let y = ((regs[*b as usize] << *sb) as i64) >> *sb;
+                    regs[*d as usize] = match *kind {
+                        0 => x < y,
+                        1 => x <= y,
+                        2 => x > y,
+                        _ => x >= y,
+                    } as u64;
+                }
+                TsInsn::BitStoreNbaDyn { sig, i, s, w } => {
+                    let idx = regs[*i as usize];
+                    if idx < *w as u64 {
+                        let bit = regs[*s as usize] & 1;
+                        self.ts_bit_store_nba(*sig as usize, idx as u32, bit);
+                    }
+                }
+                TsInsn::BitDyn { d, s, i, w } => {
+                    let idx = regs[*i as usize];
+                    if idx >= *w as u64 {
+                        return false;
+                    }
+                    regs[*d as usize] = (regs[*s as usize] >> idx) & 1;
                 }
                 TsInsn::Lt { d, a, b } => {
                     regs[*d as usize] = (regs[*a as usize] < regs[*b as usize]) as u64;
@@ -25374,8 +25533,61 @@ impl Simulator {
             self.vm_regs.resize(num_regs, Value::zero(1));
         }
         let insns = unsafe { std::slice::from_raw_parts(insns_ptr, insns_len) };
+        if self.trace_comb_paths {
+            let at = self.prof_insns_executed;
+            self.exec_insns(insns);
+            if block_idx >= self.edge_path_counts.len() {
+                self.edge_path_counts.resize(block_idx + 1, [0; 2]);
+            }
+            self.edge_path_counts[block_idx][0] += 1;
+            self.edge_path_counts[block_idx][1] += self.prof_insns_executed - at;
+            return true;
+        }
         self.exec_insns(insns);
         true
+    }
+
+    /// XEZIM_COMB_PATHS=1 end-of-sim report for EDGE blocks that ran on the
+    /// interpreter: ranked by VM instructions, with the two-state bail.
+    fn dump_edge_paths(&mut self) {
+        if !self.trace_comb_paths || self.edge_path_counts.is_empty() {
+            return;
+        }
+        let mut ranked: Vec<(usize, [u64; 2])> = self
+            .edge_path_counts
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c[1] > 0)
+            .map(|(i, c)| (i, *c))
+            .collect();
+        ranked.sort_by_key(|(_, c)| std::cmp::Reverse(c[1]));
+        let tot: u64 = ranked.iter().map(|(_, c)| c[1]).sum();
+        eprintln!("[EDGEPATH] interp edge blocks={} vm_insns={}", ranked.len(), tot);
+        for (rank, (bi, c)) in ranked.iter().take(40).enumerate() {
+            let Some(Some(cb)) = self.compiled_edge_blocks.get(*bi) else { continue };
+            let lowered = super::bytecode::lower_two_state(
+                cb,
+                &self.signal_widths,
+                &self.signal_signed,
+                &self.signal_real,
+                &self.array_first_id,
+            );
+            let (bail, bail_i) = if lowered.is_some() {
+                ("(lowers; guard/abort)", usize::MAX)
+            } else {
+                let (i, op) = super::bytecode::ts_last_bail();
+                (op, i)
+            };
+            let scope = self.edge_block_scope.get(*bi).and_then(|s| s.as_deref()).unwrap_or("?");
+            eprintln!(
+                "[EDGEPATH] #{rank} block={bi} fires={} vm_insns={} insns={} bail={}@{} why={} scope={}",
+                c[0], c[1], cb.instructions.len(), bail, bail_i, super::bytecode::ts_last_gate(), scope
+            );
+            if rank < 12 {
+                let ops: Vec<&'static str> = cb.instructions.iter().map(super::bytecode::insn_opcode_name).collect();
+                eprintln!("[EDGEPATH]     {}", ops.join(" "));
+            }
+        }
     }
 
     /// Core bytecode VM loop.
@@ -37209,6 +37421,7 @@ impl Simulator {
             );
         }
         self.dump_comb_paths();
+        self.dump_edge_paths();
         self.dump_template_census();
         self.dump_island_census();
         self.dump_cycle_census();
@@ -37294,6 +37507,25 @@ impl Simulator {
                     c,
                     100.0 * c as f64 / total as f64
                 );
+            }
+        }
+        #[cfg(feature = "opcode-census")]
+        if self.census_enabled && !self.ts_census.is_empty() {
+            let total: u64 = self.ts_census.values().sum::<u64>().max(1);
+            let mut singles: std::collections::HashMap<&'static str, u64> = std::collections::HashMap::new();
+            for (&(_, b), &c) in self.ts_census.iter() {
+                *singles.entry(b).or_insert(0) += c;
+            }
+            let mut sv: Vec<_> = singles.into_iter().collect();
+            sv.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+            eprintln!("[TS-CENSUS] total_insns={}", total);
+            for &(n, c) in sv.iter().take(25) {
+                eprintln!("[TS-CENSUS] op {:>16} {:>14} ({:.1}%)", n, c, 100.0 * c as f64 / total as f64);
+            }
+            let mut pv: Vec<_> = self.ts_census.iter().map(|(k, c)| (*k, *c)).collect();
+            pv.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+            for &((a, b), c) in pv.iter().take(40) {
+                eprintln!("[TS-CENSUS] pair {:>16} -> {:<16} {:>13} ({:.1}%)", a, b, c, 100.0 * c as f64 / total as f64);
             }
         }
         if self.event_measure && self.event_gateable_total > 0 {

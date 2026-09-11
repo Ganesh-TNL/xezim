@@ -51,6 +51,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_COACT_MIN", "Phase 2: minimum same-slot ratio for a fusion edge (default 0.9)"),
     ("XEZIM_COMB_OPS", "Profiling: with COMB_PATHS, emit the per-block opcode SET of each interp-bound entry (two-state closure analysis)"),
     ("XEZIM_COMB_PATHS", "Profiling: count settle path (two-state/JIT/interp) per comb entry; ranked dump at end"),
+    ("XEZIM_COMB_PATHS_BY", "Profiling: `insns` ranks the COMB_PATHS dump by interpreted VM instructions instead of evaluations"),
     ("XEZIM_COMB_PATHS_TOP", "Profiling: how many ranked interp-bound entries the COMB_PATHS histograms cover (0 = all, default 40)"),
     ("XEZIM_COMMIT_PLAN", "Signal commits: enable experimental per-destination sidecar specialization (1 enables)"),
     ("XEZIM_COMPILE_FAIL_STATS", "Bytecode: print why statements failed to compile (bail census)"),

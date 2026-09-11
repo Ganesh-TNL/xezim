@@ -12769,6 +12769,28 @@ pub struct TsNbaFromElem {
 /// One two-state instruction. Register file is `u64`; every value is kept
 /// masked to its static width by construction. Branch targets are indices
 /// into the LOWERED stream (remapped from the 4-state stream's indices).
+/// Variant name of a two-state instruction (census / diagnostics only).
+#[cfg(feature = "opcode-census")]
+pub fn ts_insn_name(i: &TsInsn) -> &'static str {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static NAMES: Mutex<Option<HashMap<String, &'static str>>> = Mutex::new(None);
+    let dbg = format!("{:?}", i);
+    let key: String = dbg
+        .split(|c: char| c == ' ' || c == '{' || c == '(')
+        .next()
+        .unwrap_or("?")
+        .to_string();
+    let mut g = NAMES.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    if let Some(s) = m.get(&key) {
+        return s;
+    }
+    let leaked: &'static str = Box::leak(key.clone().into_boxed_str());
+    m.insert(key, leaked);
+    leaked
+}
+
 #[derive(Debug, Clone)]
 pub enum TsInsn {
     /// regs[d] = signal_table[sig] (raw value bits; proven X-free by the
@@ -12813,6 +12835,17 @@ pub enum TsInsn {
     MaskEq { d: u16, s: u16, mask: u64, v: u64 },
     Neq { d: u16, a: u16, b: u16 },
     Lt { d: u16, a: u16, b: u16 },
+    /// Signed relational compare (§11.8.1: both operands signed). `sa`/`sb`
+    /// are the shifts that sign-extend each operand from its static width;
+    /// `kind`: 0 `<`, 1 `<=`, 2 `>`, 3 `>=`.
+    CmpS { d: u16, a: u16, b: u16, kind: u8, sa: u8, sb: u8 },
+    /// `sig[regs[i]] <= regs[s]` (§11.5.1: an out-of-range index writes
+    /// nothing); merges into the pending entry like `RangeStoreNba`.
+    BitStoreNbaDyn { sig: u32, i: u16, s: u16, w: u32 },
+    /// `d = regs[s][regs[i]]` on a narrow register. An out-of-range index
+    /// reads x in four-state (§11.5.1), which the executor cannot produce:
+    /// it ABORTS and the four-state re-run supplies the x.
+    BitDyn { d: u16, s: u16, i: u16, w: u32 },
     Leq { d: u16, a: u16, b: u16 },
     Gt { d: u16, a: u16, b: u16 },
     Geq { d: u16, a: u16, b: u16 },
@@ -13018,6 +13051,211 @@ pub fn ts_last_gate() -> &'static str {
     TS_GATE_WHY.with(|c| c.get())
 }
 
+/// Does the block read a signal (or array) BEFORE writing it, on some path,
+/// with no write of that signal earlier on that same path?
+///
+/// Every two-state bail — an x-read, an out-of-range element index — hands
+/// the block to the four-state interpreter, which re-runs it from the top
+/// against the signal table as the two-state stores left it. That re-run
+/// reproduces the aborted run exactly iff no load observed a signal the
+/// block itself overwrites later on the same path: `cnt = cnt + 1; ...`
+/// followed by a bail would increment twice. Loop counters (`i = 0; ...
+/// i = i + 1`) are fine — every read of `i` is dominated by a store.
+///
+/// Two small dataflow passes over the block's CFG: MUST-stored (intersection
+/// over predecessors) protects a read; a read of an unprotected signal is
+/// recorded (union), and a later blocking store of a recorded signal is the
+/// hazard. Non-blocking assignments queue and never touch the table.
+fn ts_raw_hazard(insns: &[Insn], array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>) -> bool {
+    #[derive(PartialEq, Clone)]
+    enum Base {
+        Sig(u32),
+        Arr(usize),
+        ArrName(String),
+    }
+    // One access site class: base + bit range. `protects` is false for a
+    // store whose bits are not static (dynamic bit / array element), which
+    // therefore shields no later read.
+    struct Acc {
+        base: Base,
+        lo: u32,
+        hi: u32,
+        protects: bool,
+    }
+    const FULL: (u32, u32) = (0, u32::MAX);
+    let arr_base = |a: &ArrayOperand| -> Base {
+        match a {
+            ArrayOperand::Dense { first_id, .. } => Base::Arr(*first_id),
+            ArrayOperand::Named(name) => match array_first_id.get(name.as_str()) {
+                Some(&(first, _, _)) => Base::Arr(first),
+                None => Base::ArrName(name.clone()),
+            },
+        }
+    };
+    let n = insns.len();
+    let mut loads: Vec<Acc> = Vec::new();
+    let mut stores: Vec<Acc> = Vec::new();
+    let mut reads: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut writes: Vec<Option<usize>> = vec![None; n];
+    fn intern(v: &mut Vec<Acc>, a: Acc) -> usize {
+        if let Some(i) = v
+            .iter()
+            .position(|x| x.base == a.base && x.lo == a.lo && x.hi == a.hi && x.protects == a.protects)
+        {
+            i
+        } else {
+            v.push(a);
+            v.len() - 1
+        }
+    }
+    let rng = |a: u32, b: u32| -> (u32, u32) { (a.min(b), a.max(b)) };
+    for (i, insn) in insns.iter().enumerate() {
+        let mut ld = |base: Base, r: (u32, u32)| {
+            reads[i].push(intern(&mut loads, Acc { base, lo: r.0, hi: r.1, protects: false }));
+        };
+        match insn {
+            Insn::LoadSignal(_, sig) | Insn::LoadSignalSigned(_, sig) => ld(Base::Sig(*sig), FULL),
+            Insn::LoadSignalBit(_, sig, b) => ld(Base::Sig(*sig), (*b, *b)),
+            Insn::LoadSignalRange(_, sig, l, r) => ld(Base::Sig(*sig), rng(*l, *r)),
+            Insn::BranchIfSignalFalse(sig, _, b) => {
+                ld(Base::Sig(*sig), if *b == u32::MAX { FULL } else { (*b, *b) })
+            }
+            Insn::LoadArrayElem(_, arr, _) => ld(arr_base(arr), FULL),
+            Insn::NbaAssignArrayRead(_, arr, isig, _) => {
+                ld(arr_base(arr), FULL);
+                ld(Base::Sig(*isig), FULL);
+            }
+            _ => {}
+        }
+        let st = match insn {
+            Insn::BlockingAssign(sig, _, _) | Insn::BlockingAssignString(sig, _) => {
+                Some(Acc { base: Base::Sig(*sig), lo: 0, hi: u32::MAX, protects: true })
+            }
+            Insn::BlockingAssignRange(sig, hi, lo, _) => {
+                let r = rng(*hi, *lo);
+                Some(Acc { base: Base::Sig(*sig), lo: r.0, hi: r.1, protects: true })
+            }
+            Insn::BlockingAssignBitDyn(sig, _, _) => {
+                Some(Acc { base: Base::Sig(*sig), lo: 0, hi: u32::MAX, protects: false })
+            }
+            Insn::BlockingAssignArray(arr, _, _, _) | Insn::BlockingAssignArrayRange(arr, _, _, _, _) => {
+                Some(Acc { base: arr_base(arr), lo: 0, hi: u32::MAX, protects: false })
+            }
+            _ => None,
+        };
+        if let Some(a) = st {
+            writes[i] = Some(intern(&mut stores, a));
+        }
+    }
+    if stores.is_empty() || loads.is_empty() {
+        return false;
+    }
+    let (nl, ns) = (loads.len(), stores.len());
+    if nl > 4096 || ns > 4096 {
+        return true;
+    }
+    // covers[L]: store classes whose static range contains load class L.
+    // overlaps[S]: load classes whose range meets store class S.
+    let covers: Vec<Vec<usize>> = loads
+        .iter()
+        .map(|l| {
+            stores
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.protects && s.base == l.base && s.lo <= l.lo && s.hi >= l.hi)
+                .map(|(j, _)| j)
+                .collect()
+        })
+        .collect();
+    let overlaps: Vec<Vec<usize>> = stores
+        .iter()
+        .map(|s| {
+            loads
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.base == s.base && l.lo <= s.hi && s.lo <= l.hi)
+                .map(|(j, _)| j)
+                .collect()
+        })
+        .collect();
+    let lw = nl.div_ceil(64);
+    let sw = ns.div_ceil(64);
+    let succs = |i: usize| -> Vec<usize> {
+        match &insns[i] {
+            Insn::Jump(t) => vec![*t as usize],
+            Insn::BranchIfFalse(_, t)
+            | Insn::BranchUnlessZero(_, t)
+            | Insn::BranchIfSignalFalse(_, t, _)
+            | Insn::CmpBranch(_, _, _, _, t) => vec![i + 1, *t as usize],
+            Insn::CaseJump(_, cj) => cj.table.iter().chain(std::iter::once(&cj.default)).map(|&t| t as usize).collect(),
+            Insn::CaseMaskJump(_, mj) => mj.table.iter().chain(std::iter::once(&mj.xz_path)).map(|&t| t as usize).collect(),
+            _ => vec![i + 1],
+        }
+    };
+    let bit = |v: &[u64], k: usize| (v[k >> 6] >> (k & 63)) & 1 != 0;
+    // must_in over store classes (intersection; top = all-ones except the
+    // entry), unprot_in over load classes (union).
+    let mut must_in: Vec<Vec<u64>> = vec![vec![u64::MAX; sw]; n + 1];
+    must_in[0] = vec![0; sw];
+    let mut unprot_in: Vec<Vec<u64>> = vec![vec![0; lw]; n + 1];
+    let mut must_out: Vec<Vec<u64>> = vec![vec![u64::MAX; sw]; n];
+    let mut unprot_out: Vec<Vec<u64>> = vec![vec![0; lw]; n];
+    let mut changed = true;
+    let mut sweeps = 0;
+    while changed {
+        changed = false;
+        sweeps += 1;
+        if sweeps > 64 {
+            return true;
+        }
+        for i in 0..n {
+            let mut mo = must_in[i].clone();
+            let mut uo = unprot_in[i].clone();
+            for &l in &reads[i] {
+                let protected = covers[l].iter().any(|&sidx| bit(&must_in[i], sidx));
+                if !protected {
+                    uo[l >> 6] |= 1u64 << (l & 63);
+                }
+            }
+            if let Some(sidx) = writes[i] {
+                if overlaps[sidx].iter().any(|&l| bit(&unprot_in[i], l)) {
+                    return true;
+                }
+                mo[sidx >> 6] |= 1u64 << (sidx & 63);
+            }
+            if mo != must_out[i] || uo != unprot_out[i] {
+                changed = true;
+                must_out[i] = mo;
+                unprot_out[i] = uo;
+            }
+            for t in succs(i) {
+                if t > n {
+                    continue;
+                }
+                let mut ch = false;
+                for w in 0..sw {
+                    let nm = must_in[t][w] & must_out[i][w];
+                    if nm != must_in[t][w] {
+                        must_in[t][w] = nm;
+                        ch = true;
+                    }
+                }
+                for w in 0..lw {
+                    let nu = unprot_in[t][w] | unprot_out[i][w];
+                    if nu != unprot_in[t][w] {
+                        unprot_in[t][w] = nu;
+                        ch = true;
+                    }
+                }
+                if ch {
+                    changed = true;
+                }
+            }
+        }
+    }
+    false
+}
+
 pub fn lower_two_state(
     cb: &CompiledBlock,
     signal_widths: &[u32],
@@ -13034,6 +13272,19 @@ pub fn lower_two_state(
     // Constant value per register (from LoadConst), for folding const-index
     // array writes into static element stores. Cleared on any redefinition.
     let mut rc: Vec<Option<u64>> = vec![None; cb.num_regs as usize];
+    // §6.11.1 signedness per register. Registers stay unsigned bit patterns;
+    // the flag only decides (a) which relational compares are signed and
+    // (b) where an implicit widening would have to sign-extend — `mn!`
+    // (maybe negative) gates those, so a signed register whose value is a
+    // known non-negative constant keeps lowering exactly as before.
+    let mut sg: Vec<bool> = vec![false; cb.num_regs as usize];
+    macro_rules! mn {
+        ($r:expr) => {{
+            let r = $r as usize;
+            sg[r]
+                && !matches!((rc[r], rw[r]), (Some(v), Some(w)) if w == 0 || (v >> (w - 1)) & 1 == 0)
+        }};
+    }
     // Once a side-effecting op is emitted, ABORTABLE ops (dynamic element
     // reads) can no longer be admitted: an abort must leave no trace.
     let mut side_effects = false;
@@ -13183,6 +13434,15 @@ pub fn lower_two_state(
     // A back edge can re-enter an earlier read from a LATER definition, which
     // the forward-only reasoning above does not model.
     let back_branch = BytecodeCompiler::has_backward_branch(&cb.instructions);
+    // See `ts_raw_hazard`: a block that reads a signal it later overwrites
+    // cannot be re-run by the interpreter after a partial two-state run, and
+    // every bail is such a re-run.
+    if ts_raw_hazard(&cb.instructions, array_first_id) {
+        if std::env::var_os("XEZIM_TS_DBG").is_some() {
+            TS_BAIL_AT.with(|c| c.set((usize::MAX, "RawHazard")));
+        }
+        return None;
+    }
     let mut wconf: Vec<bool> = vec![false; cb.num_regs as usize];
     let mut wconf_list: Vec<RegId> = Vec::new();
     let mut def_tc: Vec<u32> = vec![0; cb.num_regs as usize];
@@ -13199,6 +13459,7 @@ pub fn lower_two_state(
         ($rw:ident, $r:expr, $w:expr) => {{
             let r = $r as usize;
             let w = $w;
+            sg[r] = false;
             match $rw[r] {
                 Some(prev) if prev != w => {
                     if !wconf[r] {
@@ -13292,15 +13553,21 @@ pub fn lower_two_state(
             Insn::Nop => {}
             // No-op here: every lowered register is unsigned by construction
             // (signed sources bail below).
-            Insn::ClearSigned(_) => {}
-            Insn::LoadSignal(d, sig) => {
+            Insn::ClearSigned(r) => sg[*r as usize] = false,
+            Insn::LoadSignal(d, sig) | Insn::LoadSignalSigned(d, sig) => {
                 let sig = *sig as usize;
-                if signal_signed.get(sig).copied().unwrap_or(true) {
+                // A signed source (an `integer` loop counter, typically) is
+                // admitted narrow only, as an unsigned bit pattern tagged
+                // signed in `sg`; wide signed sources still bail.
+                let signed = signal_signed.get(sig).copied().unwrap_or(true)
+                    || matches!(insn, Insn::LoadSignalSigned(..));
+                if signed && !sig_ok(sig) {
                     return None;
                 }
                 if sig_ok(sig) {
                     note_read(sig, 0, signal_widths[sig], true, stored.contains(&(sig as u32)), &mut reads_whole, &mut reads_slice);
                     def!(rw, *d, signal_widths[sig]);
+                    sg[*d as usize] = signed;
                     out.push(TsInsn::LoadSig { d: *d as u16, sig: sig as u32 });
                 } else if sig_ok_wide(sig) {
                     let skip = !side_effects || stored.contains(&(sig as u32));
@@ -13344,6 +13611,7 @@ pub fn lower_two_state(
                     let v = clean_const(k)?;
                     def!(rw, *d, k.width);
                     rc[*d as usize] = Some(v);
+                    sg[*d as usize] = k.is_signed;
                     out.push(TsInsn::Const { d: *d as u16, v });
                 }
             }
@@ -13404,6 +13672,12 @@ pub fn lower_two_state(
                         mask: ts_mask(w),
                     }
                 });
+            }
+            Insn::BitSelect(d, base, idx) => {
+                let wb = narrow_reg!(rw, *base, "wide operand (bitsel)");
+                narrow_reg!(rw, *idx, "wide bit index");
+                def!(rw, *d, 1);
+                out.push(TsInsn::BitDyn { d: *d as u16, s: *base as u16, i: *idx as u16, w: wb });
             }
             Insn::BitSelectConst(d, s, idx) => {
                 let sw = rw[*s as usize]?;
@@ -13466,6 +13740,8 @@ pub fn lower_two_state(
                     continue;
                 }
                 def!(rw, *d, w);
+                sg[*d as usize] = sg[*s as usize];
+                rc[*d as usize] = rc[*s as usize];
                 let (d, s) = (*d as u16, *s as u16);
                 out.push(if w > 64 {
                     TsInsn::WOr { d, a: s, b: s }
@@ -13491,6 +13767,7 @@ pub fn lower_two_state(
                     return None;
                 }
                 def!(rw, *d, wa);
+                sg[*d as usize] = sg[*a as usize] && sg[*b as usize];
                 out.push(TsInsn::Sel {
                     d: *d as u16,
                     c: *c as u16,
@@ -13506,7 +13783,12 @@ pub fn lower_two_state(
                     // zero-extension across banks.
                     return None;
                 }
+                let both_sg = sg[*a as usize] && sg[*b as usize];
+                if both_sg && wa != wb && (if wa < wb { mn!(*a) } else { mn!(*b) }) {
+                    gate!("signed widening (bitop)");
+                }
                 def!(rw, *d, wa.max(wb));
+                sg[*d as usize] = both_sg;
                 let (d, a, b) = (*d as u16, *a as u16, *b as u16);
                 out.push(if aw {
                     match insn {
@@ -13524,7 +13806,9 @@ pub fn lower_two_state(
             }
             Insn::BitNot(d, s) => {
                 let w = rw[*s as usize]?;
+                let s_sg = sg[*s as usize];
                 def!(rw, *d, w);
+                sg[*d as usize] = s_sg;
                 out.push(if w > 64 {
                     if w > 128 {
                         return None;
@@ -13542,7 +13826,12 @@ pub fn lower_two_state(
                     narrow_reg!(rw, *b, "wide operand (add/sub)"),
                 );
                 let w = wa.max(wb);
+                let both_sg = sg[*a as usize] && sg[*b as usize];
+                if both_sg && wa != wb && (if wa < wb { mn!(*a) } else { mn!(*b) }) {
+                    gate!("signed widening (add/sub)");
+                }
                 def!(rw, *d, w);
+                sg[*d as usize] = both_sg;
                 let (d, a, b) = (*d as u16, *a as u16, *b as u16);
                 out.push(if matches!(insn, Insn::Add(..)) {
                     TsInsn::Add { d, a, b, mask: ts_mask(w) }
@@ -13556,7 +13845,9 @@ pub fn lower_two_state(
             Insn::Shl(d, a, b) | Insn::Shr(d, a, b) => {
                 let wa = narrow_reg!(rw, *a, "wide operand (shift)");
                 narrow_reg!(rw, *b, "wide shift amount");
+                let a_sg = sg[*a as usize];
                 def!(rw, *d, wa);
+                sg[*d as usize] = a_sg;
                 let (d, a, b) = (*d as u16, *a as u16, *b as u16);
                 out.push(if matches!(insn, Insn::Shl(..)) {
                     TsInsn::Shl { d, a, b, w: wa, mask: ts_mask(wa) }
@@ -13608,14 +13899,20 @@ pub fn lower_two_state(
                 }
             }
             Insn::Eq(d, a, b) | Insn::CaseEq(d, a, b) => {
-                narrow_reg!(rw, *a, "wide operand (eq)");
-                narrow_reg!(rw, *b, "wide operand (eq)");
+                let wa = narrow_reg!(rw, *a, "wide operand (eq)");
+                let wb = narrow_reg!(rw, *b, "wide operand (eq)");
+                if sg[*a as usize] && sg[*b as usize] && wa != wb && (if wa < wb { mn!(*a) } else { mn!(*b) }) {
+                    gate!("signed widening (eq)");
+                }
                 def!(rw, *d, 1);
                 out.push(TsInsn::Eq { d: *d as u16, a: *a as u16, b: *b as u16 });
             }
             Insn::Neq(d, a, b) => {
-                narrow_reg!(rw, *a, "wide operand (neq)");
-                narrow_reg!(rw, *b, "wide operand (neq)");
+                let wa = narrow_reg!(rw, *a, "wide operand (neq)");
+                let wb = narrow_reg!(rw, *b, "wide operand (neq)");
+                if sg[*a as usize] && sg[*b as usize] && wa != wb && (if wa < wb { mn!(*a) } else { mn!(*b) }) {
+                    gate!("signed widening (neq)");
+                }
                 def!(rw, *d, 1);
                 out.push(TsInsn::Neq { d: *d as u16, a: *a as u16, b: *b as u16 });
             }
@@ -13623,10 +13920,21 @@ pub fn lower_two_state(
             // always here, since every lowered register is unsigned.
             Insn::Lt(d, a, b) | Insn::Leq(d, a, b) | Insn::Gt(d, a, b)
             | Insn::Geq(d, a, b) => {
-                narrow_reg!(rw, *a, "wide operand (cmp)");
-                narrow_reg!(rw, *b, "wide operand (cmp)");
+                let wa = narrow_reg!(rw, *a, "wide operand (cmp)");
+                let wb = narrow_reg!(rw, *b, "wide operand (cmp)");
+                let both_sg = sg[*a as usize] && sg[*b as usize];
                 def!(rw, *d, 1);
                 let (d, a, b) = (*d as u16, *a as u16, *b as u16);
+                if both_sg {
+                    let kind = match insn {
+                        Insn::Lt(..) => 0,
+                        Insn::Leq(..) => 1,
+                        Insn::Gt(..) => 2,
+                        _ => 3,
+                    };
+                    out.push(TsInsn::CmpS { d, a, b, kind, sa: (64 - wa) as u8, sb: (64 - wb) as u8 });
+                    continue;
+                }
                 out.push(match insn {
                     Insn::Lt(..) => TsInsn::Lt { d, a, b },
                     Insn::Leq(..) => TsInsn::Leq { d, a, b },
@@ -13651,6 +13959,9 @@ pub fn lower_two_state(
                 });
             }
             Insn::BinOpConstAdd2(a) => {
+                if mn!(a.s1) || mn!(a.s2) {
+                    gate!("signed operand (addc2)");
+                }
                 // Exactly the two `AddC` lowerings the pair had before
                 // merging — in order, so a chained `s2 == d1` sees d1's
                 // freshly defined width.
@@ -13678,9 +13989,14 @@ pub fn lower_two_state(
             Insn::BinOpConst(d, s, k, kind) => {
                 let w = narrow_reg!(rw, *s, "wide operand (binop-const)");
                 let v = clean_const(k)?;
+                let both_sg = sg[*s as usize] && k.is_signed;
+                if both_sg && w < k.width && mn!(*s) {
+                    gate!("signed widening (binop-const)");
+                }
                 match kind {
                     BinOpConstKind::Xor => {
                         def!(rw, *d, w.max(k.width));
+                        sg[*d as usize] = both_sg;
                         out.push(TsInsn::XorC { d: *d as u16, s: *s as u16, k: v });
                     }
                     BinOpConstKind::Eq | BinOpConstKind::CaseEq => {
@@ -13690,6 +14006,7 @@ pub fn lower_two_state(
                     BinOpConstKind::Add => {
                         let wr = w.max(k.width);
                         def!(rw, *d, wr);
+                        sg[*d as usize] = both_sg;
                         out.push(TsInsn::AddC {
                             d: *d as u16,
                             s: *s as u16,
@@ -13735,6 +14052,9 @@ pub fn lower_two_state(
                 let cur = rw[*r as usize]?;
                 if *w > 128 {
                     return None;
+                }
+                if *w > cur && mn!(*r) {
+                    gate!("signed widening (resize)");
                 }
                 if *w > 64 {
                     if cur <= 64 {
@@ -13797,10 +14117,29 @@ pub fn lower_two_state(
             // Fused compare+branch: decompose to the exact unfused lowering,
             // reusing the embedded dead register as the compare scratch.
             Insn::CmpBranch(kind, a, b, tmp, t) => {
-                narrow_reg!(rw, *a, "wide operand (cmpbranch)");
-                narrow_reg!(rw, *b, "wide operand (cmpbranch)");
+                let wa = narrow_reg!(rw, *a, "wide operand (cmpbranch)");
+                let wb = narrow_reg!(rw, *b, "wide operand (cmpbranch)");
+                let both_sg = sg[*a as usize] && sg[*b as usize];
+                if both_sg
+                    && matches!(kind, CmpKind::Eq | CmpKind::CaseEq | CmpKind::Neq)
+                    && wa != wb
+                    && (if wa < wb { mn!(*a) } else { mn!(*b) })
+                {
+                    gate!("signed widening (cmpbranch)");
+                }
                 def!(rw, *tmp, 1);
                 let (d, a, b) = (*tmp as u16, *a as u16, *b as u16);
+                if both_sg && !matches!(kind, CmpKind::Eq | CmpKind::CaseEq | CmpKind::Neq) {
+                    let k = match kind {
+                        CmpKind::Lt => 0,
+                        CmpKind::Leq => 1,
+                        CmpKind::Gt => 2,
+                        _ => 3,
+                    };
+                    out.push(TsInsn::CmpS { d, a, b, kind: k, sa: (64 - wa) as u8, sb: (64 - wb) as u8 });
+                    out.push(TsInsn::BrFalse { s: d, t: *t });
+                    continue;
+                }
                 out.push(match kind {
                     CmpKind::Eq | CmpKind::CaseEq => TsInsn::Eq { d, a, b },
                     CmpKind::Neq => TsInsn::Neq { d, a, b },
@@ -13877,6 +14216,21 @@ pub fn lower_two_state(
                     }
                 });
             }
+            Insn::NbaAssignBitDyn(sig, idx, r) => {
+                let sig = *sig as usize;
+                if sig >= signal_widths.len() || signal_real[sig] || signal_widths[sig] > 64 {
+                    gate!("nba bit dest oob/real/wide");
+                }
+                narrow_reg!(rw, *idx, "wide bit index");
+                narrow_reg!(rw, *r, "wide store source");
+                side_effects = true;
+                out.push(TsInsn::BitStoreNbaDyn {
+                    sig: sig as u32,
+                    i: *idx as u16,
+                    s: *r as u16,
+                    w: signal_widths[sig],
+                });
+            }
             Insn::BlockingAssignBitDyn(sig, idx, r) => {
                 let sig = *sig as usize;
                 if sig >= signal_widths.len() || signal_real[sig] {
@@ -13933,6 +14287,9 @@ pub fn lower_two_state(
                 } else {
                     if cw > 64 {
                         return None;
+                    }
+                    if cw < *w && mn!(*r) {
+                        gate!("signed widening (store)");
                     }
                     side_effects = true;
                     stored.push(sig as u32);
@@ -13999,6 +14356,9 @@ pub fn lower_two_state(
                 if cw > 64 || w > 64 {
                     gate!("src reg >64b");
                 }
+                if cw < w && mn!(*r) {
+                    gate!("signed widening (range store)");
+                }
                 if !wide_dest && high >= 64 {
                     gate!("range top >=64");
                 }
@@ -14039,6 +14399,9 @@ pub fn lower_two_state(
                 if cw > 64 || high >= 64 {
                     return None;
                 }
+                if cw < w && mn!(*r) {
+                    gate!("signed widening (nba range store)");
+                }
                 side_effects = true;
                 out.push(TsInsn::RangeStoreNba {
                     sig: sig as u32,
@@ -14064,6 +14427,9 @@ pub fn lower_two_state(
                     if cw > 64 {
                         return None;
                     }
+                    if cw < *w && mn!(*r) {
+                        gate!("signed widening (nba store)");
+                    }
                     side_effects = true;
                     out.push(TsInsn::StoreNba {
                         sig: sig as u32,
@@ -14075,6 +14441,7 @@ pub fn lower_two_state(
             }
             Insn::LoadArrayElem(d, array, idx_reg) => {
                 let (first, lo, hi) = array_span(array)?;
+                let _ = side_effects;
                 // A constant, in-range index names one element: that is a
                 // plain signal load with the ordinary x-read contract, not an
                 // abortable element read — so it stays admissible after a
@@ -14094,11 +14461,9 @@ pub fn lower_two_state(
                     out.push(TsInsn::LoadSig { d: *d as u16, sig: eid as u32 });
                     continue;
                 }
-                // Abortable (X/out-of-range element read) — only admissible
-                // while nothing side-effecting has run.
-                if side_effects {
-                    return None;
-                }
+                // Abortable (X/out-of-range element read). Admissible after
+                // side effects too: `ts_raw_hazard` proved the four-state
+                // re-run reproduces every store made before the abort.
                 narrow_reg!(rw, *idx_reg, "wide array index");
                 let w = signal_widths[first];
                 def!(rw, *d, w);
@@ -14114,9 +14479,12 @@ pub fn lower_two_state(
             }
             Insn::NbaAssignArray(array, idx_reg, val_reg, w) => {
                 let (first, lo, hi) = array_span(array)?;
-                narrow_reg!(rw, *val_reg, "wide store source");
+                let vw = narrow_reg!(rw, *val_reg, "wide store source");
                 if *w > 64 || signal_widths[first] != *w {
                     return None;
+                }
+                if vw < *w && mn!(*val_reg) {
+                    gate!("signed widening (array store)");
                 }
                 side_effects = true;
                 if let Some(k) = rc[*idx_reg as usize] {
@@ -14148,9 +14516,12 @@ pub fn lower_two_state(
             }
             Insn::BlockingAssignArray(array, idx_reg, val_reg, w) => {
                 let (first, lo, hi) = array_span(array)?;
-                narrow_reg!(rw, *val_reg, "wide store source");
+                let vw = narrow_reg!(rw, *val_reg, "wide store source");
                 if *w > 64 || signal_widths[first] != *w {
                     return None;
+                }
+                if vw < *w && mn!(*val_reg) {
+                    gate!("signed widening (array store)");
                 }
                 side_effects = true;
                 if let Some(k) = rc[*idx_reg as usize] {
@@ -14204,7 +14575,8 @@ pub fn lower_two_state(
                     && idx_w < 63
                     && hi >= (1i64 << idx_w) - 1
                     && !stored.contains(&(isig as u32));
-                if side_effects && !statically_in_range {
+                let _ = statically_in_range;
+                if false {
                     return None;
                 }
                 note_read(isig, 0, signal_widths[isig], true, stored.contains(&(isig as u32)), &mut reads_whole, &mut reads_slice);
@@ -14224,7 +14596,12 @@ pub fn lower_two_state(
                     return None;
                 }
                 let w = wa.max(wb);
+                let both_sg = sg[*a as usize] && sg[*b as usize];
+                if both_sg && wa != wb && (if wa < wb { mn!(*a) } else { mn!(*b) }) {
+                    gate!("signed widening (mul)");
+                }
                 def!(rw, *d, w);
+                sg[*d as usize] = both_sg;
                 if let (Some(ka), Some(kb)) = (rc[*a as usize], rc[*b as usize]) {
                     // Both operands are known constants (a genvar expression
                     // the compiler left unfolded): fold at lower time.
@@ -14345,6 +14722,7 @@ pub fn lower_two_state(
                     | TsInsn::RangeStore { .. }
                     | TsInsn::RangeStoreNba { .. }
                     | TsInsn::BitStoreDyn { .. }
+                    | TsInsn::BitStoreNbaDyn { .. }
                     | TsInsn::ConstStoreX { .. }
                     | TsInsn::RangeStoreX { .. }
                     | TsInsn::RangeStoreW { .. }
@@ -14416,6 +14794,7 @@ pub fn lower_two_state(
         match i {
             TsInsn::Store { sig, .. }
             | TsInsn::StoreNba { sig, .. }
+            | TsInsn::BitStoreNbaDyn { sig, .. }
             | TsInsn::WStore { sig, .. }
             | TsInsn::WStoreNba { sig, .. } => writes.push(*sig),
             TsInsn::NbaFromElem(op) => writes.push(op.dst),
