@@ -21929,7 +21929,6 @@ impl Simulator {
             self.signal_table[id] = val;
         }
         self.sync_mirror(id);
-        self.signal_table[id].is_signed = self.signal_signed[id];
         if !self.dirty_signals[id] {
             self.dirty_signals[id] = true;
             self.dirty_list.push(id);
@@ -21952,7 +21951,6 @@ impl Simulator {
             self.signal_table[id] = val;
         }
         self.sync_mirror(id);
-        self.signal_table[id].is_signed = self.signal_signed[id];
         if !self.dirty_signals[id] {
             self.dirty_signals[id] = true;
             self.dirty_list.push(id);
@@ -21962,12 +21960,15 @@ impl Simulator {
         self.after_signal_write(id);
     }
 
+    // The in-place (`set_inline_bits`) stores above and below keep the
+    // table Value's `is_signed` as it was: every write path stamps it from
+    // `signal_signed` (write_sig!), so re-stamping here only cost a random
+    // load from a 35M-entry table per store.
     fn ts_store(&mut self, id: usize, v: u64, mask: u64) {
         let (dv, dx) = self.signal_table[id].raw_bits();
         if v != (dv & mask) || (dx & mask) != 0 {
             if self.signal_table[id].set_inline_bits(v, 0) {
                 self.sync_mirror(id);
-                self.signal_table[id].is_signed = self.signal_signed[id];
             } else {
                 let mut val = Value::from_u64(v, self.signal_widths[id]);
                 val.is_signed = self.signal_signed[id];
