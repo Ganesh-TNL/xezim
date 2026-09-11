@@ -1142,9 +1142,26 @@ struct AwaitWaiter {
 #[derive(Clone, Copy, Default)]
 struct TsHdr {
     off: u32,
-    len: u32,
-    num_regs: u32,
-    kind: u8,
+    /// Stream length (14 bits) | executor kind (2 bits, `TS_HDR_KIND_SHIFT`);
+    /// kind 0 = no arena stream. Eight bytes per entry keeps twice as many
+    /// headers per cache line as the unpacked form did — the header load is
+    /// the first touch of every settle evaluation.
+    len_kind: u16,
+    num_regs: u16,
+}
+
+const TS_HDR_KIND_SHIFT: u32 = 14;
+const TS_HDR_LEN_MAX: usize = (1 << TS_HDR_KIND_SHIFT) - 1;
+
+impl TsHdr {
+    #[inline(always)]
+    fn kind(&self) -> u8 {
+        (self.len_kind >> TS_HDR_KIND_SHIFT) as u8
+    }
+    #[inline(always)]
+    fn len(&self) -> usize {
+        (self.len_kind & (TS_HDR_LEN_MAX as u16)) as usize
+    }
 }
 
 /// `edge_block_armed` state bits. A gateable block skips its clock edge in
@@ -20293,14 +20310,17 @@ impl Simulator {
                         if self.ts_hdr.len() <= eidx {
                             self.ts_hdr.resize(eidx + 1, TsHdr::default());
                         }
-                        if ts.insns.len() < u32::MAX as usize && self.ts_arena.len() < (u32::MAX as usize - ts.insns.len()) {
+                        if ts.insns.len() <= TS_HDR_LEN_MAX
+                            && ts.num_regs <= u16::MAX as u32
+                            && self.ts_arena.len() < (u32::MAX as usize - ts.insns.len())
+                        {
                             let off = self.ts_arena.len() as u32;
                             self.ts_arena.extend(ts.insns.iter().cloned());
                             self.ts_hdr[eidx] = TsHdr {
                                 off,
-                                len: ts.insns.len() as u32,
-                                num_regs: ts.num_regs,
-                                kind: Self::ts_kind_of(&ts),
+                                len_kind: (ts.insns.len() as u16)
+                                    | ((Self::ts_kind_of(&ts) as u16) << TS_HDR_KIND_SHIFT),
+                                num_regs: ts.num_regs as u16,
                             };
                         }
                         TsSlot::Yes(std::sync::Arc::new(ts))
@@ -20370,7 +20390,7 @@ impl Simulator {
                     if self.comb_plan_abortn[eidx] >= TS_ABORT_DEMOTE {
                         self.comb_plan[eidx] = CombPlan::Interp;
                         if let Some(h) = self.ts_hdr.get_mut(eidx) {
-                            h.kind = 0;
+                            h.len_kind = 0;
                         }
                     }
                 }
@@ -20808,9 +20828,9 @@ impl Simulator {
         // SAFETY: the arena only grows at lowering time, never inside an
         // executor, and the executors do not touch `ts_arena`.
         let insns: &[super::bytecode::TsInsn] = unsafe {
-            std::slice::from_raw_parts(self.ts_arena.as_ptr().add(h.off as usize), h.len as usize)
+            std::slice::from_raw_parts(self.ts_arena.as_ptr().add(h.off as usize), h.len())
         };
-        if !self.exec_two_state_parts(insns, h.num_regs, h.kind) {
+        if !self.exec_two_state_parts(insns, h.num_regs as u32, h.kind()) {
             if std::mem::take(&mut self.ts_xread_bail) {
                 self.prof_ts_bail_xread += 1;
                 return false;
@@ -27077,6 +27097,22 @@ impl Simulator {
             Err(_) => return false,
         };
 
+        // The settle loop walks this CSR without bounds checks: a cache file
+        // whose prefix sum is not monotone, does not end at the entry count,
+        // or names an entry past the table is rejected and rebuilt.
+        {
+            let n_entries = cache.entries.len();
+            let offs = &cache.dep_offsets;
+            let csr_ok = offs.first().is_none_or(|&f| f == 0)
+                && offs.windows(2).all(|w| w[0] <= w[1])
+                && offs.last().is_none_or(|&l| l as usize == cache.dep_entries.len())
+                && cache.dep_entries.iter().all(|&e| (e as usize) < n_entries);
+            if !csr_ok {
+                eprintln!("[CACHE] prepared-comb dependency table inconsistent; rebuilding: {}", path.display());
+                let _ = std::fs::remove_file(&path);
+                return false;
+            }
+        }
         self.comb_entries = cache.entries;
         self.ts_comb.clear();
         self.comb_dep_offsets = cache.dep_offsets;
@@ -48805,17 +48841,24 @@ impl Simulator {
                 let __tid: usize = $id;
                 n_writes += 1;
                 if __tid + 1 < dep_offsets.len() {
-                    let __lo = dep_offsets[__tid] as usize;
-                    let __hi = dep_offsets[__tid + 1] as usize;
+                    // SAFETY: `__tid + 1 < dep_offsets.len()` was just tested;
+                    // offsets are a CSR prefix sum into `dep_entries` and every
+                    // entry index is below `num_entries` (`triggered.len()`),
+                    // built together in `build_comb_entries` and validated
+                    // when loaded from the prepared-comb cache.
+                    let __lo = unsafe { *dep_offsets.get_unchecked(__tid) } as usize;
+                    let __hi = unsafe { *dep_offsets.get_unchecked(__tid + 1) } as usize;
+                    debug_assert!(__lo <= __hi && __hi <= dep_entries.len());
                     n_dep_edges += (__hi - __lo) as u64;
                     let __tree_clk = tree_sig.get(__tid).copied().unwrap_or(false);
-                    for &__dep_u32 in &dep_entries[__lo..__hi] {
+                    for &__dep_u32 in unsafe { dep_entries.get_unchecked(__lo..__hi) } {
                         let __dep = __dep_u32 as usize;
                         if __tree_clk && tree_entry.get(__dep).copied().unwrap_or(false) {
                             continue;
                         }
-                        if !triggered[__dep] {
-                            triggered[__dep] = true;
+                        debug_assert!(__dep < triggered.len());
+                        if !unsafe { *triggered.get_unchecked(__dep) } {
+                            unsafe { *triggered.get_unchecked_mut(__dep) = true };
                             if __dep > $eidx {
                                 // Keep the pass in entry (topological)
                                 // order: an injected dependent runs BEFORE
@@ -49034,7 +49077,7 @@ impl Simulator {
                 // re-dispatches (and demotes) exactly as before.
                 let mut ts_fast = false;
                 if self.proc_depth == 0 {
-                    let arena_kind = self.ts_hdr.get(eidx).map_or(0, |h| h.kind);
+                    let arena_kind = self.ts_hdr.get(eidx).map_or(0, |h| h.kind());
                     if arena_kind != 0 {
                         if self.ts_guard_and_exec_arena(eidx) {
                             ts_fast = true;
