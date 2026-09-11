@@ -21135,6 +21135,10 @@ impl Simulator {
                 TsInsn::ConstStoreX { sig, v, x } => {
                     self.ts_store_xz(*sig as usize, *v, *x);
                 }
+                TsInsn::RangeStoreNbaW { sig, hi, lo, s, mask } => {
+                    let v = regs[*s as usize] & mask;
+                    self.ts_wide_range_store_nba(*sig as usize, *lo, *hi, v);
+                }
                 TsInsn::RangeStoreW { sig, hi, lo, s, mask } => {
                     let v = regs[*s as usize] & mask;
                     self.ts_wide_range_store(*sig as usize, *lo, *hi, v, 0);
@@ -21691,6 +21695,10 @@ impl Simulator {
                 TsInsn::ConstStoreX { sig, v, x } => {
                     self.ts_store_xz(*sig as usize, *v, *x);
                 }
+                TsInsn::RangeStoreNbaW { sig, hi, lo, s, mask } => {
+                    let v = r!(*s) & mask;
+                    self.ts_wide_range_store_nba(*sig as usize, *lo, *hi, v);
+                }
                 TsInsn::RangeStoreW { sig, hi, lo, s, mask } => {
                     let v = r!(*s) & mask;
                     self.ts_wide_range_store(*sig as usize, *lo, *hi, v, 0);
@@ -22025,6 +22033,29 @@ impl Simulator {
         }
     }
 
+    /// `sig[hi:lo] <= v` for a destination wider than 64 bits: splice the
+    /// window into the pending NBA value, seeding it from the signal with
+    /// eval-time elision (the wide twin of `RangeStoreNba`).
+    fn ts_wide_range_store_nba(&mut self, id: usize, lo: u32, hi: u32, v: u64) {
+        let n = (hi - lo + 1) as usize;
+        if let Some(i) = self.nba_fast_index.get(id) {
+            self.nba_fast[i].value.splice_bits64(lo as usize, v, 0, n);
+        } else {
+            let mut nv = self.signal_table[id].clone();
+            if !nv.splice_bits64(lo as usize, v, 0, n) {
+                self.prof_nba_elided += 1;
+            } else {
+                nv.is_signed = self.signal_signed[id];
+                self.nba_fast_index.insert(id, self.nba_fast.len());
+                self.nba_fast.push(NbaFast {
+                    block_index: 0,
+                    signal_id: id,
+                    value: nv,
+                });
+            }
+        }
+    }
+
     fn ts_store_nba(&mut self, id: usize, v: u64, w: u32) {
         let val = Value::from_u64(v, w);
         if let Some(i) = self.nba_fast_index.get(id) {
@@ -22257,6 +22288,10 @@ impl Simulator {
                 }
                 TsInsn::ConstStoreX { sig, v, x } => {
                     self.ts_store_xz(*sig as usize, *v, *x);
+                }
+                TsInsn::RangeStoreNbaW { sig, hi, lo, s, mask } => {
+                    let v = regs[*s as usize] & mask;
+                    self.ts_wide_range_store_nba(*sig as usize, *lo, *hi, v);
                 }
                 TsInsn::RangeStoreW { sig, hi, lo, s, mask } => {
                     let v = regs[*s as usize] & mask;

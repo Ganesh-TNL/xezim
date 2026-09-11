@@ -12924,6 +12924,9 @@ pub enum TsInsn {
     /// included) is preserved. Routed through the same splice the JIT bridge
     /// uses for wide destinations.
     RangeStoreW { sig: u32, hi: u32, lo: u32, s: u16, mask: u64 },
+    /// `RangeStoreNba` for a destination wider than 64 bits: the window is
+    /// spliced into the pending NBA value (seeded from the signal).
+    RangeStoreNbaW { sig: u32, hi: u32, lo: u32, s: u16, mask: u64 },
     /// `RangeStoreX` into a >64-bit destination (folded 4-state constant).
     RangeStoreXW { sig: u32, hi: u32, lo: u32, v: u64, x: u64 },
     /// Dynamic array-element read: eid = first + (regs[idx] - lo). ABORTS
@@ -14387,15 +14390,31 @@ pub fn lower_two_state(
             }
             Insn::NbaAssignRange(sig, hi, lo, r) => {
                 let sig = *sig as usize;
-                if sig >= signal_widths.len()
-                    || signal_real[sig]
-                    || signal_widths[sig] > 64
-                {
+                if sig >= signal_widths.len() || signal_real[sig] {
                     return None;
                 }
                 let cw = rw[*r as usize]?;
                 let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
                 let w = high - low + 1;
+                if signal_widths[sig] > 64 {
+                    // Wide destination: a ≤64-bit window spliced into the
+                    // pending value (the id_dp pipeline registers on c906).
+                    if cw > 64 || w > 64 || high >= signal_widths[sig] {
+                        gate!("wide nba range shape");
+                    }
+                    if cw < w && mn!(*r) {
+                        gate!("signed widening (nba range store)");
+                    }
+                    side_effects = true;
+                    out.push(TsInsn::RangeStoreNbaW {
+                        sig: sig as u32,
+                        hi: high,
+                        lo: low,
+                        s: *r as u16,
+                        mask: ts_mask(w),
+                    });
+                    continue;
+                }
                 if cw > 64 || high >= 64 {
                     return None;
                 }
@@ -14726,6 +14745,7 @@ pub fn lower_two_state(
                     | TsInsn::ConstStoreX { .. }
                     | TsInsn::RangeStoreX { .. }
                     | TsInsn::RangeStoreW { .. }
+                    | TsInsn::RangeStoreNbaW { .. }
                     | TsInsn::RangeStoreXW { .. }
                     | TsInsn::ElemStore { .. }
                     | TsInsn::ElemStoreNba { .. }
@@ -14795,6 +14815,7 @@ pub fn lower_two_state(
             TsInsn::Store { sig, .. }
             | TsInsn::StoreNba { sig, .. }
             | TsInsn::BitStoreNbaDyn { sig, .. }
+            | TsInsn::RangeStoreNbaW { sig, .. }
             | TsInsn::WStore { sig, .. }
             | TsInsn::WStoreNba { sig, .. } => writes.push(*sig),
             TsInsn::NbaFromElem(op) => writes.push(op.dst),
