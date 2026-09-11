@@ -46704,19 +46704,25 @@ impl Simulator {
                     {
                         let skip_early = armed_prefilter && blk_armed[block_idx] == 0;
                         if skip_early {
-                            if prefilter_seen[block_idx] != prefilter_generation {
-                                prefilter_seen[block_idx] = prefilter_generation;
-                                // `event_gateable_total` / `event_would_skip` /
-                                // `armed_fast_skips` all advance in lockstep
-                                // with `prefiltered` here, so they are folded
-                                // in once after the loop instead of paying
-                                // three read-modify-writes through `self` on
-                                // each of ~110 M armed skips.
+                            // `event_gateable_total` / `event_would_skip` /
+                            // `armed_fast_skips` all advance in lockstep
+                            // with `prefiltered` here, so they are folded
+                            // in once after the loop instead of paying
+                            // three read-modify-writes through `self` on
+                            // each of ~110 M armed skips. The per-block
+                            // generation stamp that deduplicated the count
+                            // (a block sensitive to two changed signals in
+                            // one pass) is kept only for the opt-in stats;
+                            // the reported skip count may otherwise count
+                            // such a block once per signal.
+                            if !stats_on {
                                 prefiltered += 1;
                                 woke_any = true;
-                                if stats_on
-                                    && block_idx < self.cross_block_wakeup_count.len()
-                                {
+                            } else if prefilter_seen[block_idx] != prefilter_generation {
+                                prefilter_seen[block_idx] = prefilter_generation;
+                                prefiltered += 1;
+                                woke_any = true;
+                                if block_idx < self.cross_block_wakeup_count.len() {
                                     self.cross_block_wakeup_count[block_idx] += 1;
                                 }
                             }
