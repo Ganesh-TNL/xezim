@@ -4403,6 +4403,17 @@ pub struct Simulator {
     cycle_mode: bool,
     clock_tree_by_root: HashMap<usize, Vec<usize>>,
     is_clock_tree_entry: Vec<bool>,
+    /// Gate lane (see `build_gate_lane`): per comb entry, the index of its
+    /// compact gate op when the entry is a fused single-bit gate whose
+    /// output no comb entry reads (c906: 47% of all settle evaluations),
+    /// else `u32::MAX`. Such gates are queued when triggered and evaluated
+    /// in one tight loop at the end of the pass instead of through the
+    /// generic entry path.
+    gate_lane: Vec<u32>,
+    gate_ops: Vec<FusedGate>,
+    gate_queue: Vec<u32>,
+    gate_queued: Vec<bool>,
+    gate_lane_valid: bool,
     is_clock_tree_signal: Vec<bool>,
     prof_clock_tree_evals: u64,
     /// Instance scope of the comb/edge BLOCK currently being evaluated, for
@@ -5777,11 +5788,17 @@ pub struct Simulator {
     comb_path_last: Option<(usize, u64)>,
     /// XEZIM_COMB_PATHS: per edge block [interp fires, interp VM insns].
     edge_path_counts: Vec<[u64; 2]>,
+    /// XEZIM_COMB_PATHS: per comb entry [evals, evals repeated within one
+    /// time step], plus the last evaluation time.
+    comb_eval_counts: Vec<[u64; 2]>,
+    comb_eval_last_time: Vec<u64>,
     prof_fallback_by_reason: HashMap<Arc<str>, (u64, u64)>,
     prof_settle_dc_ns: u64,
     prof_settle_ca_ns: u64,
     prof_settle_ab_ns: u64,
     prof_settle_dc_count: u64,
+    /// Entry evaluations made in a settle pass after the first.
+    prof_settle_repass_evals: u64,
     /// Per-CombItem-variant evaluation histogram (XEZIM_ENTRY_HIST=1).
     prof_entry_hist: [u64; 12],
     /// Per-entry eval counts (XEZIM_PROFILE_TIMING) for shape attribution.
@@ -8503,6 +8520,11 @@ impl Simulator {
             },
             clock_tree_by_root: HashMap::default(),
             is_clock_tree_entry: Vec::new(),
+            gate_lane: Vec::new(),
+            gate_ops: Vec::new(),
+            gate_queue: Vec::new(),
+            gate_queued: Vec::new(),
+            gate_lane_valid: false,
             is_clock_tree_signal: Vec::new(),
             prof_clock_tree_evals: 0,
             spec_prop_is_dyn: std::cell::RefCell::new(HashMap::default()),
@@ -8996,11 +9018,14 @@ impl Simulator {
             comb_path_counts: Vec::new(),
             comb_path_last: None,
             edge_path_counts: Vec::new(),
+            comb_eval_counts: Vec::new(),
+            comb_eval_last_time: Vec::new(),
             prof_fallback_by_reason: HashMap::default(),
             prof_settle_dc_ns: 0,
             prof_settle_ca_ns: 0,
             prof_settle_ab_ns: 0,
             prof_settle_dc_count: 0,
+            prof_settle_repass_evals: 0,
             prof_entry_hist: [0; 12],
             prof_entry_counts: Vec::new(),
             cone_chain_member: Vec::new(),
@@ -25804,6 +25829,127 @@ impl Simulator {
 
     /// XEZIM_COMB_PATHS=1 end-of-sim report for EDGE blocks that ran on the
     /// interpreter: ranked by VM instructions, with the two-state bail.
+    /// XEZIM_COMB_PATHS=1: comb entries ranked by evaluations, with the
+    /// share repeated inside one time step (several delta cycles).
+    fn dump_comb_evals(&mut self) {
+        if !self.trace_comb_paths || self.comb_eval_counts.is_empty() {
+            return;
+        }
+        let tot: u64 = self.comb_eval_counts.iter().map(|c| c[0]).sum();
+        let same: u64 = self.comb_eval_counts.iter().map(|c| c[1]).sum();
+        let mut ranked: Vec<(usize, [u64; 2])> =
+            self.comb_eval_counts.iter().enumerate().map(|(i, c)| (i, *c)).filter(|(_, c)| c[0] > 0).collect();
+        ranked.sort_by_key(|(_, c)| std::cmp::Reverse(c[0]));
+        eprintln!("[EVALS] entries={} evals={} same_time_repeats={} ({:.1}%)", ranked.len(), tot, same, 100.0 * same as f64 / tot.max(1) as f64);
+        // Cumulative share by rank buckets.
+        let mut acc = 0u64;
+        for (rank, (_, c)) in ranked.iter().enumerate() {
+            acc += c[0];
+            if [10usize, 100, 300, 1000, 3000, 10000].contains(&(rank + 1)) {
+                eprintln!("[EVALS] top {:>5} entries: {:.1}% of evals", rank + 1, 100.0 * acc as f64 / tot.max(1) as f64);
+            }
+        }
+        let mut kind_hist: std::collections::HashMap<&'static str, u64> = std::collections::HashMap::new();
+        for (eidx, c) in ranked.iter() {
+            let kind = match self.comb_entries.get(*eidx).map(|e| &e.item) {
+                Some(CombItem::Noop) => "Noop",
+                Some(CombItem::ContAssign { .. }) => "ContAssign",
+                Some(CombItem::DirectCopy { .. }) => "DirectCopy",
+                Some(CombItem::FastDirectCopy { .. }) => "FastDirectCopy",
+                Some(CombItem::FastDirectFanout { .. }) => "FastDirectFanout",
+                Some(CombItem::FusedBufFanout { .. }) => "FusedBufFanout",
+                Some(CombItem::FusedAndFanout { .. }) => "FusedAndFanout",
+                Some(CombItem::CompiledContAssign { .. }) => "CompiledContAssign",
+                Some(CombItem::AlwaysBlock { .. }) => "AlwaysBlock",
+                Some(CombItem::CompiledAlwaysBlock { .. }) => "CompiledAlwaysBlock",
+                Some(CombItem::FusedGate { .. }) => "FusedGate",
+                Some(CombItem::VectorGate { .. }) => "VectorGate",
+                Some(_) => "other",
+                None => "?",
+            };
+            *kind_hist.entry(kind).or_insert(0) += c[0];
+        }
+        let mut kh: Vec<_> = kind_hist.into_iter().collect();
+        kh.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        for (k, n) in kh {
+            eprintln!("[EVALS] kind {:<20} {:>12} ({:.1}%)", k, n, 100.0 * n as f64 / tot.max(1) as f64);
+        }
+        // Fused single-bit gates: where does their output go? Weighted by
+        // evals. A gate whose only comb consumer is one two-state entry can
+        // be absorbed into it.
+        {
+            let mut h: std::collections::HashMap<&'static str, u64> = std::collections::HashMap::new();
+            let mut dst_bits_multi = 0u64;
+            for (eidx, c) in ranked.iter() {
+                let Some(CombItem::FusedGate { op }) = self.comb_entries.get(*eidx).map(|e| &e.item) else { continue };
+                let dst = match op {
+                    FusedGate::Buf1 { dst, .. } | FusedGate::Bin2 { dst, .. } | FusedGate::Mux2 { dst, .. } | FusedGate::UdpLut3 { dst, .. } => *dst,
+                };
+                let id = dst.sig_id as usize;
+                if self.signal_widths.get(id).copied().unwrap_or(1) > 1 {
+                    dst_bits_multi += c[0];
+                }
+                let (lo, hi) = if id + 1 < self.comb_dep_offsets.len() {
+                    (self.comb_dep_offsets[id] as usize, self.comb_dep_offsets[id + 1] as usize)
+                } else {
+                    (0, 0)
+                };
+                let cons: Vec<usize> = self.comb_dep_entries[lo..hi].iter().map(|&e| e as usize).collect();
+                let key: &'static str = match cons.len() {
+                    0 => "fanout0 (edge/process readers only)",
+                    1 => {
+                        let ce = cons[0];
+                        let ts = self.ts_hdr.get(ce).map_or(0, |h| h.kind()) != 0;
+                        match self.comb_entries.get(ce).map(|e| &e.item) {
+                            Some(CombItem::FusedGate { .. }) => "fanout1 -> gate",
+                            Some(CombItem::CompiledContAssign { .. }) => if ts { "fanout1 -> TS contassign" } else { "fanout1 -> interp contassign" },
+                            Some(CombItem::CompiledAlwaysBlock { .. }) => if ts { "fanout1 -> TS always" } else { "fanout1 -> interp always" },
+                            _ => "fanout1 -> other",
+                        }
+                    }
+                    2 => "fanout2",
+                    3..=4 => "fanout3-4",
+                    _ => "fanout5+",
+                };
+                *h.entry(key).or_insert(0) += c[0];
+            }
+            let mut hv: Vec<_> = h.into_iter().collect();
+            hv.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+            for (k, n) in hv {
+                eprintln!("[EVALS] gate {:<40} {:>12} ({:.1}% of all evals)", k, n, 100.0 * n as f64 / tot.max(1) as f64);
+            }
+            eprintln!("[EVALS] gate dst in multi-bit signal: {} evals", dst_bits_multi);
+        }
+        // Entries that evaluate at (nearly) every clock edge.
+        let max = ranked.first().map(|(_, c)| c[0]).unwrap_or(0);
+        for frac in [1.0f64, 0.66, 0.5, 0.33] {
+            let thr = (max as f64 * frac) as u64;
+            let n = ranked.iter().filter(|(_, c)| c[0] >= thr).count();
+            let sum: u64 = ranked.iter().filter(|(_, c)| c[0] >= thr).map(|(_, c)| c[0]).sum();
+            eprintln!("[EVALS] entries with evals >= {:.2} x max: {} entries, {:.1}% of evals", frac, n, 100.0 * sum as f64 / tot.max(1) as f64);
+        }
+        let top_n: usize = std::env::var("XEZIM_EVALS_TOP").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+        for (rank, (eidx, c)) in ranked.iter().take(top_n).enumerate() {
+            let (scope, ninsn, nreads) = match self.comb_entries.get(*eidx) {
+                Some(e) => (
+                    e.cold.scope_hint.as_deref().unwrap_or("?"),
+                    match &e.item {
+                        CombItem::CompiledContAssign { compiled, .. }
+                        | CombItem::CompiledAlwaysBlock { compiled, .. } => compiled.instructions.len(),
+                        _ => 0,
+                    },
+                    e.cold.read_signal_ids.len(),
+                ),
+                None => ("?", 0, 0),
+            };
+            let ts = self.comb_path_counts.get(*eidx).map(|c| c[0]).unwrap_or(0);
+            eprintln!(
+                "[EVALS] #{rank} eidx={eidx} evals={} same_time={} ts={} insns={} reads={} scope={}",
+                c[0], c[1], ts, ninsn, nreads, scope
+            );
+        }
+    }
+
     fn dump_edge_paths(&mut self) {
         if !self.trace_comb_paths || self.edge_path_counts.is_empty() {
             return;
@@ -27584,6 +27730,7 @@ impl Simulator {
         self.ts_comb.clear();
         self.comb_dep_offsets = cache.dep_offsets;
         self.comb_dep_entries = cache.dep_entries;
+        self.gate_lane_valid = false;
         self.comb_unresolved_idx = cache.unresolved_idx;
         self.comb_time0_idx = cache.time0_idx;
         self.comb_time0_deferred = cache.time0_deferred;
@@ -31553,6 +31700,7 @@ impl Simulator {
         }
         self.comb_dep_offsets = dep_offsets;
         self.comb_dep_entries = dep_entries;
+        self.gate_lane_valid = false;
         // Co-activation census setup: predecessor CSR (entry -> writer
         // entries of its read signals, capped at 16 preds/entry). Built here
         // so it reflects the FINAL entry order, learning from the topo-
@@ -37677,6 +37825,7 @@ impl Simulator {
         }
         self.dump_comb_paths();
         self.dump_edge_paths();
+        self.dump_comb_evals();
         self.dump_template_census();
         self.dump_island_census();
         self.dump_cycle_census();
@@ -37896,7 +38045,7 @@ impl Simulator {
             unresolved, self.comb_entries.len());
         let quiet_evals = self.entry_evals.saturating_sub(self.prof_settle_writes);
         eprintln!(
-            "[PROF] settle_writes={} ({:.1}% of evals changed a signal, {} quiet) dep_edges={} ({:.1} per write)",
+            "[PROF] settle_writes={} ({:.1}% of evals changed a signal, {} quiet) dep_edges={} ({:.1} per write) repass_evals={}",
             self.prof_settle_writes,
             if self.entry_evals > 0 {
                 100.0 * self.prof_settle_writes as f64 / self.entry_evals as f64
@@ -37909,7 +38058,8 @@ impl Simulator {
                 self.prof_settle_dep_edges as f64 / self.prof_settle_writes as f64
             } else {
                 0.0
-            }
+            },
+            self.prof_settle_repass_evals
         );
         eprintln!(
             "[PROF] two_state_evals={} ({} entries lowered)",
@@ -49074,6 +49224,45 @@ impl Simulator {
         }
     }
 
+    /// Classify the fused single-bit gates whose destination has no comb
+    /// reader (its only consumers are edge blocks / processes): those never
+    /// feed the worklist, so evaluation order inside a pass is irrelevant
+    /// and they can run in a batch. Rebuilt whenever the dependency tables
+    /// change. Clock-tree entries stay on the generic path.
+    fn build_gate_lane(&mut self) {
+        let n = self.comb_entries.len();
+        self.gate_lane.clear();
+        self.gate_lane.resize(n, u32::MAX);
+        self.gate_ops.clear();
+        for eidx in 0..n {
+            let CombItem::FusedGate { op } = &self.comb_entries[eidx].item else { continue };
+            if self.is_clock_tree_entry.get(eidx).copied().unwrap_or(false) {
+                continue;
+            }
+            let dst = match op {
+                FusedGate::Buf1 { dst, .. }
+                | FusedGate::Bin2 { dst, .. }
+                | FusedGate::Mux2 { dst, .. }
+                | FusedGate::UdpLut3 { dst, .. } => *dst,
+            };
+            let id = dst.sig_id as usize;
+            let readers = if id + 1 < self.comb_dep_offsets.len() {
+                self.comb_dep_offsets[id + 1] - self.comb_dep_offsets[id]
+            } else {
+                0
+            };
+            if readers != 0 {
+                continue;
+            }
+            self.gate_lane[eidx] = self.gate_ops.len() as u32;
+            self.gate_ops.push(*op);
+        }
+        self.gate_queued.clear();
+        self.gate_queued.resize(self.gate_ops.len(), false);
+        self.gate_queue.clear();
+        self.gate_lane_valid = true;
+    }
+
     fn settle_combinatorial_inner(&mut self) {
 
         if self.settling {
@@ -49088,6 +49277,9 @@ impl Simulator {
         self.settling = true;
         self.settle_calls += 1;
 
+        if !self.gate_lane_valid || self.gate_lane.len() != self.comb_entries.len() {
+            self.build_gate_lane();
+        }
         let entries = std::mem::take(&mut self.comb_entries);
         let dep_offsets = std::mem::take(&mut self.comb_dep_offsets);
         let dep_entries = std::mem::take(&mut self.comb_dep_entries);
@@ -49108,6 +49300,16 @@ impl Simulator {
         // nothing else touches them. Restored on every exit path below.
         let mut triggered = std::mem::take(&mut self.settle_triggered);
         let mut next_list = std::mem::take(&mut self.settle_triggered_list);
+        // The lane bypasses the per-entry hooks (activity monitor, trace,
+        // per-entry profile, path census), so it is off while any is armed.
+        let lane_on = !self.activity_mon
+            && self.trace_always.is_none()
+            && !self.profile_report
+            && !self.trace_comb_paths
+            && self.proc_depth == 0;
+        let gate_lane = std::mem::take(&mut self.gate_lane);
+        let mut gate_queue = std::mem::take(&mut self.gate_queue);
+        let mut gate_queued = std::mem::take(&mut self.gate_queued);
 
         let mut total_iters = 0u64;
         let limit = self.settle_limit as u64;
@@ -49216,6 +49418,9 @@ impl Simulator {
             self.is_clock_tree_entry = tree_entry;
             self.settle_triggered = triggered;
             self.settle_triggered_list = next_list;
+            self.gate_lane = gate_lane;
+            self.gate_queue = gate_queue;
+            self.gate_queued = gate_queued;
             self.settling = false;
             return;
         }
@@ -49254,6 +49459,10 @@ impl Simulator {
                     .unwrap_or(8)
             })
         };
+        static PREFETCH_MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let prefetch_mode = *PREFETCH_MODE.get_or_init(|| {
+            std::env::var("XEZIM_PREFETCH_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        });
         let mon_on = self.activity_mon;
         let trace_on = self.trace_always.is_some();
         let warn_x_on = self.warn_x && self.time > 0;
@@ -49310,6 +49519,7 @@ impl Simulator {
         let mut n_evals = 0u64;
         let mut n_dc = 0u64;
         let mut n_ab = 0u64;
+        let mut n_repass = 0u64;
         // Settle census (folded back once, like the counters above).
         let mut n_writes = 0u64;
         let mut n_dep_edges = 0u64;
@@ -49342,6 +49552,17 @@ impl Simulator {
                         let __dep = __dep_u32 as usize;
                         if __tree_clk && tree_entry.get(__dep).copied().unwrap_or(false) {
                             continue;
+                        }
+                        if lane_on {
+                            let __g = unsafe { *gate_lane.get_unchecked(__dep) };
+                            if __g != u32::MAX {
+                                let __g = __g as usize;
+                                if !gate_queued[__g] {
+                                    gate_queued[__g] = true;
+                                    gate_queue.push(__g as u32);
+                                }
+                                continue;
+                            }
                         }
                         debug_assert!(__dep < triggered.len());
                         if !unsafe { *triggered.get_unchecked(__dep) } {
@@ -49440,7 +49661,41 @@ impl Simulator {
                 #[cfg(target_arch = "x86_64")]
                 {
                     let d = cur_pos + prefetch_dist;
-                    if d < cur_list.len() {
+                    if prefetch_mode != 0 {
+                        // Two-state entries never touch `entries[]` any more:
+                        // their first loads are the packed header and the
+                        // arena stream. Header at full distance; the stream
+                        // of the entry whose header arrived half a distance
+                        // ago.
+                        if d < cur_list.len() {
+                            let nxt = cur_list[d];
+                            if nxt < self.ts_hdr.len() {
+                                unsafe {
+                                    core::arch::x86_64::_mm_prefetch(
+                                        self.ts_hdr.as_ptr().add(nxt) as *const i8,
+                                        core::arch::x86_64::_MM_HINT_T0,
+                                    );
+                                }
+                            }
+                        }
+                        if prefetch_mode >= 2 {
+                            let d2 = cur_pos + prefetch_dist / 2;
+                            if d2 < cur_list.len() {
+                                let nxt = cur_list[d2];
+                                if let Some(h) = self.ts_hdr.get(nxt) {
+                                    let off = h.off as usize;
+                                    if h.kind() != 0 && off < self.ts_arena.len() {
+                                        unsafe {
+                                            core::arch::x86_64::_mm_prefetch(
+                                                self.ts_arena.as_ptr().add(off) as *const i8,
+                                                core::arch::x86_64::_MM_HINT_T0,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if d < cur_list.len() {
                         let nxt = cur_list[d];
                         if nxt < entries.len() {
                             unsafe {
@@ -49498,6 +49753,20 @@ impl Simulator {
                 let dirty_before = self.dirty_list.len();
 
                 n_evals += 1;
+                if _iteration > 0 {
+                    n_repass += 1;
+                }
+                if self.trace_comb_paths {
+                    if eidx >= self.comb_eval_counts.len() {
+                        self.comb_eval_counts.resize(eidx + 1, [0; 2]);
+                        self.comb_eval_last_time.resize(eidx + 1, u64::MAX);
+                    }
+                    self.comb_eval_counts[eidx][0] += 1;
+                    if self.comb_eval_last_time[eidx] == self.time {
+                        self.comb_eval_counts[eidx][1] += 1;
+                    }
+                    self.comb_eval_last_time[eidx] = self.time;
+                }
                 // Co-activation stamp: count, per predecessor edge, how often
                 // this entry evaluates in the same TIME SLOT as that
                 // predecessor. Opt-in; ~4 loads per eval when enabled.
@@ -50056,6 +50325,24 @@ impl Simulator {
                 }
             }
 
+            // Gate lane: the fused gates queued during this pass, in one
+            // tight loop. None of them feeds a comb entry, so nothing here
+            // can trigger further work in this pass.
+            if !gate_queue.is_empty() {
+                let sdf_any = !self.sdf_delays.is_empty();
+                for qi in 0..gate_queue.len() {
+                    let g = gate_queue[qi] as usize;
+                    gate_queued[g] = false;
+                    let op = self.gate_ops[g];
+                    let (dst, new_bit) = self.fused_gate_eval(&op);
+                    if self.fused_bit_commit(dst, new_bit, sdf_any) {
+                        n_writes += 1;
+                    }
+                }
+                n_evals += gate_queue.len() as u64;
+                n_dc += gate_queue.len() as u64;
+                gate_queue.clear();
+            }
             // After one full topo scan: if no entry was evaluated, fixpoint.
             if !evaluated_any {
                 converged = true;
@@ -50076,6 +50363,7 @@ impl Simulator {
         self.entry_evals += n_evals;
         self.prof_settle_dc_count += n_dc;
         self.prof_settle_ab_count += n_ab;
+        self.prof_settle_repass_evals += n_repass;
         self.prof_settle_writes += n_writes;
         self.prof_settle_dep_edges += n_dep_edges;
         self.comb_entries = entries;
@@ -50086,6 +50374,9 @@ impl Simulator {
         self.settle_inject_bits = inject_bits;
         self.settle_triggered = triggered;
         self.settle_triggered_list = next_list;
+        self.gate_lane = gate_lane;
+        self.gate_queue = gate_queue;
+        self.gate_queued = gate_queued;
         self.settle_dirty_ids = cur_list;
         self.settle_iters += total_iters;
         // Unconverged = the loop exhausted its budget with entries still
