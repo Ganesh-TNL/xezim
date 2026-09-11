@@ -609,8 +609,8 @@ macro_rules! write_sig {
             // The dense bitmap keeps unrelated writes a single cheap branch;
             // positive hits use the sparse CSR fanout built after compile.
             if $self.armed_edge
-                && __wsig_id < $self.armed_input_bitmap.len()
-                && $self.armed_input_bitmap[__wsig_id]
+                && ((__wsig_id >> 6) < $self.armed_input_bitmap.len())
+                && ($self.armed_input_bitmap[__wsig_id >> 6] >> (__wsig_id & 63)) & 1 != 0
             {
                 let (lo, hi) = $self.armed_input_ranges[__wsig_id];
                 for __k in lo as usize..hi as usize {
@@ -5587,7 +5587,10 @@ pub struct Simulator {
     value_trace_pending: std::cell::RefCell<Vec<(usize, u64, Value, Value, usize, &'static str)>>,
     value_trace_emitted: u64,
     value_trace_limit: u64,
-    armed_input_bitmap: Vec<bool>,
+    /// One bit per signal id (u64 words): is it a data input of a gateable
+    /// edge block? A bitset keeps the whole table cache-resident where one
+    /// byte per signal (1.4 MB with array elements) did not.
+    armed_input_bitmap: Vec<u64>,
     armed_input_ranges: Vec<(u32, u32)>,
     armed_input_blocks: Vec<u32>,
     edge_block_armed: Vec<u8>,
@@ -20854,21 +20857,26 @@ impl Simulator {
     /// (and the sbox-class dispatch) is unaffected.
     fn exec_two_state_wide(&mut self, insns: &[super::bytecode::TsInsn], num_regs: u32) -> bool {
         use super::bytecode::TsInsn;
-        let mut regs = std::mem::take(&mut self.ts_regs);
-        let mut wregs = std::mem::take(&mut self.ts_wregs);
-        if regs.len() < num_regs as usize {
-            regs.resize(num_regs as usize, 0);
+        // Registers live in `self.ts_regs` and are used in place: no callee
+        // below touches that vector, and it never reallocates during the
+        // block (sized here), so an unbounded raw view is sound and saves
+        // the take/restore pair on every entry and exit.
+        if self.ts_regs.len() < num_regs as usize {
+            self.ts_regs.resize(num_regs as usize, 0);
         }
-        if wregs.len() < num_regs as usize {
-            wregs.resize(num_regs as usize, [0, 0]);
+        let regs: &mut [u64] =
+            unsafe { std::slice::from_raw_parts_mut(self.ts_regs.as_mut_ptr(), self.ts_regs.len()) };
+        if self.ts_wregs.len() < num_regs as usize {
+            self.ts_wregs.resize(num_regs as usize, [0, 0]);
         }
+        let wregs: &mut [[u64; 2]] = unsafe {
+            std::slice::from_raw_parts_mut(self.ts_wregs.as_mut_ptr(), self.ts_wregs.len())
+        };
         let insns_ptr = insns.as_ptr();
         let insns_len = insns.len();
         let mut pc = 0usize;
         macro_rules! bail {
             () => {{
-                self.ts_regs = regs;
-                self.ts_wregs = wregs;
                 return false;
             }};
         }
@@ -21373,8 +21381,6 @@ impl Simulator {
             }
             pc += 1;
         }
-        self.ts_regs = regs;
-        self.ts_wregs = wregs;
         true
     }
 
@@ -21383,10 +21389,15 @@ impl Simulator {
     /// (`has_ctrl` routed them to the pc-loop twin).
     fn exec_two_state_line(&mut self, insns: &[super::bytecode::TsInsn], num_regs: u32) -> bool {
         use super::bytecode::TsInsn;
-        let mut regs = std::mem::take(&mut self.ts_regs);
-        if regs.len() < num_regs as usize {
-            regs.resize(num_regs as usize, 0);
+        // Registers live in `self.ts_regs` and are used in place: no callee
+        // below touches that vector, and it never reallocates during the
+        // block (sized here), so an unbounded raw view is sound and saves
+        // the take/restore pair on every entry and exit.
+        if self.ts_regs.len() < num_regs as usize {
+            self.ts_regs.resize(num_regs as usize, 0);
         }
+        let regs: &mut [u64] =
+            unsafe { std::slice::from_raw_parts_mut(self.ts_regs.as_mut_ptr(), self.ts_regs.len()) };
         // Register indices are assigned by the block compiler below
         // `num_regs`, and `regs` was just sized to it: the bounds checks on
         // every operand access are provably redundant, so go through a raw
@@ -21400,7 +21411,6 @@ impl Simulator {
         macro_rules! xbail {
             () => {{
                 self.ts_xread_bail = true;
-                self.ts_regs = regs;
                 return false;
             }};
         }
@@ -21613,13 +21623,11 @@ impl Simulator {
                 TsInsn::ElemLoad(op) => {
                     let i = r!(op.idx) as i64;
                     if i < op.lo || i > op.hi {
-                        self.ts_regs = regs;
                         return false;
                     }
                     let eid = op.first as usize + (i - op.lo) as usize;
                     let (v, x) = self.signal_table[eid].raw_bits();
                     if x != 0 {
-                        self.ts_regs = regs;
                         return false;
                     }
                     r!(op.s) = v;
@@ -21645,13 +21653,11 @@ impl Simulator {
                     let (iv, _) = self.signal_table[op.idx_sig as usize].raw_bits();
                     let i = iv as i64;
                     if i < op.lo || i > op.hi {
-                        self.ts_regs = regs;
                         return false;
                     }
                     let eid = op.first as usize + (i - op.lo) as usize;
                     let (ev, ex) = self.signal_table[eid].raw_bits();
                     if ex != 0 {
-                        self.ts_regs = regs;
                         return false;
                     }
                     let m = if op.w >= 64 { u64::MAX } else { (1u64 << op.w) - 1 };
@@ -21742,7 +21748,6 @@ impl Simulator {
                 | TsInsn::CaseMaskJmp { .. } => unreachable!("ctrl insn in straight-line block"),
             } }
         }
-        self.ts_regs = regs;
         true
     }
 
@@ -21893,14 +21898,18 @@ impl Simulator {
 
     fn exec_two_state_ctrl(&mut self, insns: &[super::bytecode::TsInsn], num_regs: u32) -> bool {
         use super::bytecode::TsInsn;
-        let mut regs = std::mem::take(&mut self.ts_regs);
-        if regs.len() < num_regs as usize {
-            regs.resize(num_regs as usize, 0);
+        // Registers live in `self.ts_regs` and are used in place: no callee
+        // below touches that vector, and it never reallocates during the
+        // block (sized here), so an unbounded raw view is sound and saves
+        // the take/restore pair on every entry and exit.
+        if self.ts_regs.len() < num_regs as usize {
+            self.ts_regs.resize(num_regs as usize, 0);
         }
+        let regs: &mut [u64] =
+            unsafe { std::slice::from_raw_parts_mut(self.ts_regs.as_mut_ptr(), self.ts_regs.len()) };
         macro_rules! xbail {
             () => {{
                 self.ts_xread_bail = true;
-                self.ts_regs = regs;
                 return false;
             }};
         }
@@ -22177,13 +22186,11 @@ impl Simulator {
                 TsInsn::ElemLoad(op) => {
                     let i = regs[op.idx as usize] as i64;
                     if i < op.lo || i > op.hi {
-                        self.ts_regs = regs;
                         return false;
                     }
                     let eid = op.first as usize + (i - op.lo) as usize;
                     let (v, x) = self.signal_table[eid].raw_bits();
                     if x != 0 {
-                        self.ts_regs = regs;
                         return false;
                     }
                     regs[op.s as usize] = v;
@@ -22209,13 +22216,11 @@ impl Simulator {
                     let (iv, _) = self.signal_table[op.idx_sig as usize].raw_bits();
                     let i = iv as i64;
                     if i < op.lo || i > op.hi {
-                        self.ts_regs = regs;
                         return false;
                     }
                     let eid = op.first as usize + (i - op.lo) as usize;
                     let (ev, ex) = self.signal_table[eid].raw_bits();
                     if ex != 0 {
-                        self.ts_regs = regs;
                         return false;
                     }
                     let m = if op.w >= 64 { u64::MAX } else { (1u64 << op.w) - 1 };
@@ -22301,7 +22306,6 @@ impl Simulator {
             }
             pc += 1;
         }
-        self.ts_regs = regs;
         true
     }
 
@@ -74979,7 +74983,7 @@ impl Simulator {
             if self.sig_to_edge_pos.get(id).is_some_and(|&p| p >= 0) {
                 self.signal_commit_plan[id] |= 1;
             }
-            if self.armed_input_bitmap.get(id).copied().unwrap_or(false) {
+            if self.armed_input_set(id) {
                 self.signal_commit_plan[id] |= 2;
             }
         }
@@ -75014,10 +75018,17 @@ impl Simulator {
     }
 
     #[inline(always)]
+    fn armed_input_set(&self, id: usize) -> bool {
+        match self.armed_input_bitmap.get(id >> 6) {
+            Some(w) => (w >> (id & 63)) & 1 != 0,
+            None => false,
+        }
+    }
+
+    #[inline(always)]
     fn note_armed_write(&mut self, id: usize) {
         if !self.armed_edge
-            || id >= self.armed_input_bitmap.len()
-            || !self.armed_input_bitmap[id]
+            || !self.armed_input_set(id)
         {
             return;
         }
@@ -75963,7 +75974,7 @@ impl Simulator {
         let bitmap_len = pairs
             .last()
             .map_or(0, |(sid, _)| *sid as usize + 1);
-        self.armed_input_bitmap = vec![false; bitmap_len];
+        self.armed_input_bitmap = vec![0u64; bitmap_len.div_ceil(64)];
         self.armed_input_ranges = vec![(0, 0); bitmap_len];
         self.armed_input_blocks.reserve(pairs.len());
         let mut cursor = 0usize;
@@ -75976,7 +75987,7 @@ impl Simulator {
                 cursor += 1;
             }
             let hi = self.armed_input_blocks.len() as u32;
-            self.armed_input_bitmap[sid as usize] = true;
+            self.armed_input_bitmap[(sid as usize) >> 6] |= 1u64 << (sid & 63);
             self.armed_input_ranges[sid as usize] = (lo, hi);
             input_count += 1;
         }
