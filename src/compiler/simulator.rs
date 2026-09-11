@@ -20623,7 +20623,8 @@ impl Simulator {
                 let (bi, op) = super::bytecode::ts_last_bail();
                 (op, bi)
             };
-            if rank < 6 && bail == "RawHazard" {
+            let dump_n: usize = std::env::var("XEZIM_COMB_PATHS_DUMP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            if (rank < 6 && bail == "RawHazard") || rank < dump_n {
                 for (k, insn) in compiled.instructions.iter().enumerate() {
                     eprintln!("[COMBPATH]     insn[{k}]  {:?}", insn);
                 }
@@ -21234,6 +21235,12 @@ impl Simulator {
                 }
                 TsInsn::ConstStoreX { sig, v, x } => {
                     self.ts_store_xz(*sig as usize, *v, *x);
+                }
+                TsInsn::RangeFillW { sig, hi, lo, bit } => {
+                    self.ts_wide_range_fill(*sig as usize, *lo, *hi, *bit);
+                }
+                TsInsn::RangeFillNbaW { sig, hi, lo, bit } => {
+                    self.ts_wide_range_fill_nba(*sig as usize, *lo, *hi, *bit);
                 }
                 TsInsn::RangeStoreNbaW { sig, hi, lo, s, mask } => {
                     let v = regs[*s as usize] & mask;
@@ -21859,6 +21866,12 @@ impl Simulator {
                 TsInsn::ConstStoreX { sig, v, x } => {
                     self.ts_store_xz(*sig as usize, *v, *x);
                 }
+                TsInsn::RangeFillW { sig, hi, lo, bit } => {
+                    self.ts_wide_range_fill(*sig as usize, *lo, *hi, *bit);
+                }
+                TsInsn::RangeFillNbaW { sig, hi, lo, bit } => {
+                    self.ts_wide_range_fill_nba(*sig as usize, *lo, *hi, *bit);
+                }
                 TsInsn::RangeStoreNbaW { sig, hi, lo, s, mask } => {
                     let v = r!(*s) & mask;
                     self.ts_wide_range_store_nba(*sig as usize, *lo, *hi, v);
@@ -22237,6 +22250,75 @@ impl Simulator {
         }
     }
 
+    /// `sig[hi:lo] = {N{bit}}` for a destination of any width: fill the
+    /// window 64 bits at a time through `splice_bits64`, then the ordinary
+    /// change bookkeeping when any bit moved.
+    fn ts_wide_range_fill(&mut self, id: usize, lo: u32, hi: u32, bit: u8) {
+        let fill = if bit != 0 { u64::MAX } else { 0 };
+        let mut pos = lo as usize;
+        let end = hi as usize + 1;
+        let mut changed = false;
+        while pos < end {
+            let n = (end - pos).min(64);
+            if self.signal_table[id].splice_bits64(pos, fill, 0, n) {
+                changed = true;
+            }
+            pos += n;
+        }
+        if !changed {
+            return;
+        }
+        self.sync_mirror(id);
+        if self.ts_direct_writes {
+            if self.dirty_list.last() != Some(&id) {
+                self.dirty_list.push(id);
+            }
+        } else if !self.dirty_signals[id] {
+            self.dirty_signals[id] = true;
+            self.dirty_list.push(id);
+            self.dirty_any = true;
+        }
+        self.table_modified = true;
+        self.after_signal_write(id);
+    }
+
+    /// Non-blocking twin of `ts_wide_range_fill`: fill the window in the
+    /// pending NBA value, seeding it from the signal with elision.
+    fn ts_wide_range_fill_nba(&mut self, id: usize, lo: u32, hi: u32, bit: u8) {
+        let fill = if bit != 0 { u64::MAX } else { 0 };
+        let end = hi as usize + 1;
+        if let Some(i) = self.nba_fast_index.get(id) {
+            let mut pos = lo as usize;
+            while pos < end {
+                let n = (end - pos).min(64);
+                self.nba_fast[i].value.splice_bits64(pos, fill, 0, n);
+                pos += n;
+            }
+        } else {
+            let mut nv = self.signal_table[id].clone();
+            let mut changed = false;
+            let mut pos = lo as usize;
+            while pos < end {
+                let n = (end - pos).min(64);
+                if nv.splice_bits64(pos, fill, 0, n) {
+                    changed = true;
+                }
+                pos += n;
+            }
+            if !changed {
+                self.prof_nba_elided += 1;
+            } else {
+                nv.is_signed = self.signal_signed[id];
+                self.nba_fast_index.insert(id, self.nba_fast.len());
+                self.nba_fast.push(NbaFast {
+                    block_index: 0,
+                    signal_id: id,
+                    value: nv,
+                });
+            }
+        }
+    }
+
     fn ts_store_nba(&mut self, id: usize, v: u64, w: u32) {
         let val = Value::from_u64(v, w);
         if let Some(i) = self.nba_fast_index.get(id) {
@@ -22533,6 +22615,12 @@ impl Simulator {
                 }
                 TsInsn::ConstStoreX { sig, v, x } => {
                     self.ts_store_xz(*sig as usize, *v, *x);
+                }
+                TsInsn::RangeFillW { sig, hi, lo, bit } => {
+                    self.ts_wide_range_fill(*sig as usize, *lo, *hi, *bit);
+                }
+                TsInsn::RangeFillNbaW { sig, hi, lo, bit } => {
+                    self.ts_wide_range_fill_nba(*sig as usize, *lo, *hi, *bit);
                 }
                 TsInsn::RangeStoreNbaW { sig, hi, lo, s, mask } => {
                     let v = regs[*s as usize] & mask;
@@ -38039,6 +38127,16 @@ impl Simulator {
             self.prof_settle_ab_count
         );
         eprintln!("[PROF] engine={}", if self.cycle_mode { "cycle" } else { "event" });
+        eprintln!(
+            "[PROF] tables: signals={} sig_to_edge_pos={} edge_signals={} armed_input_ranges={} dirty_signals={} gate_lane_ops={}",
+            self.signal_table.len(),
+            self.sig_to_edge_pos.len(),
+            self.edge_signal_ids.len(),
+            self.armed_input_ranges.len(),
+            self.dirty_signals.len(),
+            self.gate_ops.len()
+        );
+        eprintln!("[PROF] vm_insns_total={}", self.prof_insns_executed);
         eprintln!("[PROF] clock_tree: roots={} entries={} eager_evals={}", self.clock_tree_by_root.len(), self.is_clock_tree_entry.iter().filter(|&&b| b).count(), self.prof_clock_tree_evals);
         eprintln!("[PROF] settle_calls={} settle_iters={} max_iters={} entry_evals={} unresolved_entries={}/{}",
             self.settle_calls, self.settle_iters, self.max_settle_iters, self.entry_evals,

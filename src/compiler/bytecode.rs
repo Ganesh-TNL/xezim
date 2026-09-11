@@ -12938,6 +12938,11 @@ pub enum TsInsn {
     /// `RangeStoreNba` for a destination wider than 64 bits: the window is
     /// spliced into the pending NBA value (seeded from the signal).
     RangeStoreNbaW { sig: u32, hi: u32, lo: u32, s: u16, mask: u64 },
+    /// `sig[hi:lo] = {N{bit}}` for any width (the `bus = {265{1'b0}}` default
+    /// assignment that opens most c906 decode blocks): a constant fill of
+    /// the window, blocking and non-blocking.
+    RangeFillW { sig: u32, hi: u32, lo: u32, bit: u8 },
+    RangeFillNbaW { sig: u32, hi: u32, lo: u32, bit: u8 },
     /// `RangeStoreX` into a >64-bit destination (folded 4-state constant).
     RangeStoreXW { sig: u32, hi: u32, lo: u32, v: u64, x: u64 },
     /// Dynamic array-element read: eid = first + (regs[idx] - lo). ABORTS
@@ -13579,11 +13584,16 @@ pub fn lower_two_state(
     // top of the loop rejects the block instead.
     let mut xc: Vec<Option<(u64, u64)>> = vec![None; cb.num_regs as usize];
     let mut xc_live: Vec<RegId> = Vec::new();
+    // A `{N{bit}}` replicate wider than the register banks is not
+    // materialised: the register only remembers the bit, `rw` stays None so
+    // every ordinary consumer bails, and the store arms turn it into a fill.
+    let mut wfill: Vec<Option<u8>> = vec![None; cb.num_regs as usize];
     macro_rules! def {
         ($rw:ident, $r:expr, $w:expr) => {{
             let r = $r as usize;
             let w = $w;
             sg[r] = false;
+            wfill[r] = None;
             match $rw[r] {
                 Some(prev) if prev != w => {
                     if !wconf[r] {
@@ -14376,6 +14386,15 @@ pub fn lower_two_state(
             }
             Insn::BlockingAssign(sig, r, w) => {
                 let sig = *sig as usize;
+                if let Some(bit) = wfill[*r as usize] {
+                    if sig >= signal_widths.len() || signal_widths[sig] != *w || signal_real[sig] || *w == 0 {
+                        gate!("fill dest shape");
+                    }
+                    side_effects = true;
+                    stored.push(sig as u32);
+                    out.push(TsInsn::RangeFillW { sig: sig as u32, hi: *w - 1, lo: 0, bit });
+                    continue;
+                }
                 let cw = rw[*r as usize]?;
                 if let Some((v, x)) = xc[*r as usize] {
                     // §10.4.1 with a folded constant source. Every lowered
@@ -14437,6 +14456,16 @@ pub fn lower_two_state(
                 let sig = *sig as usize;
                 if sig >= signal_widths.len() || signal_real[sig] {
                     gate!("dest oob/real");
+                }
+                if let Some(bit) = wfill[*r as usize] {
+                    let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
+                    if high >= signal_widths[sig] {
+                        gate!("fill range past dest");
+                    }
+                    side_effects = true;
+                    stored.push(sig as u32);
+                    out.push(TsInsn::RangeFillW { sig: sig as u32, hi: high, lo: low, bit });
+                    continue;
                 }
                 let wide_dest = signal_widths[sig] > 64;
                 if let Some((v, x)) = xc[*r as usize] {
@@ -14514,6 +14543,15 @@ pub fn lower_two_state(
                 if sig >= signal_widths.len() || signal_real[sig] {
                     return None;
                 }
+                if let Some(bit) = wfill[*r as usize] {
+                    let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
+                    if high >= signal_widths[sig] {
+                        gate!("fill range past dest");
+                    }
+                    side_effects = true;
+                    out.push(TsInsn::RangeFillNbaW { sig: sig as u32, hi: high, lo: low, bit });
+                    continue;
+                }
                 let cw = rw[*r as usize]?;
                 let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
                 let w = high - low + 1;
@@ -14553,10 +14591,18 @@ pub fn lower_two_state(
             }
             Insn::NbaAssign(sig, r, w) => {
                 let sig = *sig as usize;
-                let cw = rw[*r as usize]?;
                 if sig >= signal_widths.len() || signal_real[sig] {
                     return None;
                 }
+                if let Some(bit) = wfill[*r as usize] {
+                    if signal_widths[sig] != *w || *w == 0 {
+                        gate!("fill dest shape");
+                    }
+                    side_effects = true;
+                    out.push(TsInsn::RangeFillNbaW { sig: sig as u32, hi: *w - 1, lo: 0, bit });
+                    continue;
+                }
+                let cw = rw[*r as usize]?;
                 if *w > 64 {
                     if *w > 128 || cw != *w || signal_signed[sig] {
                         return None;
@@ -14760,6 +14806,16 @@ pub fn lower_two_state(
             Insn::Replicate(d, src, n) => {
                 let sw = rw[*src as usize]?;
                 let n = *n;
+                if n > 128 && sw == 1 && xc[*src as usize].is_none() {
+                    if let Some(k) = rc[*src as usize] {
+                        if k <= 1 {
+                            def!(rw, *d, 1);
+                            rw[*d as usize] = None;
+                            wfill[*d as usize] = Some(k as u8);
+                            continue;
+                        }
+                    }
+                }
                 if n == 0 || sw > 64 || n > 128 {
                     return None;
                 }
@@ -14867,6 +14923,8 @@ pub fn lower_two_state(
                     | TsInsn::RangeStoreX { .. }
                     | TsInsn::RangeStoreW { .. }
                     | TsInsn::RangeStoreNbaW { .. }
+                    | TsInsn::RangeFillW { .. }
+                    | TsInsn::RangeFillNbaW { .. }
                     | TsInsn::RangeStoreXW { .. }
                     | TsInsn::ElemStore { .. }
                     | TsInsn::ElemStoreNba { .. }
@@ -14937,6 +14995,8 @@ pub fn lower_two_state(
             | TsInsn::StoreNba { sig, .. }
             | TsInsn::BitStoreNbaDyn { sig, .. }
             | TsInsn::RangeStoreNbaW { sig, .. }
+            | TsInsn::RangeFillW { sig, .. }
+            | TsInsn::RangeFillNbaW { sig, .. }
             | TsInsn::WStore { sig, .. }
             | TsInsn::WStoreNba { sig, .. } => writes.push(*sig),
             TsInsn::NbaFromElem(op) => writes.push(op.dst),
