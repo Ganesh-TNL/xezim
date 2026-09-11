@@ -14074,12 +14074,31 @@ pub fn lower_two_state(
                 }
             }
             Insn::LoadArrayElem(d, array, idx_reg) => {
+                let (first, lo, hi) = array_span(array)?;
+                // A constant, in-range index names one element: that is a
+                // plain signal load with the ordinary x-read contract, not an
+                // abortable element read — so it stays admissible after a
+                // store (`q <= mem[3][7:0]` behind a reset arm was 256 of
+                // the c906 edge bails).
+                if let Some(k) = rc[*idx_reg as usize] {
+                    let ki = k as i64;
+                    if ki < lo || ki > hi {
+                        return None;
+                    }
+                    let eid = first + (ki - lo) as usize;
+                    if signal_signed.get(eid).copied().unwrap_or(true) || !sig_ok(eid) {
+                        return None;
+                    }
+                    note_read(eid, 0, signal_widths[eid], true, stored.contains(&(eid as u32)), &mut reads_whole, &mut reads_slice);
+                    def!(rw, *d, signal_widths[eid]);
+                    out.push(TsInsn::LoadSig { d: *d as u16, sig: eid as u32 });
+                    continue;
+                }
                 // Abortable (X/out-of-range element read) — only admissible
                 // while nothing side-effecting has run.
                 if side_effects {
                     return None;
                 }
-                let (first, lo, hi) = array_span(array)?;
                 narrow_reg!(rw, *idx_reg, "wide array index");
                 let w = signal_widths[first];
                 def!(rw, *d, w);
