@@ -12985,6 +12985,11 @@ pub enum TsInsn {
     /// to the register by construction; stored via Value::set_words128).
     WStore { sig: u32, s: u16 },
     WStoreNba { sig: u32, s: u16, w: u32 },
+    /// `sig[lo+w-1:lo] = wregs[s]` / `<=`: a whole wide (65..=128-bit)
+    /// register written into a window of a wider destination (the
+    /// `bus[127:0] = data` arms of the c906 load/store arbiters).
+    WRangeStore { sig: u32, lo: u32, s: u16, w: u32 },
+    WRangeStoreNba { sig: u32, lo: u32, s: u16, w: u32 },
     /// Wrapping multiply at max operand width (both operands unsigned).
     Mul { d: u16, a: u16, b: u16, mask: u64 },
     /// Wide (65..=128-bit) slice of a SIGNAL into the wide bank; the two
@@ -14506,6 +14511,12 @@ pub fn lower_two_state(
                 };
                 let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
                 let w = high - low + 1;
+                if cw > 64 && cw <= 128 && w == cw && wide_dest && high < signal_widths[sig] {
+                    side_effects = true;
+                    stored.push(sig as u32);
+                    out.push(TsInsn::WRangeStore { sig: sig as u32, lo: low, s: *r as u16, w });
+                    continue;
+                }
                 if cw > 64 || w > 64 {
                     gate!("src reg >64b");
                 }
@@ -14558,6 +14569,11 @@ pub fn lower_two_state(
                 if signal_widths[sig] > 64 {
                     // Wide destination: a ≤64-bit window spliced into the
                     // pending value (the id_dp pipeline registers on c906).
+                    if cw > 64 && cw <= 128 && w == cw && high < signal_widths[sig] {
+                        side_effects = true;
+                        out.push(TsInsn::WRangeStoreNba { sig: sig as u32, lo: low, s: *r as u16, w });
+                        continue;
+                    }
                     if cw > 64 || w > 64 || high >= signal_widths[sig] {
                         gate!("wide nba range shape");
                     }
@@ -14925,6 +14941,8 @@ pub fn lower_two_state(
                     | TsInsn::RangeStoreNbaW { .. }
                     | TsInsn::RangeFillW { .. }
                     | TsInsn::RangeFillNbaW { .. }
+                    | TsInsn::WRangeStore { .. }
+                    | TsInsn::WRangeStoreNba { .. }
                     | TsInsn::RangeStoreXW { .. }
                     | TsInsn::ElemStore { .. }
                     | TsInsn::ElemStoreNba { .. }
@@ -14940,6 +14958,8 @@ pub fn lower_two_state(
         matches!(
             i,
             TsInsn::WLoadSig { .. }
+                | TsInsn::WRangeStore { .. }
+                | TsInsn::WRangeStoreNba { .. }
                 | TsInsn::WRedOr { .. }
                 | TsInsn::WRedAnd { .. }
                 | TsInsn::WConst { .. }
@@ -14997,6 +15017,8 @@ pub fn lower_two_state(
             | TsInsn::RangeStoreNbaW { sig, .. }
             | TsInsn::RangeFillW { sig, .. }
             | TsInsn::RangeFillNbaW { sig, .. }
+            | TsInsn::WRangeStore { sig, .. }
+            | TsInsn::WRangeStoreNba { sig, .. }
             | TsInsn::WStore { sig, .. }
             | TsInsn::WStoreNba { sig, .. } => writes.push(*sig),
             TsInsn::NbaFromElem(op) => writes.push(op.dst),

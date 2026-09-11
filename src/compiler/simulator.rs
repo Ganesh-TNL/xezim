@@ -20922,6 +20922,58 @@ impl Simulator {
         }
     }
 
+    /// `sig[lo+w-1:lo] = v` for a 65..=128-bit source window: two splices,
+    /// one round of change bookkeeping.
+    fn ts_wide_range_store2(&mut self, id: usize, lo: u32, v: [u64; 2], w: u32) {
+        let n0 = w.min(64) as usize;
+        let n1 = (w - 64) as usize;
+        let c0 = self.signal_table[id].splice_bits64(lo as usize, v[0], 0, n0);
+        let c1 = n1 > 0 && self.signal_table[id].splice_bits64(lo as usize + 64, v[1], 0, n1);
+        if !(c0 || c1) {
+            return;
+        }
+        self.sync_mirror(id);
+        if self.ts_direct_writes {
+            if self.dirty_list.last() != Some(&id) {
+                self.dirty_list.push(id);
+            }
+        } else if !self.dirty_signals[id] {
+            self.dirty_signals[id] = true;
+            self.dirty_list.push(id);
+            self.dirty_any = true;
+        }
+        self.table_modified = true;
+        self.after_signal_write(id);
+    }
+
+    /// Non-blocking twin of `ts_wide_range_store2`.
+    fn ts_wide_range_store2_nba(&mut self, id: usize, lo: u32, v: [u64; 2], w: u32) {
+        let n0 = w.min(64) as usize;
+        let n1 = (w - 64) as usize;
+        if let Some(i) = self.nba_fast_index.get(id) {
+            let t = &mut self.nba_fast[i].value;
+            t.splice_bits64(lo as usize, v[0], 0, n0);
+            if n1 > 0 {
+                t.splice_bits64(lo as usize + 64, v[1], 0, n1);
+            }
+        } else {
+            let mut nv = self.signal_table[id].clone();
+            let c0 = nv.splice_bits64(lo as usize, v[0], 0, n0);
+            let c1 = n1 > 0 && nv.splice_bits64(lo as usize + 64, v[1], 0, n1);
+            if !(c0 || c1) {
+                self.prof_nba_elided += 1;
+            } else {
+                nv.is_signed = self.signal_signed[id];
+                self.nba_fast_index.insert(id, self.nba_fast.len());
+                self.nba_fast.push(NbaFast {
+                    block_index: 0,
+                    signal_id: id,
+                    value: nv,
+                });
+            }
+        }
+    }
+
     fn ts_store_nba_wide(&mut self, id: usize, v: [u64; 2], w: u32) {
         let val = Value::from_words128(v, w);
         if let Some(i) = self.nba_fast_index.get(id) {
@@ -21572,6 +21624,14 @@ impl Simulator {
                     let v = wregs[*s as usize];
                     self.ts_store_nba_wide(*sig as usize, v, *w);
                 }
+                TsInsn::WRangeStore { sig, lo, s, w } => {
+                    let v = wregs[*s as usize];
+                    self.ts_wide_range_store2(*sig as usize, *lo, v, *w);
+                }
+                TsInsn::WRangeStoreNba { sig, lo, s, w } => {
+                    let v = wregs[*s as usize];
+                    self.ts_wide_range_store2_nba(*sig as usize, *lo, v, *w);
+                }
             }
             pc += 1;
         }
@@ -22026,6 +22086,8 @@ impl Simulator {
                     }
                 }
                 TsInsn::WLoadSig { .. }
+                | TsInsn::WRangeStore { .. }
+                | TsInsn::WRangeStoreNba { .. }
                 | TsInsn::WConst { .. }
                 | TsInsn::WXor { .. }
                 | TsInsn::WAnd { .. }
@@ -22834,6 +22896,8 @@ impl Simulator {
                     }
                 }
                 TsInsn::WLoadSig { .. }
+                | TsInsn::WRangeStore { .. }
+                | TsInsn::WRangeStoreNba { .. }
                 | TsInsn::WConst { .. }
                 | TsInsn::WXor { .. }
                 | TsInsn::WAnd { .. }
