@@ -25309,8 +25309,10 @@ impl Simulator {
         match self.ts_edge.get(block_idx) {
             Some(TsSlot::No) => {}
             Some(TsSlot::Yes(ts)) => {
-                let ts = ts.clone();
-                if self.ts_guard_and_exec(&ts) {
+                // Raw view instead of an `Arc` clone per fire: the slot is
+                // only replaced below, after the executor has returned.
+                let tp: *const super::bytecode::TwoStateBlock = std::sync::Arc::as_ptr(ts);
+                if self.ts_guard_and_exec(unsafe { &*tp }) {
                     return true;
                 }
                 if self.ts_exec_aborted {
@@ -25326,18 +25328,12 @@ impl Simulator {
             }
             _ => {
                 if let Some(cb) = self.compiled_edge_blocks[block_idx].take() {
-                    // Tiny bodies (a 2-flop sync is 4 insns) lose more to the
-                    // ts entry overhead (prefilter, reg-file swap, Value
-                    // construction per NBA) than the word ops save.
-                    let ran = if cb.instructions.len() >= 8 {
-                        self.try_two_state_in(block_idx, &cb, true)
-                    } else {
-                        if block_idx >= self.ts_edge.len() {
-                            self.ts_edge.resize(block_idx + 1, TsSlot::Untried);
-                        }
-                        self.ts_edge[block_idx] = TsSlot::No;
-                        false
-                    };
+                    // Every body is offered to the lowering, tiny ones
+                    // included: with registers used in place and no per-fire
+                    // `Arc` traffic the two-state entry is cheaper than the
+                    // interpreter even for a 4-insn 2-flop sync (the old
+                    // `>= 8` gate cost 0.85% of c906 memcpy cycles).
+                    let ran = self.try_two_state_in(block_idx, &cb, true);
                     self.compiled_edge_blocks[block_idx] = Some(cb);
                     if ran {
                         return true;
