@@ -1138,6 +1138,15 @@ struct AwaitWaiter {
     continuation: ProcCont,
 }
 
+/// Header of a two-state stream in `Simulator::ts_arena`.
+#[derive(Clone, Copy, Default)]
+struct TsHdr {
+    off: u32,
+    len: u32,
+    num_regs: u32,
+    kind: u8,
+}
+
 /// `edge_block_armed` state bits. A gateable block skips its clock edge in
 /// the scan prefilter iff its byte is ZERO: no input written since its last
 /// execution (`EDGE_ARMED` clear) and nothing forcing a visit (`EDGE_HOLD`
@@ -5296,6 +5305,11 @@ pub struct Simulator {
     /// `ts_comb`/`comb_jit_fns` stay the sources of truth at resolution;
     /// a JIT strike-out downgrades the plan in place.
     comb_plan: Vec<CombPlan>,
+    /// Two-state code arena: every lowered comb stream appended contiguously
+    /// (in first-evaluation order, which tracks the worklist order), plus a
+    /// dense per-entry header. `kind == 0` means "no arena stream".
+    ts_arena: Vec<super::bytecode::TsInsn>,
+    ts_hdr: Vec<TsHdr>,
     /// Same, for edge blocks (indexed like `compiled_edge_blocks`).
     ts_edge: Vec<TsSlot>,
     /// Two-state scratch register file (u64 words).
@@ -8766,6 +8780,8 @@ impl Simulator {
             comb_dep_offsets: Vec::new(),
             ts_comb: Vec::new(),
             comb_plan: Vec::new(),
+            ts_arena: Vec::new(),
+            ts_hdr: Vec::new(),
             ts_edge: Vec::new(),
             ts_regs: Vec::new(),
             ts_wregs: Vec::new(),
@@ -20270,7 +20286,22 @@ impl Simulator {
                     &self.array_first_id,
                 );
                 self.ts_comb[eidx] = match lowered {
-                    Some(ts) => TsSlot::Yes(std::sync::Arc::new(ts)),
+                    Some(ts) => {
+                        if self.ts_hdr.len() <= eidx {
+                            self.ts_hdr.resize(eidx + 1, TsHdr::default());
+                        }
+                        if ts.insns.len() < u32::MAX as usize && self.ts_arena.len() < (u32::MAX as usize - ts.insns.len()) {
+                            let off = self.ts_arena.len() as u32;
+                            self.ts_arena.extend(ts.insns.iter().cloned());
+                            self.ts_hdr[eidx] = TsHdr {
+                                off,
+                                len: ts.insns.len() as u32,
+                                num_regs: ts.num_regs,
+                                kind: Self::ts_kind_of(&ts),
+                            };
+                        }
+                        TsSlot::Yes(std::sync::Arc::new(ts))
+                    }
                     None => TsSlot::No,
                 };
             }
@@ -20720,13 +20751,70 @@ impl Simulator {
     /// out-of-range index) — lowering guarantees no side effect has been
     /// committed at that point, so the caller re-runs the 4-state stream.
     fn exec_two_state(&mut self, ts: &super::bytecode::TwoStateBlock) -> bool {
+        self.exec_two_state_parts(&ts.insns, ts.num_regs, Self::ts_kind_of(ts))
+    }
+
+    /// Executor selector for a two-state stream: 3 = wide registers,
+    /// 2 = control flow, 1 = straight line.
+    fn ts_kind_of(ts: &super::bytecode::TwoStateBlock) -> u8 {
         if ts.has_wide {
-            self.exec_two_state_wide(ts)
+            3
         } else if ts.has_ctrl {
-            self.exec_two_state_ctrl(ts)
+            2
         } else {
-            self.exec_two_state_line(ts)
+            1
         }
+    }
+
+    fn exec_two_state_parts(
+        &mut self,
+        insns: &[super::bytecode::TsInsn],
+        num_regs: u32,
+        kind: u8,
+    ) -> bool {
+        match kind {
+            3 => self.exec_two_state_wide(insns, num_regs),
+            2 => self.exec_two_state_ctrl(insns, num_regs),
+            _ => self.exec_two_state_line(insns, num_regs),
+        }
+    }
+
+    /// `ts_guard_and_exec` for a comb entry whose lowered stream lives in the
+    /// arena (`ts_arena` / `ts_hdr`): one dense header load and a contiguous
+    /// instruction slice instead of an `Arc` deref plus a per-block heap
+    /// `Vec` — the executor's cycles were dominated by those two misses.
+    fn ts_guard_and_exec_arena(&mut self, eidx: usize) -> bool {
+        let h = self.ts_hdr[eidx];
+        self.ts_exec_aborted = false;
+        if self.warn_x {
+            self.prof_ts_bail_warnx += 1;
+            return false;
+        }
+        if !self.forced_signals.is_empty() {
+            if let Some(TsSlot::Yes(ts)) = self.ts_comb.get(eidx) {
+                let p: *const super::bytecode::TwoStateBlock = std::sync::Arc::as_ptr(ts);
+                if self.ts_writes_forced(unsafe { &*p }) {
+                    self.prof_ts_bail_forced += 1;
+                    return false;
+                }
+            }
+        }
+        // SAFETY: the arena only grows at lowering time, never inside an
+        // executor, and the executors do not touch `ts_arena`.
+        let insns: &[super::bytecode::TsInsn] = unsafe {
+            std::slice::from_raw_parts(self.ts_arena.as_ptr().add(h.off as usize), h.len as usize)
+        };
+        if !self.exec_two_state_parts(insns, h.num_regs, h.kind) {
+            if std::mem::take(&mut self.ts_xread_bail) {
+                self.prof_ts_bail_xread += 1;
+                return false;
+            }
+            self.prof_ts_bail_abort += 1;
+            self.ts_exec_aborted = true;
+            return false;
+        }
+        self.prof_ts_evals += 1;
+        true
     }
 
     /// Wide writeback: mirrors ts_store's bookkeeping via Value::set_words128.
@@ -20761,18 +20849,18 @@ impl Simulator {
     /// Executor for blocks containing wide (65..=128-bit) ops: full arm set
     /// with a pc loop. Kept OUT of the narrow executors so their code size
     /// (and the sbox-class dispatch) is unaffected.
-    fn exec_two_state_wide(&mut self, ts: &super::bytecode::TwoStateBlock) -> bool {
+    fn exec_two_state_wide(&mut self, insns: &[super::bytecode::TsInsn], num_regs: u32) -> bool {
         use super::bytecode::TsInsn;
         let mut regs = std::mem::take(&mut self.ts_regs);
         let mut wregs = std::mem::take(&mut self.ts_wregs);
-        if regs.len() < ts.num_regs as usize {
-            regs.resize(ts.num_regs as usize, 0);
+        if regs.len() < num_regs as usize {
+            regs.resize(num_regs as usize, 0);
         }
-        if wregs.len() < ts.num_regs as usize {
-            wregs.resize(ts.num_regs as usize, [0, 0]);
+        if wregs.len() < num_regs as usize {
+            wregs.resize(num_regs as usize, [0, 0]);
         }
-        let insns_ptr = ts.insns.as_ptr();
-        let insns_len = ts.insns.len();
+        let insns_ptr = insns.as_ptr();
+        let insns_len = insns.len();
         let mut pc = 0usize;
         macro_rules! bail {
             () => {{
@@ -21290,11 +21378,11 @@ impl Simulator {
     /// Straight-line executor — no pc bookkeeping, compact codegen for the
     /// dominant comb shape. Control-flow variants are unreachable here
     /// (`has_ctrl` routed them to the pc-loop twin).
-    fn exec_two_state_line(&mut self, ts: &super::bytecode::TwoStateBlock) -> bool {
+    fn exec_two_state_line(&mut self, insns: &[super::bytecode::TsInsn], num_regs: u32) -> bool {
         use super::bytecode::TsInsn;
         let mut regs = std::mem::take(&mut self.ts_regs);
-        if regs.len() < ts.num_regs as usize {
-            regs.resize(ts.num_regs as usize, 0);
+        if regs.len() < num_regs as usize {
+            regs.resize(num_regs as usize, 0);
         }
         // Register indices are assigned by the block compiler below
         // `num_regs`, and `regs` was just sized to it: the bounds checks on
@@ -21313,7 +21401,7 @@ impl Simulator {
                 return false;
             }};
         }
-        for insn in &ts.insns {
+        for insn in insns {
             unsafe { match insn {
                 TsInsn::LoadSig { d, sig } => {
                     // Plane-direct: one flat load vs the Value discriminant
@@ -21800,11 +21888,11 @@ impl Simulator {
         }
     }
 
-    fn exec_two_state_ctrl(&mut self, ts: &super::bytecode::TwoStateBlock) -> bool {
+    fn exec_two_state_ctrl(&mut self, insns: &[super::bytecode::TsInsn], num_regs: u32) -> bool {
         use super::bytecode::TsInsn;
         let mut regs = std::mem::take(&mut self.ts_regs);
-        if regs.len() < ts.num_regs as usize {
-            regs.resize(ts.num_regs as usize, 0);
+        if regs.len() < num_regs as usize {
+            regs.resize(num_regs as usize, 0);
         }
         macro_rules! xbail {
             () => {{
@@ -21816,8 +21904,8 @@ impl Simulator {
         // Raw-ptr walk mirrors exec_insns: the indexed form's bounds check
         // per instruction cost ~14% on a comb-dense fabric. Targets were
         // range-checked against the lowered stream at fixup time.
-        let insns_ptr = ts.insns.as_ptr();
-        let insns_len = ts.insns.len();
+        let insns_ptr = insns.as_ptr();
+        let insns_len = insns.len();
         let mut pc = 0usize;
         while pc < insns_len {
             match unsafe { &*insns_ptr.add(pc) } {
@@ -48918,7 +49006,18 @@ impl Simulator {
                 // re-dispatches (and demotes) exactly as before.
                 let mut ts_fast = false;
                 if self.proc_depth == 0 {
-                    if let Some(CombPlan::Ts(ts)) = self.comb_plan.get(eidx) {
+                    let arena_kind = self.ts_hdr.get(eidx).map_or(0, |h| h.kind);
+                    if arena_kind != 0 {
+                        if matches!(self.comb_plan.get(eidx), Some(CombPlan::Ts(_)))
+                            && self.ts_guard_and_exec_arena(eidx)
+                        {
+                            ts_fast = true;
+                            n_dc += 1;
+                            if self.trace_comb_paths {
+                                self.note_comb_path(eidx, 0);
+                            }
+                        }
+                    } else if let Some(CombPlan::Ts(ts)) = self.comb_plan.get(eidx) {
                         let tp: *const super::bytecode::TwoStateBlock = std::sync::Arc::as_ptr(ts);
                         if self.ts_guard_and_exec(unsafe { &*tp }) {
                             ts_fast = true;
