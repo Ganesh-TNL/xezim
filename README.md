@@ -260,6 +260,21 @@ and testbench flows. Portable code should not rely on them.
   until that state changes: 11 % fewer on a UVM bench.
 * Fewer per-identifier lookups inside class methods: 4.9 % fewer on the
   axi4 AVIP.
+* Clocked blocks that only need arming skip the value compare, two-state
+  blocks run from one contiguous code arena with a packed per-entry
+  header, and the settle loop takes the two-state path before touching
+  the entry table: C906 memcpy (2000 iterations) 375 s to 313 s, output
+  identical.
+* Two-state blocks may now carry signed narrow registers (`integer` loop
+  counters and their compares), dynamic bit selects, non-blocking dynamic
+  bit writes (`q[i] <= v`) and range writes into buses wider than 64 bits;
+  a block is admitted after a read-before-write analysis of its control
+  flow instead of a fixed statement-order rule. Every clocked block is
+  offered to the two-state lowering regardless of size, and the eight most
+  common adjacent instruction pairs run fused. The four `for`-loop flop
+  blocks that dominated the C906 interpreter time (arbiters, fill buffer,
+  GPIO) now run two-state: memcpy 313 s to 295 s, CoreMark 18 % fewer
+  cycles, output identical; UVM benchmarks unchanged.
 
 ### 0.10.5 — class covergroups, DPI exports and unit scope, faster UVM (September 2026)
 * **Typedef'd packed arrays keep their dimensions inside instances**: a
