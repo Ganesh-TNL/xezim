@@ -5399,6 +5399,9 @@ pub struct Simulator {
     /// so check_edges can scan only changed positions instead of all of them.
     sig_to_edge_pos: Vec<i32>,
     changed_edge_pos: Vec<usize>,
+    /// Retained buffer that becomes `changed_edge_pos` while a scan runs, so
+    /// positions written during the scan do not grow a fresh Vec every pass.
+    edge_pos_scratch: Vec<usize>,
     edge_pos_seen: Vec<bool>,
     dirty_edge: bool,
     dirty_edge_shadow: bool,
@@ -8802,6 +8805,7 @@ impl Simulator {
             clktree_probe_mismatch: 0,
             clktree_probe_sids: Vec::new(),
             changed_edge_pos: Vec::new(),
+            edge_pos_scratch: Vec::new(),
             edge_pos_seen: Vec::new(),
             edge_exec_wrote: Vec::new(),
             edge_exec_seen: Vec::new(),
@@ -44541,6 +44545,7 @@ impl Simulator {
                 }
             }
             let subset = std::mem::take(&mut self.changed_edge_pos);
+            self.changed_edge_pos = std::mem::take(&mut self.edge_pos_scratch);
             self.check_edges_inner(Some(&subset), false);
             for &p in &subset {
                 if p < self.edge_pos_seen.len() {
@@ -44549,12 +44554,12 @@ impl Simulator {
             }
             // A process resumed INSIDE the scan (an edge continuation) may
             // write an edge-sensitive signal; that position is pushed onto
-            // the fresh list during the scan. Overwriting the list with the
+            // the list during the scan. Overwriting the list with the
             // emptied subset dropped it while its `edge_pos_seen` stayed
             // set, so no later write to that signal could ever queue it
             // again: an `always @(sig)` fired once and was dead for the
             // rest of the run. Carry those positions into the next pass.
-            let pushed_during_scan = std::mem::take(&mut self.changed_edge_pos);
+            let mut pushed_during_scan = std::mem::take(&mut self.changed_edge_pos);
             let mut s = subset;
             s.clear();
             s.extend_from_slice(&pushed_during_scan);
@@ -44564,6 +44569,8 @@ impl Simulator {
                 }
             }
             self.changed_edge_pos = s;
+            pushed_during_scan.clear();
+            self.edge_pos_scratch = pushed_during_scan;
             return;
         }
         if self.dirty_edge_shadow {
@@ -45909,7 +45916,17 @@ impl Simulator {
                             fast_skip_delta += 1;
                             false
                         }
-                    } else if self.edge_block_arm_only[bi] || !self.edge_block_snap_valid[bi] {
+                    } else if self.edge_block_arm_only[bi]
+                        || !self.edge_block_snap_valid[bi]
+                        || !self.armed_edge_shadow
+                    {
+                        // Armed means an input was WRITTEN since the last
+                        // execution. Comparing its value against the snapshot
+                        // elided only ~20% of these executions (C906: 38M of
+                        // 187M compares) at ~200 host instructions each, more
+                        // than the elided executions cost — so an armed block
+                        // simply executes. The snapshot is kept only for the
+                        // shadow mode's cross-check.
                         true
                     } else {
                         let start = self.edge_block_off[bi] as usize;
@@ -46034,6 +46051,15 @@ impl Simulator {
                         {
                             self.edge_block_armed[bi] |= EDGE_HOLD;
                         }
+                        } else if self.armed_edge && !self.armed_edge_shadow {
+                            // Write-armed and not cross-checking: the value
+                            // snapshot is never compared, so do not rebuild
+                            // it — just mark the block skippable while
+                            // unarmed.
+                            self.edge_block_snap_valid[bi] = true;
+                            if bi < self.edge_block_armed.len() {
+                                self.edge_block_armed[bi] &= !EDGE_HOLD;
+                            }
                         } else {
                             let start = self.edge_block_off[bi] as usize;
                             let end = self.edge_block_off[bi + 1] as usize;
