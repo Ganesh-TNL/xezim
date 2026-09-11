@@ -48750,21 +48750,42 @@ impl Simulator {
             inject_bits.resize(words, 0);
         }
         let mut next_inject: usize = usize::MAX;
-        fn next_set_bit(bits: &[u64], from: usize) -> usize {
-            let mut w = from >> 6;
+        // Summary level: bit `w` set iff `inject_bits[w] != 0`, so the
+        // forward scan for the next injected entry skips empty words in
+        // one step instead of walking the whole (30k-entry / 470-word on
+        // c906) bitset each time — that walk was 6% of the settle loop.
+        let mut inject_sum: [u64; 32] = [0; 32];
+        debug_assert!(words <= 32 * 64, "settle inject summary covers 2048 words");
+        fn next_set_bit(bits: &[u64], sum: &[u64; 32], from: usize) -> usize {
+            let w = from >> 6;
             if w >= bits.len() {
                 return usize::MAX;
             }
-            let mut word = bits[w] & (u64::MAX << (from & 63));
+            let word = bits[w] & (u64::MAX << (from & 63));
+            if word != 0 {
+                return (w << 6) + word.trailing_zeros() as usize;
+            }
+            // Next non-empty word after `w`, via the summary.
+            let mut sw = (w + 1) >> 6;
+            if sw >= sum.len() {
+                return usize::MAX;
+            }
+            let mut sword = sum[sw] & (u64::MAX << ((w + 1) & 63));
             loop {
-                if word != 0 {
-                    return (w << 6) + word.trailing_zeros() as usize;
+                if sword != 0 {
+                    let nw = (sw << 6) + sword.trailing_zeros() as usize;
+                    if nw >= bits.len() {
+                        return usize::MAX;
+                    }
+                    let word = bits[nw];
+                    debug_assert!(word != 0);
+                    return (nw << 6) + word.trailing_zeros() as usize;
                 }
-                w += 1;
-                if w >= bits.len() {
+                sw += 1;
+                if sw >= sum.len() {
                     return usize::MAX;
                 }
-                word = bits[w];
+                sword = sum[sw];
             }
         }
         let mut n_evals = 0u64;
@@ -48807,6 +48828,7 @@ impl Simulator {
                                 // it to the pass list ran it last and cost
                                 // 15% more entry evaluations on c906.
                                 inject_bits[__dep >> 6] |= 1u64 << (__dep & 63);
+                                inject_sum[__dep >> 12] |= 1u64 << ((__dep >> 6) & 63);
                                 if __dep < next_inject {
                                     next_inject = __dep;
                                 }
@@ -48860,7 +48882,10 @@ impl Simulator {
                 {
                     let e = next_inject;
                     inject_bits[e >> 6] &= !(1u64 << (e & 63));
-                    next_inject = next_set_bit(&inject_bits, e + 1);
+                    if inject_bits[e >> 6] == 0 {
+                        inject_sum[e >> 12] &= !(1u64 << ((e >> 6) & 63));
+                    }
+                    next_inject = next_set_bit(&inject_bits, &inject_sum, e + 1);
                     e
                 } else {
                     cur_pos += 1;

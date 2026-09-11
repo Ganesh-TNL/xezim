@@ -11563,6 +11563,21 @@ impl<'a> BytecodeCompiler<'a> {
                         folded += 1;
                     }
                 }
+                // `[l:r]` with both bounds folded to non-negative 32-bit
+                // constants is exactly `RangeSelectConst` (the dynamic form
+                // only differs for a negative low bound, which takes the
+                // signed x-fill path). The const form lowers to two-state;
+                // the dynamic one bails the whole block.
+                Insn::RangeSelect(d, base, l, r) => {
+                    let kl = known.get(l).and_then(|v| const_index(v));
+                    let kr = known.get(r).and_then(|v| const_index(v));
+                    if let (Some(ul), Some(ur)) = (kl, kr) {
+                        if ul <= i32::MAX as u32 && ur <= i32::MAX as u32 {
+                            insns[i] = Insn::RangeSelectConst(*d, *base, ul.max(ur), ul.min(ur));
+                            folded += 1;
+                        }
+                    }
+                }
                 _ => {}
             }
             match dest {
