@@ -48910,6 +48910,26 @@ impl Simulator {
                 } else {
                     None
                 };
+                // Plan-first fast path: an entry with a resolved two-state
+                // plan runs straight from the plan table — no `CombEntry`
+                // load (a cache miss on this design's 30k-entry table), no
+                // item match, no `dispatch_comb_plan` round trip. A guard
+                // bail falls through to the ordinary path below, which
+                // re-dispatches (and demotes) exactly as before.
+                let mut ts_fast = false;
+                if self.proc_depth == 0 {
+                    if let Some(CombPlan::Ts(ts)) = self.comb_plan.get(eidx) {
+                        let tp: *const super::bytecode::TwoStateBlock = std::sync::Arc::as_ptr(ts);
+                        if self.ts_guard_and_exec(unsafe { &*tp }) {
+                            ts_fast = true;
+                            n_dc += 1;
+                            if self.trace_comb_paths {
+                                self.note_comb_path(eidx, 0);
+                            }
+                        }
+                    }
+                }
+                if !ts_fast {
                 match &entries[eidx].item {
                     CombItem::Noop => {}
                     CombItem::FastDirectCopy { dst_id, src_id } => {
@@ -49342,6 +49362,7 @@ impl Simulator {
                         self.eval_udp_batch(*event_ref, indices);
                         n_dc += indices.len() as u64;
                     }
+                }
                 }
                 if let Some(t0) = report_t0 {
                     self.prof_entry_ns[eidx] += t0.elapsed().as_nanos() as u64;
