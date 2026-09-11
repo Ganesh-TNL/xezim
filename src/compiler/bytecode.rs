@@ -12834,6 +12834,17 @@ pub enum TsInsn {
     /// pattern value under that mask. The selector is X-free on this path.
     MaskEq { d: u16, s: u16, mask: u64, v: u64 },
     Neq { d: u16, a: u16, b: u16 },
+    /// Fused adjacent pairs (see `fuse_ts_pairs`). Each one is exactly its
+    /// two component instructions run back to back — same register writes,
+    /// same order — minus one dispatch through the executor's jump table.
+    LoadSigNot { dl: u16, d: u16, sig: u32 },
+    SigRangeEqC { dr: u16, d: u16, sig: u32, lo: u16, mask: u64, k: u64 },
+    LoadSigLogAnd { dl: u16, sig: u32, d: u16, a: u16, b: u16 },
+    LogNotAnd { dn: u16, s: u16, d: u16, a: u16, b: u16 },
+    LogNotLogAnd { dn: u16, s: u16, d: u16, a: u16, b: u16 },
+    LogAndStore { d: u16, a: u16, b: u16, sig: u32, mask: u64 },
+    AndRangeStore { d: u16, a: u16, b: u16, sig: u32, hi: u32, lo: u32, mask: u64 },
+    SigBitNot { db: u16, d: u16, sig: u32, bit: u16 },
     Lt { d: u16, a: u16, b: u16 },
     /// Signed relational compare (§11.8.1: both operands signed). `sa`/`sb`
     /// are the shifts that sign-extend each operand from its static width;
@@ -13257,6 +13268,116 @@ fn ts_raw_hazard(insns: &[Insn], array_first_id: &HashMap<Arc<str>, (usize, i64,
         }
     }
     false
+}
+
+/// Peephole over a lowered stream: the eight adjacent opcode pairs that a
+/// c906 census put at 17% of all two-state instructions collapse into one
+/// fused instruction each. A pair is only fused when its second half is not
+/// a branch target; every branch target is then remapped.
+fn fuse_ts_pairs(out: &mut Vec<TsInsn>) {
+    let n = out.len();
+    if n < 2 {
+        return;
+    }
+    let mut is_tgt = vec![false; n + 1];
+    for i in out.iter() {
+        match i {
+            TsInsn::BrSigFalse { t, .. }
+            | TsInsn::BrFalse { t, .. }
+            | TsInsn::BrNz { t, .. }
+            | TsInsn::Jmp { t } => {
+                if (*t as usize) <= n {
+                    is_tgt[*t as usize] = true;
+                }
+            }
+            TsInsn::CaseMaskJmp { mj, .. } => {
+                for t in mj.table.iter().chain(std::iter::once(&mj.xz_path)) {
+                    if (*t as usize) <= n {
+                        is_tgt[*t as usize] = true;
+                    }
+                }
+            }
+            TsInsn::CaseJmp { cj, .. } => {
+                for t in cj.table.iter().chain(std::iter::once(&cj.default)) {
+                    if (*t as usize) <= n {
+                        is_tgt[*t as usize] = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut fused: Vec<TsInsn> = Vec::with_capacity(n);
+    let mut new_of: Vec<u32> = vec![0; n + 1];
+    let mut i = 0;
+    let mut any = false;
+    while i < n {
+        new_of[i] = fused.len() as u32;
+        let f = if i + 1 < n && !is_tgt[i + 1] {
+            match (&out[i], &out[i + 1]) {
+                (TsInsn::LoadSig { d: dl, sig }, TsInsn::LogNot { d, s }) if s == dl => {
+                    Some(TsInsn::LoadSigNot { dl: *dl, d: *d, sig: *sig })
+                }
+                (TsInsn::SigRange { d: dr, sig, lo, mask }, TsInsn::EqC { d, s, k }) if s == dr => {
+                    Some(TsInsn::SigRangeEqC { dr: *dr, d: *d, sig: *sig, lo: *lo, mask: *mask, k: *k })
+                }
+                (TsInsn::LoadSig { d: dl, sig }, TsInsn::LogAnd { d, a, b }) if a == dl || b == dl => {
+                    Some(TsInsn::LoadSigLogAnd { dl: *dl, sig: *sig, d: *d, a: *a, b: *b })
+                }
+                (TsInsn::LogNot { d: dn, s }, TsInsn::And { d, a, b }) if a == dn || b == dn => {
+                    Some(TsInsn::LogNotAnd { dn: *dn, s: *s, d: *d, a: *a, b: *b })
+                }
+                (TsInsn::LogNot { d: dn, s }, TsInsn::LogAnd { d, a, b }) if a == dn || b == dn => {
+                    Some(TsInsn::LogNotLogAnd { dn: *dn, s: *s, d: *d, a: *a, b: *b })
+                }
+                (TsInsn::LogAnd { d, a, b }, TsInsn::Store { sig, s, mask }) if s == d => {
+                    Some(TsInsn::LogAndStore { d: *d, a: *a, b: *b, sig: *sig, mask: *mask })
+                }
+                (TsInsn::And { d, a, b }, TsInsn::RangeStore { sig, hi, lo, s, mask }) if s == d => {
+                    Some(TsInsn::AndRangeStore { d: *d, a: *a, b: *b, sig: *sig, hi: *hi, lo: *lo, mask: *mask })
+                }
+                (TsInsn::SigBit { d: db, sig, bit }, TsInsn::LogNot { d, s }) if s == db => {
+                    Some(TsInsn::SigBitNot { db: *db, d: *d, sig: *sig, bit: *bit })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(f) = f {
+            new_of[i + 1] = fused.len() as u32;
+            fused.push(f);
+            any = true;
+            i += 2;
+        } else {
+            fused.push(out[i].clone());
+            i += 1;
+        }
+    }
+    if !any {
+        return;
+    }
+    new_of[n] = fused.len() as u32;
+    for insn in fused.iter_mut() {
+        match insn {
+            TsInsn::BrSigFalse { t, .. }
+            | TsInsn::BrFalse { t, .. }
+            | TsInsn::BrNz { t, .. }
+            | TsInsn::Jmp { t } => *t = new_of[(*t as usize).min(n)],
+            TsInsn::CaseMaskJmp { mj, .. } => {
+                for t in mj.table.iter_mut().chain(std::iter::once(&mut mj.xz_path)) {
+                    *t = new_of[(*t as usize).min(n)];
+                }
+            }
+            TsInsn::CaseJmp { cj, .. } => {
+                for t in cj.table.iter_mut().chain(std::iter::once(&mut cj.default)) {
+                    *t = new_of[(*t as usize).min(n)];
+                }
+            }
+            _ => {}
+        }
+    }
+    *out = fused;
 }
 
 pub fn lower_two_state(
@@ -14831,6 +14952,7 @@ pub fn lower_two_state(
     writes.dedup();
     writes_span.sort_unstable();
     writes_span.dedup();
+    fuse_ts_pairs(&mut out);
     Some(TwoStateBlock {
         insns: out,
         num_regs: cb.num_regs,
