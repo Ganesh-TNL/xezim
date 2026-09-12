@@ -4414,6 +4414,19 @@ pub struct Simulator {
     gate_queue: Vec<u32>,
     gate_queued: Vec<bool>,
     gate_lane_valid: bool,
+    /// Native two-state streams (XEZIM_TS_JIT=1, jit feature): per comb
+    /// entry, the compiled straight-line function, consulted before the
+    /// arena executor.
+    #[cfg(feature = "jit")]
+    ts_jit: Option<Box<super::ts_jit::enabled::TsJitModule>>,
+    #[cfg(feature = "jit")]
+    ts_jit_fns: Vec<Option<super::ts_jit::enabled::TsJitFn>>,
+    ts_jit_on: bool,
+    /// Per comb entry: two-state evaluations so far (native path only);
+    /// a stream is compiled once it crosses `ts_jit_hot`, so only the hot
+    /// set turns into machine code and the code stays cache-resident.
+    ts_jit_evals: Vec<u32>,
+    ts_jit_hot: u32,
     is_clock_tree_signal: Vec<bool>,
     prof_clock_tree_evals: u64,
     /// Instance scope of the comb/edge BLOCK currently being evaluated, for
@@ -8525,6 +8538,13 @@ impl Simulator {
             gate_queue: Vec::new(),
             gate_queued: Vec::new(),
             gate_lane_valid: false,
+            #[cfg(feature = "jit")]
+            ts_jit: None,
+            #[cfg(feature = "jit")]
+            ts_jit_fns: Vec::new(),
+            ts_jit_on: std::env::var_os("XEZIM_TS_JIT").is_some(),
+            ts_jit_evals: Vec::new(),
+            ts_jit_hot: std::env::var("XEZIM_TS_JIT_HOT").ok().and_then(|v| v.parse().ok()).unwrap_or(64),
             is_clock_tree_signal: Vec::new(),
             prof_clock_tree_evals: 0,
             spec_prop_is_dyn: std::cell::RefCell::new(HashMap::default()),
@@ -20829,6 +20849,15 @@ impl Simulator {
     /// Does this block write any currently forced signal? Walks the FORCE
     /// map (a handful of entries in practice) against the block's sorted
     /// write set, so the cost stays proportional to the forces in flight.
+    /// `ts_writes_forced` for an entry addressed by index.
+    #[allow(dead_code)]
+    fn ts_writes_forced_eidx(&self, eidx: usize) -> bool {
+        match self.ts_comb.get(eidx) {
+            Some(TsSlot::Yes(ts)) => self.ts_writes_forced(ts),
+            _ => false,
+        }
+    }
+
     fn ts_writes_forced(&self, ts: &super::bytecode::TwoStateBlock) -> bool {
         self.forced_signals.keys().any(|&f| {
             let f = f as u32;
@@ -22428,7 +22457,7 @@ impl Simulator {
     /// Blocking partial-range store for two-state blocks: splice `v` into
     /// `signal[hi:lo]`, leaving every other bit (value AND x/z planes)
     /// untouched, then run the ordinary change/dirty/post-write bookkeeping.
-    fn ts_range_store(&mut self, id: usize, v: u64, lo: u32, hi: u32) {
+    pub(crate) fn ts_range_store(&mut self, id: usize, v: u64, lo: u32, hi: u32) {
         self.ts_range_store_xz(id, v, 0, lo, hi)
     }
 
@@ -22465,7 +22494,7 @@ impl Simulator {
 
     /// `ts_range_store` with an explicit x/z plane, for a folded 4-state
     /// constant source (`y[hi:lo] = 'x;`).
-    fn ts_range_store_xz(&mut self, id: usize, v: u64, x: u64, lo: u32, hi: u32) {
+    pub(crate) fn ts_range_store_xz(&mut self, id: usize, v: u64, x: u64, lo: u32, hi: u32) {
         let (base_v, base_x) = self.signal_table[id].raw_bits();
         let (new_v, new_x) =
             Self::compose_inline_range_bits(base_v, base_x, v, x, lo, hi);
@@ -22493,7 +22522,7 @@ impl Simulator {
 
     /// Whole-signal blocking store of a folded 4-state constant. Mirrors
     /// `ts_store`'s bookkeeping but carries an x/z plane.
-    fn ts_store_xz(&mut self, id: usize, v: u64, x: u64) {
+    pub(crate) fn ts_store_xz(&mut self, id: usize, v: u64, x: u64) {
         let (dv, dx) = self.signal_table[id].raw_bits();
         if v == dv && x == dx {
             return;
@@ -22521,7 +22550,7 @@ impl Simulator {
     // table Value's `is_signed` as it was: every write path stamps it from
     // `signal_signed` (write_sig!), so re-stamping here only cost a random
     // load from a 35M-entry table per store.
-    fn ts_store(&mut self, id: usize, v: u64, mask: u64) {
+    pub(crate) fn ts_store(&mut self, id: usize, v: u64, mask: u64) {
         let (dv, dx) = self.signal_table[id].raw_bits();
         if v != (dv & mask) || (dx & mask) != 0 {
             if self.signal_table[id].set_inline_bits(v, 0) {
@@ -22687,7 +22716,31 @@ impl Simulator {
         }
     }
 
-    fn ts_store_nba(&mut self, id: usize, v: u64, w: u32) {
+    /// `sig[hi:lo] <= v` (narrow destination): merge into the pending NBA
+    /// entry when one exists, else seed from the signal with elision — the
+    /// `RangeStoreNba` executor arm as a callable.
+    pub(crate) fn ts_range_store_nba(&mut self, id: usize, lo: u32, hi: u32, v: u64) {
+        if let Some(i) = self.nba_fast_index.get(id) {
+            let target = &mut self.nba_fast[i].value;
+            let (base_v, base_x) = target.raw_bits();
+            let (new_v, new_x) = Self::compose_inline_range_bits(base_v, base_x, v, 0, lo, hi);
+            target.set_inline_bits(new_v, new_x);
+            target.is_signed = self.signal_signed[id];
+        } else {
+            let (base_v, base_x) = self.signal_table[id].raw_bits();
+            let (new_v, new_x) = Self::compose_inline_range_bits(base_v, base_x, v, 0, lo, hi);
+            if new_v == base_v && new_x == base_x {
+                self.prof_nba_elided += 1;
+            } else {
+                let mut nv = Value::from_inline(new_v, new_x, self.signal_widths[id]);
+                nv.is_signed = self.signal_signed[id];
+                self.nba_fast_index.insert(id, self.nba_fast.len());
+                self.nba_fast.push(NbaFast { block_index: 0, signal_id: id, value: nv });
+            }
+        }
+    }
+
+    pub(crate) fn ts_store_nba(&mut self, id: usize, v: u64, w: u32) {
         let val = Value::from_u64(v, w);
         if let Some(i) = self.nba_fast_index.get(id) {
             self.nba_fast[i].value = val;
@@ -38678,6 +38731,10 @@ impl Simulator {
             self.gate_ops.len()
         );
         eprintln!("[PROF] vm_insns_total={}", self.prof_insns_executed);
+        #[cfg(feature = "jit")]
+        if let Some(m) = self.ts_jit.as_ref() {
+            eprintln!("[PROF] ts_jit: compiled={} rejected={} code_bytes={} pending={}", m.compiled, m.rejected, m.code_bytes, m.pending_len());
+        }
         eprintln!("[PROF] clock_tree: roots={} entries={} eager_evals={}", self.clock_tree_by_root.len(), self.is_clock_tree_entry.iter().filter(|&&b| b).count(), self.prof_clock_tree_evals);
         eprintln!("[PROF] settle_calls={} settle_iters={} max_iters={} entry_evals={} unresolved_entries={}/{}",
             self.settle_calls, self.settle_iters, self.max_settle_iters, self.entry_evals,
@@ -49925,6 +49982,22 @@ impl Simulator {
         if !self.gate_lane_valid || self.gate_lane.len() != self.comb_entries.len() {
             self.build_gate_lane();
         }
+        #[cfg(feature = "jit")]
+        if let Some(m) = self.ts_jit.as_mut() {
+            // Batch finalization: a whole group of streams lands in one
+            // contiguous code segment (per-function finalize cost a page
+            // per function). The threshold shrinks once lowering settles
+            // so late stragglers still get installed.
+            let thr = if self.settle_calls < 50_000 { 64 } else { 1 };
+            if m.pending_len() >= thr {
+                for (eidx, f) in m.flush() {
+                    if self.ts_jit_fns.len() <= eidx {
+                        self.ts_jit_fns.resize(eidx + 1, None);
+                    }
+                    self.ts_jit_fns[eidx] = Some(f);
+                }
+            }
+        }
         let entries = std::mem::take(&mut self.comb_entries);
         let dep_offsets = std::mem::take(&mut self.comb_dep_offsets);
         let dep_entries = std::mem::take(&mut self.comb_dep_entries);
@@ -50527,12 +50600,67 @@ impl Simulator {
                 // bail falls through to the ordinary path below, which
                 // re-dispatches (and demotes) exactly as before.
                 let mut ts_fast = false;
-                if self.proc_depth == 0 {
+                let mut ts_native_bailed = false;
+                #[cfg(feature = "jit")]
+                if self.proc_depth == 0 && self.ts_jit_on {
+                    if let Some(Some(f)) = self.ts_jit_fns.get(eidx) {
+                        let f = *f;
+                        self.ts_exec_aborted = false;
+                        if !self.warn_x && (self.forced_signals.is_empty() || !self.ts_writes_forced_eidx(eidx)) {
+                            let sp: *mut u8 = self as *mut Self as *mut u8;
+                            let tp: *const u8 = self.signal_table.as_ptr() as *const u8;
+                            self.ts_direct_writes = true;
+                            let rc = unsafe { f(sp, tp) };
+                            self.ts_direct_writes = false;
+                            match rc {
+                                0 => {
+                                    ts_fast = true;
+                                    n_dc += 1;
+                                    self.prof_ts_evals += 1;
+                                    if self.trace_comb_paths {
+                                        self.note_comb_path(eidx, 0);
+                                    }
+                                }
+                                1 => {
+                                    self.prof_ts_bail_xread += 1;
+                                    ts_native_bailed = true;
+                                }
+                                _ => {
+                                    self.prof_ts_bail_abort += 1;
+                                    self.ts_exec_aborted = true;
+                                    ts_native_bailed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if !ts_fast && !ts_native_bailed && self.proc_depth == 0 {
                     let arena_kind = self.ts_hdr.get(eidx).map_or(0, |h| h.kind());
                     if arena_kind != 0 {
                         self.ts_direct_writes = true;
                         let ok = self.ts_guard_and_exec_arena(eidx);
                         self.ts_direct_writes = false;
+                        #[cfg(feature = "jit")]
+                        if ok && self.ts_jit_on {
+                            if self.ts_jit_evals.len() <= eidx {
+                                self.ts_jit_evals.resize(eidx + 1, 0);
+                            }
+                            let c = self.ts_jit_evals[eidx].saturating_add(1);
+                            self.ts_jit_evals[eidx] = c;
+                            if c == self.ts_jit_hot {
+                                if self.ts_jit.is_none() {
+                                    self.ts_jit = super::ts_jit::enabled::TsJitModule::new().map(Box::new);
+                                    if self.ts_jit.is_none() {
+                                        self.ts_jit_on = false;
+                                    }
+                                }
+                                if let (Some(TsSlot::Yes(ts)), Some(m)) = (self.ts_comb.get(eidx), self.ts_jit.as_mut()) {
+                                    if !ts.has_ctrl && !ts.has_wide {
+                                        m.compile(eidx, &ts.insns, ts.num_regs);
+                                    }
+                                }
+                            }
+                        }
                         if ok {
                             ts_fast = true;
                             n_dc += 1;

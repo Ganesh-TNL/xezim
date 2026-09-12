@@ -70,7 +70,7 @@ default = []
 # Per-instruction opcode/adjacent-pair histogram for fusion planning.
 # Off by default: the counting sits on the VM dispatch critical path.
 opcode-census = []
-jit = ["dep:cranelift", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native"]
+jit = ["dep:cranelift", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native", "xezim-core/native-layout"]
 
 [[bin]]
 name = "xezim"
