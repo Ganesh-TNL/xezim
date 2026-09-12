@@ -275,6 +275,14 @@ and testbench flows. Portable code should not rely on them.
   blocks that dominated the C906 interpreter time (arbiters, fill buffer,
   GPIO) now run two-state: memcpy 313 s to 295 s, CoreMark 18 % fewer
   cycles, output identical; UVM benchmarks unchanged.
+* Single-bit gates whose output only clocked blocks read (half of all
+  combinational evaluations on the C906) are evaluated in one batch at the
+  end of each settle pass instead of through the worklist; a default
+  assignment of a wide bus (`bus = {265{1'b0}}`) and a 65..128-bit window
+  written into a wider bus now lower to the two-state path; the signal
+  mirror that only native (JIT) code reads is no longer maintained on
+  every write in ordinary runs. C906 memcpy (2000 iterations) 295 s to
+  275 s, output identical; UVM benchmarks unchanged.
 
 ### 0.10.5 — class covergroups, DPI exports and unit scope, faster UVM (September 2026)
 * **Typedef'd packed arrays keep their dimensions inside instances**: a
