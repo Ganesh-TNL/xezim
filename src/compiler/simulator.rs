@@ -4414,6 +4414,15 @@ pub struct Simulator {
     gate_queue: Vec<u32>,
     gate_queued: Vec<bool>,
     gate_lane_valid: bool,
+    /// Quiet signals: neither an armed edge-block input nor edge-sensitive,
+    /// so a write to one has no side-table work at all. One bit per signal;
+    /// rebuilt when either table changes. A quiet store skips the write
+    /// observer with one load (c906: most two-state stores are internal
+    /// nets).
+    quiet_bits: Vec<u64>,
+    quiet_valid: bool,
+    prof_quiet_stores: u64,
+    prof_observed_stores: u64,
     /// Native two-state streams (XEZIM_TS_JIT=1, jit feature): per comb
     /// entry, the compiled straight-line function, consulted before the
     /// arena executor.
@@ -8538,6 +8547,10 @@ impl Simulator {
             gate_queue: Vec::new(),
             gate_queued: Vec::new(),
             gate_lane_valid: false,
+            quiet_bits: Vec::new(),
+            quiet_valid: false,
+            prof_quiet_stores: 0,
+            prof_observed_stores: 0,
             #[cfg(feature = "jit")]
             ts_jit: None,
             #[cfg(feature = "jit")]
@@ -13808,6 +13821,7 @@ impl Simulator {
             .copied()
             .map_or(0, |sid| sid.saturating_add(1));
         self.sig_to_edge_pos = vec![-1i32; edge_lookup_len];
+        self.quiet_valid = false;
         for (pos, &sid) in self.edge_signal_ids.iter().enumerate() {
             if sid < self.sig_to_edge_pos.len() {
                 self.sig_to_edge_pos[sid] = pos as i32;
@@ -38731,6 +38745,7 @@ impl Simulator {
             self.gate_ops.len()
         );
         eprintln!("[PROF] vm_insns_total={}", self.prof_insns_executed);
+        eprintln!("[PROF] write_observer: quiet={} observed={}", self.prof_quiet_stores, self.prof_observed_stores);
         #[cfg(feature = "jit")]
         if let Some(m) = self.ts_jit.as_ref() {
             eprintln!("[PROF] ts_jit: compiled={} rejected={} code_bytes={} pending={}", m.compiled, m.rejected, m.code_bytes, m.pending_len());
@@ -49931,6 +49946,20 @@ impl Simulator {
     /// feed the worklist, so evaluation order inside a pass is irrelevant
     /// and they can run in a batch. Rebuilt whenever the dependency tables
     /// change. Clock-tree entries stay on the generic path.
+    fn build_quiet_bits(&mut self) {
+        let n = self.signal_table.len();
+        self.quiet_bits.clear();
+        self.quiet_bits.resize(n.div_ceil(64), 0);
+        for id in 0..n {
+            let armed = self.armed_input_set(id);
+            let edge = self.sig_to_edge_pos.get(id).is_some_and(|&p| p >= 0);
+            if !armed && !edge {
+                self.quiet_bits[id >> 6] |= 1u64 << (id & 63);
+            }
+        }
+        self.quiet_valid = true;
+    }
+
     fn build_gate_lane(&mut self) {
         let n = self.comb_entries.len();
         self.gate_lane.clear();
@@ -49981,6 +50010,9 @@ impl Simulator {
 
         if !self.gate_lane_valid || self.gate_lane.len() != self.comb_entries.len() {
             self.build_gate_lane();
+        }
+        if !self.quiet_valid || self.quiet_bits.len() != self.signal_table.len().div_ceil(64) {
+            self.build_quiet_bits();
         }
         #[cfg(feature = "jit")]
         if let Some(m) = self.ts_jit.as_mut() {
@@ -77190,6 +77222,24 @@ impl Simulator {
             return;
         }
         let (edge_sidecar, armed_sidecar) = if self.signal_commit_plan.is_empty() {
+            // Quiet signal (no armed / edge readers): nothing below applies
+            // unless a global observer is active.
+            if self.quiet_valid
+                && (self.quiet_bits[id >> 6] >> (id & 63)) & 1 != 0
+                && self.value_trace_ids.is_none()
+                && !self.dump_dirty_active
+                && self.active_force_exprs.is_empty()
+                && (premirrored || self.signal_inline_bits.is_empty())
+                && !(self.event_measure && !self.armed_edge)
+            {
+                if self.profile_report {
+                    self.prof_quiet_stores += 1;
+                }
+                return;
+            }
+            if self.profile_report {
+                self.prof_observed_stores += 1;
+            }
             (true, true)
         } else {
             let plan = self.signal_commit_plan.get(id).copied().unwrap_or(3);
@@ -77649,6 +77699,7 @@ impl Simulator {
             .last()
             .map_or(0, |(sid, _)| *sid as usize + 1);
         self.armed_input_bitmap = vec![0u64; bitmap_len.div_ceil(64)];
+        self.quiet_valid = false;
         self.armed_input_ranges = vec![(0, 0); bitmap_len];
         self.armed_input_blocks.reserve(pairs.len());
         let mut cursor = 0usize;
