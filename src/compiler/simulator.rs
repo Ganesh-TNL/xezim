@@ -22714,6 +22714,10 @@ impl Simulator {
         }
         let regs: &mut [u64] =
             unsafe { std::slice::from_raw_parts_mut(self.ts_regs.as_mut_ptr(), self.ts_regs.len()) };
+        // Register indices are assigned by the block compiler below
+        // `num_regs` and the file was just sized to it: every operand access
+        // goes through a raw pointer, as in the straight-line executor.
+        let rp: *mut u64 = regs.as_mut_ptr();
         macro_rules! xbail {
             () => {{
                 self.ts_xread_bail = true;
@@ -22737,7 +22741,7 @@ impl Simulator {
                 *self.ts_census.entry((census_prev, nm)).or_insert(0) += 1;
                 census_prev = nm;
             }
-            match unsafe { &*insns_ptr.add(pc) } {
+            unsafe { match &*insns_ptr.add(pc) {
                 TsInsn::LoadSig { d, sig } => {
                     // Plane-direct: one flat load vs the Value discriminant
                     // branch (raw_bits showed at 5% of settle post-PGO).
@@ -22750,9 +22754,9 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*d as usize] = v;
+                    (*rp.add(*d as usize)) = v;
                 }
-                TsInsn::Const { d, v } => regs[*d as usize] = *v,
+                TsInsn::Const { d, v } => (*rp.add(*d as usize)) = *v,
                 TsInsn::SigBit { d, sig, bit } => {
                     let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
                         Some(sl) => (sl[0], sl[1]),
@@ -22761,7 +22765,7 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*d as usize] = (v >> bit) & 1;
+                    (*rp.add(*d as usize)) = (v >> bit) & 1;
                 }
                 TsInsn::SigRange { d, sig, lo, mask } => {
                     let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
@@ -22771,7 +22775,7 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*d as usize] = (v >> lo) & mask;
+                    (*rp.add(*d as usize)) = (v >> lo) & mask;
                 }
                 TsInsn::SigBitW { d, sig, bit } => {
                     let (v, x) =
@@ -22779,7 +22783,7 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*d as usize] = v;
+                    (*rp.add(*d as usize)) = v;
                 }
                 TsInsn::SigRangeW { d, sig, lo, w, mask } => {
                     let (v, x) =
@@ -22787,79 +22791,79 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*d as usize] = v & mask;
+                    (*rp.add(*d as usize)) = v & mask;
                 }
                 TsInsn::Bit { d, s, bit } => {
-                    regs[*d as usize] = (regs[*s as usize] >> bit) & 1;
+                    (*rp.add(*d as usize)) = ((*rp.add(*s as usize)) >> bit) & 1;
                 }
                 TsInsn::Range { d, s, lo, mask } => {
-                    regs[*d as usize] = (regs[*s as usize] >> lo) & mask;
+                    (*rp.add(*d as usize)) = ((*rp.add(*s as usize)) >> lo) & mask;
                 }
                 TsInsn::Xor { d, a, b } => {
-                    regs[*d as usize] = regs[*a as usize] ^ regs[*b as usize];
+                    (*rp.add(*d as usize)) = (*rp.add(*a as usize)) ^ (*rp.add(*b as usize));
                 }
                 TsInsn::And { d, a, b } => {
-                    regs[*d as usize] = regs[*a as usize] & regs[*b as usize];
+                    (*rp.add(*d as usize)) = (*rp.add(*a as usize)) & (*rp.add(*b as usize));
                 }
                 TsInsn::Or { d, a, b } => {
-                    regs[*d as usize] = regs[*a as usize] | regs[*b as usize];
+                    (*rp.add(*d as usize)) = (*rp.add(*a as usize)) | (*rp.add(*b as usize));
                 }
                 TsInsn::Sel { d, c, a, b } => {
-                    regs[*d as usize] = if regs[*c as usize] != 0 {
-                        regs[*a as usize]
+                    (*rp.add(*d as usize)) = if (*rp.add(*c as usize)) != 0 {
+                        (*rp.add(*a as usize))
                     } else {
-                        regs[*b as usize]
+                        (*rp.add(*b as usize))
                     };
                 }
                 TsInsn::Not { d, s, mask } => {
-                    regs[*d as usize] = !regs[*s as usize] & mask;
+                    (*rp.add(*d as usize)) = !(*rp.add(*s as usize)) & mask;
                 }
                 TsInsn::XorC { d, s, k } => {
-                    regs[*d as usize] = regs[*s as usize] ^ k;
+                    (*rp.add(*d as usize)) = (*rp.add(*s as usize)) ^ k;
                 }
                 TsInsn::MaskEq { d, s, mask, v } => {
-                    regs[*d as usize] = ((regs[*s as usize] & mask) == *v) as u64;
+                    (*rp.add(*d as usize)) = (((*rp.add(*s as usize)) & mask) == *v) as u64;
                 }
                 TsInsn::EqC { d, s, k } => {
-                    regs[*d as usize] = (regs[*s as usize] == *k) as u64;
+                    (*rp.add(*d as usize)) = ((*rp.add(*s as usize)) == *k) as u64;
                 }
                 TsInsn::Add { d, a, b, mask } => {
-                    regs[*d as usize] =
-                        regs[*a as usize].wrapping_add(regs[*b as usize]) & mask;
+                    (*rp.add(*d as usize)) =
+                        (*rp.add(*a as usize)).wrapping_add((*rp.add(*b as usize))) & mask;
                 }
                 TsInsn::AddC { d, s: sr, k, mask } => {
-                    regs[*d as usize] = regs[*sr as usize].wrapping_add(*k) & mask;
+                    (*rp.add(*d as usize)) = (*rp.add(*sr as usize)).wrapping_add(*k) & mask;
                 }
                 TsInsn::Shl { d, a, b, w, mask } => {
-                    let amt = regs[*b as usize];
-                    regs[*d as usize] = if amt >= *w as u64 {
+                    let amt = (*rp.add(*b as usize));
+                    (*rp.add(*d as usize)) = if amt >= *w as u64 {
                         0
                     } else {
-                        (regs[*a as usize] << amt) & mask
+                        ((*rp.add(*a as usize)) << amt) & mask
                     };
                 }
                 TsInsn::Shr { d, a, b, w } => {
-                    let amt = regs[*b as usize];
-                    regs[*d as usize] = if amt >= *w as u64 {
+                    let amt = (*rp.add(*b as usize));
+                    (*rp.add(*d as usize)) = if amt >= *w as u64 {
                         0
                     } else {
-                        regs[*a as usize] >> amt
+                        (*rp.add(*a as usize)) >> amt
                     };
                 }
                 TsInsn::Sub { d, a, b, mask } => {
-                    regs[*d as usize] =
-                        regs[*a as usize].wrapping_sub(regs[*b as usize]) & mask;
+                    (*rp.add(*d as usize)) =
+                        (*rp.add(*a as usize)).wrapping_sub((*rp.add(*b as usize))) & mask;
                 }
                 TsInsn::Eq { d, a, b } => {
-                    regs[*d as usize] = (regs[*a as usize] == regs[*b as usize]) as u64;
+                    (*rp.add(*d as usize)) = ((*rp.add(*a as usize)) == (*rp.add(*b as usize))) as u64;
                 }
                 TsInsn::Neq { d, a, b } => {
-                    regs[*d as usize] = (regs[*a as usize] != regs[*b as usize]) as u64;
+                    (*rp.add(*d as usize)) = ((*rp.add(*a as usize)) != (*rp.add(*b as usize))) as u64;
                 }
                 TsInsn::CmpS { d, a, b, kind, sa, sb } => {
-                    let x = ((regs[*a as usize] << *sa) as i64) >> *sa;
-                    let y = ((regs[*b as usize] << *sb) as i64) >> *sb;
-                    regs[*d as usize] = match *kind {
+                    let x = (((*rp.add(*a as usize)) << *sa) as i64) >> *sa;
+                    let y = (((*rp.add(*b as usize)) << *sb) as i64) >> *sb;
+                    (*rp.add(*d as usize)) = match *kind {
                         0 => x < y,
                         1 => x <= y,
                         2 => x > y,
@@ -22867,18 +22871,18 @@ impl Simulator {
                     } as u64;
                 }
                 TsInsn::BitStoreNbaDyn { sig, i, s, w } => {
-                    let idx = regs[*i as usize];
+                    let idx = (*rp.add(*i as usize));
                     if idx < *w as u64 {
-                        let bit = regs[*s as usize] & 1;
+                        let bit = (*rp.add(*s as usize)) & 1;
                         self.ts_bit_store_nba(*sig as usize, idx as u32, bit);
                     }
                 }
                 TsInsn::BitDyn { d, s, i, w } => {
-                    let idx = regs[*i as usize];
+                    let idx = (*rp.add(*i as usize));
                     if idx >= *w as u64 {
                         return false;
                     }
-                    regs[*d as usize] = (regs[*s as usize] >> idx) & 1;
+                    (*rp.add(*d as usize)) = ((*rp.add(*s as usize)) >> idx) & 1;
                 }
                 TsInsn::LoadSigNot { dl, d, sig } => {
                     let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
@@ -22888,8 +22892,8 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*dl as usize] = v;
-                    regs[*d as usize] = (v == 0) as u64;
+                    (*rp.add(*dl as usize)) = v;
+                    (*rp.add(*d as usize)) = (v == 0) as u64;
                 }
                 TsInsn::SigRangeEqC { dr, d, sig, lo, mask, k } => {
                     let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
@@ -22900,8 +22904,8 @@ impl Simulator {
                         xbail!();
                     }
                     let rv = (v >> lo) & mask;
-                    regs[*dr as usize] = rv;
-                    regs[*d as usize] = (rv == *k) as u64;
+                    (*rp.add(*dr as usize)) = rv;
+                    (*rp.add(*d as usize)) = (rv == *k) as u64;
                 }
                 TsInsn::LoadSigLogAnd { dl, sig, d, a, b } => {
                     let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
@@ -22911,25 +22915,25 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*dl as usize] = v;
-                    regs[*d as usize] = (regs[*a as usize] != 0 && regs[*b as usize] != 0) as u64;
+                    (*rp.add(*dl as usize)) = v;
+                    (*rp.add(*d as usize)) = ((*rp.add(*a as usize)) != 0 && (*rp.add(*b as usize)) != 0) as u64;
                 }
                 TsInsn::LogNotAnd { dn, s, d, a, b } => {
-                    regs[*dn as usize] = (regs[*s as usize] == 0) as u64;
-                    regs[*d as usize] = regs[*a as usize] & regs[*b as usize];
+                    (*rp.add(*dn as usize)) = ((*rp.add(*s as usize)) == 0) as u64;
+                    (*rp.add(*d as usize)) = (*rp.add(*a as usize)) & (*rp.add(*b as usize));
                 }
                 TsInsn::LogNotLogAnd { dn, s, d, a, b } => {
-                    regs[*dn as usize] = (regs[*s as usize] == 0) as u64;
-                    regs[*d as usize] = (regs[*a as usize] != 0 && regs[*b as usize] != 0) as u64;
+                    (*rp.add(*dn as usize)) = ((*rp.add(*s as usize)) == 0) as u64;
+                    (*rp.add(*d as usize)) = ((*rp.add(*a as usize)) != 0 && (*rp.add(*b as usize)) != 0) as u64;
                 }
                 TsInsn::LogAndStore { d, a, b, sig, mask } => {
-                    let rv = (regs[*a as usize] != 0 && regs[*b as usize] != 0) as u64;
-                    regs[*d as usize] = rv;
+                    let rv = ((*rp.add(*a as usize)) != 0 && (*rp.add(*b as usize)) != 0) as u64;
+                    (*rp.add(*d as usize)) = rv;
                     self.ts_store(*sig as usize, rv & mask, *mask);
                 }
                 TsInsn::AndRangeStore { d, a, b, sig, hi, lo, mask } => {
-                    let rv = regs[*a as usize] & regs[*b as usize];
-                    regs[*d as usize] = rv;
+                    let rv = (*rp.add(*a as usize)) & (*rp.add(*b as usize));
+                    (*rp.add(*d as usize)) = rv;
                     self.ts_range_store(*sig as usize, rv & mask, *lo, *hi);
                 }
                 TsInsn::SigBitNot { db, d, sig, bit } => {
@@ -22941,8 +22945,8 @@ impl Simulator {
                         xbail!();
                     }
                     let bv = (v >> bit) & 1;
-                    regs[*db as usize] = bv;
-                    regs[*d as usize] = (bv == 0) as u64;
+                    (*rp.add(*db as usize)) = bv;
+                    (*rp.add(*d as usize)) = (bv == 0) as u64;
                 }
                 TsInsn::LoadSig2 { d1, sig1, d2, sig2 } => {
                     let (v, x) = match self.signal_inline_bits.get(*sig1 as usize) {
@@ -22952,7 +22956,7 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*d1 as usize] = v;
+                    (*rp.add(*d1 as usize)) = v;
                     let (v, x) = match self.signal_inline_bits.get(*sig2 as usize) {
                         Some(sl) => (sl[0], sl[1]),
                         None => self.signal_table[*sig2 as usize].raw_bits(),
@@ -22960,7 +22964,7 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*d2 as usize] = v;
+                    (*rp.add(*d2 as usize)) = v;
                 }
                 TsInsn::SigBit2 { d1, sig1, bit1, d2, sig2, bit2 } => {
                     let (v, x) = match self.signal_inline_bits.get(*sig1 as usize) {
@@ -22970,7 +22974,7 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*d1 as usize] = (v >> bit1) & 1;
+                    (*rp.add(*d1 as usize)) = (v >> bit1) & 1;
                     let (v, x) = match self.signal_inline_bits.get(*sig2 as usize) {
                         Some(sl) => (sl[0], sl[1]),
                         None => self.signal_table[*sig2 as usize].raw_bits(),
@@ -22978,7 +22982,7 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*d2 as usize] = (v >> bit2) & 1;
+                    (*rp.add(*d2 as usize)) = (v >> bit2) & 1;
                 }
                 TsInsn::LoadSigLogOr { dl, sig, d, a, b } => {
                     let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
@@ -22988,8 +22992,8 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*dl as usize] = v;
-                    regs[*d as usize] = (regs[*a as usize] != 0 || regs[*b as usize] != 0) as u64;
+                    (*rp.add(*dl as usize)) = v;
+                    (*rp.add(*d as usize)) = ((*rp.add(*a as usize)) != 0 || (*rp.add(*b as usize)) != 0) as u64;
                 }
                 TsInsn::LoadSigAnd { dl, sig, d, a, b } => {
                     let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
@@ -22999,8 +23003,8 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*dl as usize] = v;
-                    regs[*d as usize] = regs[*a as usize] & regs[*b as usize];
+                    (*rp.add(*dl as usize)) = v;
+                    (*rp.add(*d as usize)) = (*rp.add(*a as usize)) & (*rp.add(*b as usize));
                 }
                 TsInsn::LoadSigRepl { dl, sig, d, w, count } => {
                     let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
@@ -23010,12 +23014,12 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*dl as usize] = v;
+                    (*rp.add(*dl as usize)) = v;
                     let mut acc = 0u64;
                     for _ in 0..*count {
                         acc = (acc << *w) | v;
                     }
-                    regs[*d as usize] = acc;
+                    (*rp.add(*d as usize)) = acc;
                 }
                 TsInsn::LoadSigSigRange { dl, sig, d, sig2, lo, mask } => {
                     let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
@@ -23025,7 +23029,7 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*dl as usize] = v;
+                    (*rp.add(*dl as usize)) = v;
                     let (v, x) = match self.signal_inline_bits.get(*sig2 as usize) {
                         Some(sl) => (sl[0], sl[1]),
                         None => self.signal_table[*sig2 as usize].raw_bits(),
@@ -23033,7 +23037,7 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*d as usize] = (v >> lo) & mask;
+                    (*rp.add(*d as usize)) = (v >> lo) & mask;
                 }
                 TsInsn::SigRangeAnd { dr, sig, lo, mask, d, a, b } => {
                     let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
@@ -23043,8 +23047,8 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*dr as usize] = (v >> lo) & mask;
-                    regs[*d as usize] = regs[*a as usize] & regs[*b as usize];
+                    (*rp.add(*dr as usize)) = (v >> lo) & mask;
+                    (*rp.add(*d as usize)) = (*rp.add(*a as usize)) & (*rp.add(*b as usize));
                 }
                 TsInsn::SigRangeEq { dr, sig, lo, mask, d, a, b } => {
                     let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
@@ -23054,25 +23058,25 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*dr as usize] = (v >> lo) & mask;
-                    regs[*d as usize] = (regs[*a as usize] == regs[*b as usize]) as u64;
+                    (*rp.add(*dr as usize)) = (v >> lo) & mask;
+                    (*rp.add(*d as usize)) = ((*rp.add(*a as usize)) == (*rp.add(*b as usize))) as u64;
                 }
                 TsInsn::ConstEq { dc, v, d, a, b } => {
-                    regs[*dc as usize] = *v;
-                    regs[*d as usize] = (regs[*a as usize] == regs[*b as usize]) as u64;
+                    (*rp.add(*dc as usize)) = *v;
+                    (*rp.add(*d as usize)) = ((*rp.add(*a as usize)) == (*rp.add(*b as usize))) as u64;
                 }
                 TsInsn::LogOrStore { d, a, b, sig, mask } => {
-                    let rv = (regs[*a as usize] != 0 || regs[*b as usize] != 0) as u64;
-                    regs[*d as usize] = rv;
+                    let rv = ((*rp.add(*a as usize)) != 0 || (*rp.add(*b as usize)) != 0) as u64;
+                    (*rp.add(*d as usize)) = rv;
                     self.ts_store(*sig as usize, rv & mask, *mask);
                 }
                 TsInsn::AndOr { d1, a1, b1, d, a, b } => {
-                    regs[*d1 as usize] = regs[*a1 as usize] & regs[*b1 as usize];
-                    regs[*d as usize] = regs[*a as usize] | regs[*b as usize];
+                    (*rp.add(*d1 as usize)) = (*rp.add(*a1 as usize)) & (*rp.add(*b1 as usize));
+                    (*rp.add(*d as usize)) = (*rp.add(*a as usize)) | (*rp.add(*b as usize));
                 }
                 TsInsn::OrRangeStore { d, a, b, sig, hi, lo, mask } => {
-                    let rv = regs[*a as usize] | regs[*b as usize];
-                    regs[*d as usize] = rv;
+                    let rv = (*rp.add(*a as usize)) | (*rp.add(*b as usize));
+                    (*rp.add(*d as usize)) = rv;
                     self.ts_range_store(*sig as usize, rv & mask, *lo, *hi);
                 }
                 TsInsn::LoadSigBrNz { dl, sig, t } => {
@@ -23083,14 +23087,14 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*dl as usize] = v;
+                    (*rp.add(*dl as usize)) = v;
                     if v != 0 {
                         pc = *t as usize;
                         continue;
                     }
                 }
                 TsInsn::BrFalseLoadSig { s, t, dl, sig } => {
-                    if regs[*s as usize] == 0 {
+                    if (*rp.add(*s as usize)) == 0 {
                         pc = *t as usize;
                         continue;
                     }
@@ -23101,36 +23105,36 @@ impl Simulator {
                     if x != 0 {
                         xbail!();
                     }
-                    regs[*dl as usize] = v;
+                    (*rp.add(*dl as usize)) = v;
                 }
                 TsInsn::EqBrFalse { d, a, b, t } => {
-                    let rv = (regs[*a as usize] == regs[*b as usize]) as u64;
-                    regs[*d as usize] = rv;
+                    let rv = ((*rp.add(*a as usize)) == (*rp.add(*b as usize))) as u64;
+                    (*rp.add(*d as usize)) = rv;
                     if rv == 0 {
                         pc = *t as usize;
                         continue;
                     }
                 }
                 TsInsn::Lt { d, a, b } => {
-                    regs[*d as usize] = (regs[*a as usize] < regs[*b as usize]) as u64;
+                    (*rp.add(*d as usize)) = ((*rp.add(*a as usize)) < (*rp.add(*b as usize))) as u64;
                 }
                 TsInsn::Leq { d, a, b } => {
-                    regs[*d as usize] = (regs[*a as usize] <= regs[*b as usize]) as u64;
+                    (*rp.add(*d as usize)) = ((*rp.add(*a as usize)) <= (*rp.add(*b as usize))) as u64;
                 }
                 TsInsn::Gt { d, a, b } => {
-                    regs[*d as usize] = (regs[*a as usize] > regs[*b as usize]) as u64;
+                    (*rp.add(*d as usize)) = ((*rp.add(*a as usize)) > (*rp.add(*b as usize))) as u64;
                 }
                 TsInsn::Geq { d, a, b } => {
-                    regs[*d as usize] = (regs[*a as usize] >= regs[*b as usize]) as u64;
+                    (*rp.add(*d as usize)) = ((*rp.add(*a as usize)) >= (*rp.add(*b as usize))) as u64;
                 }
                 TsInsn::LogNot { d, s } => {
-                    regs[*d as usize] = (regs[*s as usize] == 0) as u64;
+                    (*rp.add(*d as usize)) = ((*rp.add(*s as usize)) == 0) as u64;
                 }
                 TsInsn::RedOr { d, s } => {
-                    regs[*d as usize] = (regs[*s as usize] != 0) as u64;
+                    (*rp.add(*d as usize)) = ((*rp.add(*s as usize)) != 0) as u64;
                 }
                 TsInsn::RedAnd { d, s, mask } => {
-                    regs[*d as usize] = (regs[*s as usize] == *mask) as u64;
+                    (*rp.add(*d as usize)) = ((*rp.add(*s as usize)) == *mask) as u64;
                 }
                 TsInsn::WRedOr { .. } | TsInsn::WRedAnd { .. } => {
                     unreachable!("wide insn outside the wide executor")
@@ -23138,9 +23142,9 @@ impl Simulator {
                 TsInsn::BitStoreDyn { sig, i, s, w } => {
                     // §11.5.1: an out-of-range dynamic bit-select target
                     // drops the write (`Value::set_bit` is a no-op there).
-                    let idx = regs[*i as usize];
+                    let idx = (*rp.add(*i as usize));
                     if idx < *w as u64 {
-                        let b = regs[*s as usize] & 1;
+                        let b = (*rp.add(*s as usize)) & 1;
                         if *w > 64 {
                             self.ts_wide_bit_store(*sig as usize, idx as usize, b);
                         } else {
@@ -23158,11 +23162,11 @@ impl Simulator {
                     self.ts_wide_range_fill_nba(*sig as usize, *lo, *hi, *bit);
                 }
                 TsInsn::RangeStoreNbaW { sig, hi, lo, s, mask } => {
-                    let v = regs[*s as usize] & mask;
+                    let v = (*rp.add(*s as usize)) & mask;
                     self.ts_wide_range_store_nba(*sig as usize, *lo, *hi, v);
                 }
                 TsInsn::RangeStoreW { sig, hi, lo, s, mask } => {
-                    let v = regs[*s as usize] & mask;
+                    let v = (*rp.add(*s as usize)) & mask;
                     self.ts_wide_range_store(*sig as usize, *lo, *hi, v, 0);
                 }
                 TsInsn::RangeStoreXW { sig, hi, lo, v, x } => {
@@ -23172,34 +23176,34 @@ impl Simulator {
                     self.ts_range_store_xz(*sig as usize, *v, *x, *lo, *hi);
                 }
                 TsInsn::LogAnd { d, a, b } => {
-                    regs[*d as usize] =
-                        (regs[*a as usize] != 0 && regs[*b as usize] != 0) as u64;
+                    (*rp.add(*d as usize)) =
+                        ((*rp.add(*a as usize)) != 0 && (*rp.add(*b as usize)) != 0) as u64;
                 }
                 TsInsn::LogOr { d, a, b } => {
-                    regs[*d as usize] =
-                        (regs[*a as usize] != 0 || regs[*b as usize] != 0) as u64;
+                    (*rp.add(*d as usize)) =
+                        ((*rp.add(*a as usize)) != 0 || (*rp.add(*b as usize)) != 0) as u64;
                 }
                 TsInsn::Concat { d, parts } => {
                     let mut acc = 0u64;
                     for &(r, w) in parts.iter() {
-                        acc = (acc << w) | regs[r as usize];
+                        acc = (acc << w) | (*rp.add(r as usize));
                     }
-                    regs[*d as usize] = acc;
+                    (*rp.add(*d as usize)) = acc;
                 }
                 TsInsn::Mask { d, mask } => {
-                    regs[*d as usize] &= mask;
+                    (*rp.add(*d as usize)) &= mask;
                 }
                 TsInsn::Mul { d, a, b, mask } => {
-                    regs[*d as usize] =
-                        regs[*a as usize].wrapping_mul(regs[*b as usize]) & mask;
+                    (*rp.add(*d as usize)) =
+                        (*rp.add(*a as usize)).wrapping_mul((*rp.add(*b as usize))) & mask;
                 }
                 TsInsn::Repl { d, s, w, count } => {
-                    let part = regs[*s as usize];
+                    let part = (*rp.add(*s as usize));
                     let mut acc = 0u64;
                     for _ in 0..*count {
                         acc = (acc << *w) | part;
                     }
-                    regs[*d as usize] = acc;
+                    (*rp.add(*d as usize)) = acc;
                 }
                 TsInsn::WSigRange { .. } => {
                     unreachable!("wide insn outside the wide executor")
@@ -23232,13 +23236,13 @@ impl Simulator {
                     }
                 }
                 TsInsn::BrFalse { s, t } => {
-                    if regs[*s as usize] == 0 {
+                    if (*rp.add(*s as usize)) == 0 {
                         pc = *t as usize;
                         continue;
                     }
                 }
                 TsInsn::BrNz { s, t } => {
-                    if regs[*s as usize] != 0 {
+                    if (*rp.add(*s as usize)) != 0 {
                         pc = *t as usize;
                         continue;
                     }
@@ -23253,7 +23257,7 @@ impl Simulator {
                     // holes still take `default`.
                     pc = cj
                         .table
-                        .get(regs[*s as usize] as usize)
+                        .get((*rp.add(*s as usize)) as usize)
                         .copied()
                         .unwrap_or(cj.default) as usize;
                     continue;
@@ -23261,12 +23265,12 @@ impl Simulator {
                 TsInsn::CaseMaskJmp { s, mask, lo, wmask, mj } => {
                     // The window is fully defined on an X-free selector, so
                     // `xz_path` (the wildcard compare chain) cannot be taken.
-                    let v = regs[*s as usize] & *mask;
+                    let v = (*rp.add(*s as usize)) & *mask;
                     pc = mj.table[(((v >> *lo) & *wmask) as usize)] as usize;
                     continue;
                 }
                 TsInsn::ElemLoad(op) => {
-                    let i = regs[op.idx as usize] as i64;
+                    let i = (*rp.add(op.idx as usize)) as i64;
                     if i < op.lo || i > op.hi {
                         return false;
                     }
@@ -23275,22 +23279,22 @@ impl Simulator {
                     if x != 0 {
                         return false;
                     }
-                    regs[op.s as usize] = v;
+                    (*rp.add(op.s as usize)) = v;
                 }
                 TsInsn::ElemStoreNba(op) => {
-                    let i = regs[op.idx as usize] as i64;
+                    let i = (*rp.add(op.idx as usize)) as i64;
                     if i >= op.lo && i <= op.hi {
                         let eid = op.first as usize + (i - op.lo) as usize;
-                        let v = regs[op.s as usize] & op.mask;
+                        let v = (*rp.add(op.s as usize)) & op.mask;
                         self.ts_store_nba(eid, v, op.w);
                     }
                     // Out-of-range: silent drop, as in 4-state.
                 }
                 TsInsn::ElemStore(op) => {
-                    let i = regs[op.idx as usize] as i64;
+                    let i = (*rp.add(op.idx as usize)) as i64;
                     if i >= op.lo && i <= op.hi {
                         let eid = op.first as usize + (i - op.lo) as usize;
-                        let v = regs[op.s as usize] & op.mask;
+                        let v = (*rp.add(op.s as usize)) & op.mask;
                         self.ts_store(eid, v, op.mask);
                     }
                 }
@@ -23309,7 +23313,7 @@ impl Simulator {
                     self.ts_store_nba(op.dst as usize, ev & m, op.w);
                 }
                 TsInsn::Store { sig, s, mask } => {
-                    let v = regs[*s as usize] & mask;
+                    let v = (*rp.add(*s as usize)) & mask;
                     self.ts_store(*sig as usize, v, *mask);
                 }
                 TsInsn::RangeStore { sig, hi, lo, s, mask } => {
@@ -23321,13 +23325,13 @@ impl Simulator {
                     // the same merge the NBA arm below uses.
                     self.ts_range_store(
                         *sig as usize,
-                        regs[*s as usize] & mask,
+                        (*rp.add(*s as usize)) & mask,
                         *lo,
                         *hi,
                     );
                 }
                 TsInsn::StoreNba { sig, s, w, mask } => {
-                    let v = regs[*s as usize] & mask;
+                    let v = (*rp.add(*s as usize)) & mask;
                     self.ts_store_nba(*sig as usize, v, *w);
                 }
                 TsInsn::ConstStoreNba { sig, v, w } => {
@@ -23339,7 +23343,7 @@ impl Simulator {
                     // the signal, with eval-time elision. Plane-based, so an
                     // X base composes instead of aborting.
                     let id = *sig as usize;
-                    let (src_v, src_x) = (regs[*s as usize] & mask, 0u64);
+                    let (src_v, src_x) = ((*rp.add(*s as usize)) & mask, 0u64);
                     if let Some(i) = self.nba_fast_index.get(id) {
                         let target = &mut self.nba_fast[i].value;
                         let (base_v, base_x) = target.raw_bits();
@@ -23387,7 +23391,7 @@ impl Simulator {
                 | TsInsn::WStoreNba { .. } => {
                     unreachable!("wide insn outside the wide executor")
                 }
-            }
+            } }
             pc += 1;
         }
         true
@@ -50331,6 +50335,56 @@ impl Simulator {
                                                 self.ts_arena.as_ptr().add(off) as *const i8,
                                                 core::arch::x86_64::_MM_HINT_T0,
                                             );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Mode 3: the signal VALUES the entry loads first —
+                        // the random 32-byte `Value` fetch at the head of
+                        // nearly every two-state block is the executor's
+                        // dominant stall. The stream was prefetched half a
+                        // distance ago; read its first two instructions and
+                        // touch the values they will load.
+                        if prefetch_mode >= 3 {
+                            let d3 = cur_pos + prefetch_dist / 4;
+                            if d3 < cur_list.len() {
+                                let nxt = cur_list[d3];
+                                if let Some(h) = self.ts_hdr.get(nxt) {
+                                    let off = h.off as usize;
+                                    if h.kind() != 0 {
+                                        let n = h.len().min(3);
+                                        for k in 0..n {
+                                            let Some(insn) = self.ts_arena.get(off + k) else { break };
+                                            use super::bytecode::TsInsn as T;
+                                            let sig = match insn {
+                                                T::LoadSig { sig, .. }
+                                                | T::SigRange { sig, .. }
+                                                | T::SigBit { sig, .. }
+                                                | T::LoadSigNot { sig, .. }
+                                                | T::SigRangeEqC { sig, .. }
+                                                | T::LoadSigLogAnd { sig, .. }
+                                                | T::SigBitNot { sig, .. }
+                                                | T::LoadSigLogOr { sig, .. }
+                                                | T::LoadSigAnd { sig, .. }
+                                                | T::LoadSigRepl { sig, .. }
+                                                | T::LoadSigSigRange { sig, .. }
+                                                | T::SigRangeAnd { sig, .. }
+                                                | T::SigRangeEq { sig, .. }
+                                                | T::LoadSigBrNz { sig, .. }
+                                                | T::BrSigFalse { sig, .. }
+                                                | T::LoadSig2 { sig1: sig, .. }
+                                                | T::SigBit2 { sig1: sig, .. } => *sig as usize,
+                                                _ => continue,
+                                            };
+                                            if sig < self.signal_table.len() {
+                                                unsafe {
+                                                    core::arch::x86_64::_mm_prefetch(
+                                                        self.signal_table.as_ptr().add(sig) as *const i8,
+                                                        core::arch::x86_64::_MM_HINT_T0,
+                                                    );
+                                                }
+                                            }
                                         }
                                     }
                                 }
