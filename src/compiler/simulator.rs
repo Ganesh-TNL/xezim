@@ -13532,13 +13532,18 @@ impl Simulator {
         // pointer in `set_inline_bits_storage`.  Otherwise Stage 2's
         // inline LoadSignal codegen falls back to the FFI path because
         // the storage is empty at JIT-compile time.
-        // SoA planes are now AUTHORITATIVE-COHERENT by default: always
-        // allocated, maintained by write_sig!/the plane-sync helpers, and
-        // read by the native load paths. XEZIM_INLINE_BITS=0 opts out
-        // (diagnostic only — the FFI load bridges then serve everything).
-        if std::env::var("XEZIM_INLINE_BITS").ok().as_deref() != Some("0")
-            && self.signal_inline_bits.is_empty()
-        {
+        // SoA planes are allocated for JIT runs (XEZIM_JIT), where the native
+        // load paths read them, and on explicit XEZIM_INLINE_BITS=1. In the
+        // default interpreter/two-state run the mirror only adds a 16-byte
+        // store per signal write (560 MB on c906) that the two-state loads
+        // do not need: keeping it off measured 2.6 % fewer cycles on the
+        // c906 memcpy run. XEZIM_INLINE_BITS=0 forces it off everywhere.
+        let want_mirror = match std::env::var("XEZIM_INLINE_BITS").ok().as_deref() {
+            Some("0") => false,
+            Some(_) => true,
+            None => std::env::var("XEZIM_JIT").map(|v| v != "0" && !v.is_empty()).unwrap_or(false),
+        };
+        if want_mirror && self.signal_inline_bits.is_empty() {
             let n = self.signal_table.len();
             self.signal_inline_bits = Vec::with_capacity(n);
             for v in &self.signal_table {
