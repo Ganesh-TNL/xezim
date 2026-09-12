@@ -12845,6 +12845,22 @@ pub enum TsInsn {
     LogAndStore { d: u16, a: u16, b: u16, sig: u32, mask: u64 },
     AndRangeStore { d: u16, a: u16, b: u16, sig: u32, hi: u32, lo: u32, mask: u64 },
     SigBitNot { db: u16, d: u16, sig: u32, bit: u16 },
+    /// Second fusion batch (same rules).
+    LoadSig2 { d1: u16, sig1: u32, d2: u16, sig2: u32 },
+    SigBit2 { d1: u16, sig1: u32, bit1: u16, d2: u16, sig2: u32, bit2: u16 },
+    LoadSigBrNz { dl: u16, sig: u32, t: u32 },
+    BrFalseLoadSig { s: u16, t: u32, dl: u16, sig: u32 },
+    EqBrFalse { d: u16, a: u16, b: u16, t: u32 },
+    LoadSigLogOr { dl: u16, sig: u32, d: u16, a: u16, b: u16 },
+    LoadSigAnd { dl: u16, sig: u32, d: u16, a: u16, b: u16 },
+    LoadSigRepl { dl: u16, sig: u32, d: u16, w: u8, count: u8 },
+    LoadSigSigRange { dl: u16, sig: u32, d: u16, sig2: u32, lo: u16, mask: u64 },
+    SigRangeAnd { dr: u16, sig: u32, lo: u16, mask: u64, d: u16, a: u16, b: u16 },
+    SigRangeEq { dr: u16, sig: u32, lo: u16, mask: u64, d: u16, a: u16, b: u16 },
+    ConstEq { dc: u16, v: u64, d: u16, a: u16, b: u16 },
+    LogOrStore { d: u16, a: u16, b: u16, sig: u32, mask: u64 },
+    AndOr { d1: u16, a1: u16, b1: u16, d: u16, a: u16, b: u16 },
+    OrRangeStore { d: u16, a: u16, b: u16, sig: u32, hi: u32, lo: u32, mask: u64 },
     Lt { d: u16, a: u16, b: u16 },
     /// Signed relational compare (§11.8.1: both operands signed). `sa`/`sb`
     /// are the shifts that sign-extend each operand from its static width;
@@ -13349,6 +13365,51 @@ fn fuse_ts_pairs(out: &mut Vec<TsInsn>) {
                 (TsInsn::SigBit { d: db, sig, bit }, TsInsn::LogNot { d, s }) if s == db => {
                     Some(TsInsn::SigBitNot { db: *db, d: *d, sig: *sig, bit: *bit })
                 }
+                (TsInsn::LoadSig { d: d1, sig: sig1 }, TsInsn::LoadSig { d: d2, sig: sig2 }) => {
+                    Some(TsInsn::LoadSig2 { d1: *d1, sig1: *sig1, d2: *d2, sig2: *sig2 })
+                }
+                (TsInsn::SigBit { d: d1, sig: sig1, bit: bit1 }, TsInsn::SigBit { d: d2, sig: sig2, bit: bit2 }) => {
+                    Some(TsInsn::SigBit2 { d1: *d1, sig1: *sig1, bit1: *bit1, d2: *d2, sig2: *sig2, bit2: *bit2 })
+                }
+                (TsInsn::LoadSig { d: dl, sig }, TsInsn::BrNz { s, t }) if s == dl => {
+                    Some(TsInsn::LoadSigBrNz { dl: *dl, sig: *sig, t: *t })
+                }
+                (TsInsn::BrFalse { s, t }, TsInsn::LoadSig { d: dl, sig }) => {
+                    Some(TsInsn::BrFalseLoadSig { s: *s, t: *t, dl: *dl, sig: *sig })
+                }
+                (TsInsn::Eq { d, a, b }, TsInsn::BrFalse { s, t }) if s == d => {
+                    Some(TsInsn::EqBrFalse { d: *d, a: *a, b: *b, t: *t })
+                }
+                (TsInsn::LoadSig { d: dl, sig }, TsInsn::LogOr { d, a, b }) if a == dl || b == dl => {
+                    Some(TsInsn::LoadSigLogOr { dl: *dl, sig: *sig, d: *d, a: *a, b: *b })
+                }
+                (TsInsn::LoadSig { d: dl, sig }, TsInsn::And { d, a, b }) if a == dl || b == dl => {
+                    Some(TsInsn::LoadSigAnd { dl: *dl, sig: *sig, d: *d, a: *a, b: *b })
+                }
+                (TsInsn::LoadSig { d: dl, sig }, TsInsn::Repl { d, s, w, count }) if s == dl => {
+                    Some(TsInsn::LoadSigRepl { dl: *dl, sig: *sig, d: *d, w: *w, count: *count })
+                }
+                (TsInsn::LoadSig { d: dl, sig }, TsInsn::SigRange { d, sig: sig2, lo, mask }) => {
+                    Some(TsInsn::LoadSigSigRange { dl: *dl, sig: *sig, d: *d, sig2: *sig2, lo: *lo, mask: *mask })
+                }
+                (TsInsn::SigRange { d: dr, sig, lo, mask }, TsInsn::And { d, a, b }) if a == dr || b == dr => {
+                    Some(TsInsn::SigRangeAnd { dr: *dr, sig: *sig, lo: *lo, mask: *mask, d: *d, a: *a, b: *b })
+                }
+                (TsInsn::SigRange { d: dr, sig, lo, mask }, TsInsn::Eq { d, a, b }) if a == dr || b == dr => {
+                    Some(TsInsn::SigRangeEq { dr: *dr, sig: *sig, lo: *lo, mask: *mask, d: *d, a: *a, b: *b })
+                }
+                (TsInsn::Const { d: dc, v }, TsInsn::Eq { d, a, b }) if a == dc || b == dc => {
+                    Some(TsInsn::ConstEq { dc: *dc, v: *v, d: *d, a: *a, b: *b })
+                }
+                (TsInsn::LogOr { d, a, b }, TsInsn::Store { sig, s, mask }) if s == d => {
+                    Some(TsInsn::LogOrStore { d: *d, a: *a, b: *b, sig: *sig, mask: *mask })
+                }
+                (TsInsn::And { d: d1, a: a1, b: b1 }, TsInsn::Or { d, a, b }) if a == d1 || b == d1 => {
+                    Some(TsInsn::AndOr { d1: *d1, a1: *a1, b1: *b1, d: *d, a: *a, b: *b })
+                }
+                (TsInsn::Or { d, a, b }, TsInsn::RangeStore { sig, hi, lo, s, mask }) if s == d => {
+                    Some(TsInsn::OrRangeStore { d: *d, a: *a, b: *b, sig: *sig, hi: *hi, lo: *lo, mask: *mask })
+                }
                 _ => None,
             }
         } else {
@@ -13373,6 +13434,9 @@ fn fuse_ts_pairs(out: &mut Vec<TsInsn>) {
             TsInsn::BrSigFalse { t, .. }
             | TsInsn::BrFalse { t, .. }
             | TsInsn::BrNz { t, .. }
+            | TsInsn::LoadSigBrNz { t, .. }
+            | TsInsn::BrFalseLoadSig { t, .. }
+            | TsInsn::EqBrFalse { t, .. }
             | TsInsn::Jmp { t } => *t = new_of[(*t as usize).min(n)],
             TsInsn::CaseMaskJmp { mj, .. } => {
                 for t in mj.table.iter_mut().chain(std::iter::once(&mut mj.xz_path)) {
@@ -14943,6 +15007,8 @@ pub fn lower_two_state(
                     | TsInsn::RangeFillNbaW { .. }
                     | TsInsn::WRangeStore { .. }
                     | TsInsn::WRangeStoreNba { .. }
+                    | TsInsn::LogOrStore { .. }
+                    | TsInsn::OrRangeStore { .. }
                     | TsInsn::RangeStoreXW { .. }
                     | TsInsn::ElemStore { .. }
                     | TsInsn::ElemStoreNba { .. }

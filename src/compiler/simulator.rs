@@ -21242,6 +21242,173 @@ impl Simulator {
                     regs[*db as usize] = bv;
                     regs[*d as usize] = (bv == 0) as u64;
                 }
+                TsInsn::LoadSig2 { d1, sig1, d2, sig2 } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig1 as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig1 as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*d1 as usize] = v;
+                    let (v, x) = match self.signal_inline_bits.get(*sig2 as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig2 as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*d2 as usize] = v;
+                }
+                TsInsn::SigBit2 { d1, sig1, bit1, d2, sig2, bit2 } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig1 as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig1 as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*d1 as usize] = (v >> bit1) & 1;
+                    let (v, x) = match self.signal_inline_bits.get(*sig2 as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig2 as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*d2 as usize] = (v >> bit2) & 1;
+                }
+                TsInsn::LoadSigLogOr { dl, sig, d, a, b } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*dl as usize] = v;
+                    regs[*d as usize] = (regs[*a as usize] != 0 || regs[*b as usize] != 0) as u64;
+                }
+                TsInsn::LoadSigAnd { dl, sig, d, a, b } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*dl as usize] = v;
+                    regs[*d as usize] = regs[*a as usize] & regs[*b as usize];
+                }
+                TsInsn::LoadSigRepl { dl, sig, d, w, count } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*dl as usize] = v;
+                    let mut acc = 0u64;
+                    for _ in 0..*count {
+                        acc = (acc << *w) | v;
+                    }
+                    regs[*d as usize] = acc;
+                }
+                TsInsn::LoadSigSigRange { dl, sig, d, sig2, lo, mask } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*dl as usize] = v;
+                    let (v, x) = match self.signal_inline_bits.get(*sig2 as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig2 as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*d as usize] = (v >> lo) & mask;
+                }
+                TsInsn::SigRangeAnd { dr, sig, lo, mask, d, a, b } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*dr as usize] = (v >> lo) & mask;
+                    regs[*d as usize] = regs[*a as usize] & regs[*b as usize];
+                }
+                TsInsn::SigRangeEq { dr, sig, lo, mask, d, a, b } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*dr as usize] = (v >> lo) & mask;
+                    regs[*d as usize] = (regs[*a as usize] == regs[*b as usize]) as u64;
+                }
+                TsInsn::ConstEq { dc, v, d, a, b } => {
+                    regs[*dc as usize] = *v;
+                    regs[*d as usize] = (regs[*a as usize] == regs[*b as usize]) as u64;
+                }
+                TsInsn::LogOrStore { d, a, b, sig, mask } => {
+                    let rv = (regs[*a as usize] != 0 || regs[*b as usize] != 0) as u64;
+                    regs[*d as usize] = rv;
+                    self.ts_store(*sig as usize, rv & mask, *mask);
+                }
+                TsInsn::AndOr { d1, a1, b1, d, a, b } => {
+                    regs[*d1 as usize] = regs[*a1 as usize] & regs[*b1 as usize];
+                    regs[*d as usize] = regs[*a as usize] | regs[*b as usize];
+                }
+                TsInsn::OrRangeStore { d, a, b, sig, hi, lo, mask } => {
+                    let rv = regs[*a as usize] | regs[*b as usize];
+                    regs[*d as usize] = rv;
+                    self.ts_range_store(*sig as usize, rv & mask, *lo, *hi);
+                }
+                TsInsn::LoadSigBrNz { dl, sig, t } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*dl as usize] = v;
+                    if v != 0 {
+                        pc = *t as usize;
+                        continue;
+                    }
+                }
+                TsInsn::BrFalseLoadSig { s, t, dl, sig } => {
+                    if regs[*s as usize] == 0 {
+                        pc = *t as usize;
+                        continue;
+                    }
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*dl as usize] = v;
+                }
+                TsInsn::EqBrFalse { d, a, b, t } => {
+                    let rv = (regs[*a as usize] == regs[*b as usize]) as u64;
+                    regs[*d as usize] = rv;
+                    if rv == 0 {
+                        pc = *t as usize;
+                        continue;
+                    }
+                }
                 TsInsn::Lt { d, a, b } => {
                     regs[*d as usize] = ((regs[*a as usize]) < (regs[*b as usize])) as u64;
                 }
@@ -21886,6 +22053,137 @@ impl Simulator {
                     r!(*db) = bv;
                     r!(*d) = (bv == 0) as u64;
                 }
+                TsInsn::LoadSig2 { d1, sig1, d2, sig2 } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig1 as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig1 as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    r!(*d1) = v;
+                    let (v, x) = match self.signal_inline_bits.get(*sig2 as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig2 as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    r!(*d2) = v;
+                }
+                TsInsn::SigBit2 { d1, sig1, bit1, d2, sig2, bit2 } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig1 as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig1 as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    r!(*d1) = (v >> bit1) & 1;
+                    let (v, x) = match self.signal_inline_bits.get(*sig2 as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig2 as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    r!(*d2) = (v >> bit2) & 1;
+                }
+                TsInsn::LoadSigLogOr { dl, sig, d, a, b } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    r!(*dl) = v;
+                    r!(*d) = (r!(*a) != 0 || r!(*b) != 0) as u64;
+                }
+                TsInsn::LoadSigAnd { dl, sig, d, a, b } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    r!(*dl) = v;
+                    r!(*d) = r!(*a) & r!(*b);
+                }
+                TsInsn::LoadSigRepl { dl, sig, d, w, count } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    r!(*dl) = v;
+                    let mut acc = 0u64;
+                    for _ in 0..*count {
+                        acc = (acc << *w) | v;
+                    }
+                    r!(*d) = acc;
+                }
+                TsInsn::LoadSigSigRange { dl, sig, d, sig2, lo, mask } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    r!(*dl) = v;
+                    let (v, x) = match self.signal_inline_bits.get(*sig2 as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig2 as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    r!(*d) = (v >> lo) & mask;
+                }
+                TsInsn::SigRangeAnd { dr, sig, lo, mask, d, a, b } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    r!(*dr) = (v >> lo) & mask;
+                    r!(*d) = r!(*a) & r!(*b);
+                }
+                TsInsn::SigRangeEq { dr, sig, lo, mask, d, a, b } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    r!(*dr) = (v >> lo) & mask;
+                    r!(*d) = (r!(*a) == r!(*b)) as u64;
+                }
+                TsInsn::ConstEq { dc, v, d, a, b } => {
+                    r!(*dc) = *v;
+                    r!(*d) = (r!(*a) == r!(*b)) as u64;
+                }
+                TsInsn::LogOrStore { d, a, b, sig, mask } => {
+                    let rv = (r!(*a) != 0 || r!(*b) != 0) as u64;
+                    r!(*d) = rv;
+                    self.ts_store(*sig as usize, rv & mask, *mask);
+                }
+                TsInsn::AndOr { d1, a1, b1, d, a, b } => {
+                    r!(*d1) = r!(*a1) & r!(*b1);
+                    r!(*d) = r!(*a) | r!(*b);
+                }
+                TsInsn::OrRangeStore { d, a, b, sig, hi, lo, mask } => {
+                    let rv = r!(*a) | r!(*b);
+                    r!(*d) = rv;
+                    self.ts_range_store(*sig as usize, rv & mask, *lo, *hi);
+                }
                 TsInsn::Lt { d, a, b } => {
                     r!(*d) = (r!(*a) < r!(*b)) as u64;
                 }
@@ -22107,6 +22405,9 @@ impl Simulator {
                 TsInsn::BrSigFalse { .. }
                 | TsInsn::BrFalse { .. }
                 | TsInsn::BrNz { .. }
+                | TsInsn::LoadSigBrNz { .. }
+                | TsInsn::BrFalseLoadSig { .. }
+                | TsInsn::EqBrFalse { .. }
                 | TsInsn::Jmp { .. }
                 | TsInsn::CaseJmp { .. }
                 | TsInsn::CaseMaskJmp { .. } => unreachable!("ctrl insn in straight-line block"),
@@ -22637,6 +22938,173 @@ impl Simulator {
                     let bv = (v >> bit) & 1;
                     regs[*db as usize] = bv;
                     regs[*d as usize] = (bv == 0) as u64;
+                }
+                TsInsn::LoadSig2 { d1, sig1, d2, sig2 } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig1 as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig1 as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*d1 as usize] = v;
+                    let (v, x) = match self.signal_inline_bits.get(*sig2 as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig2 as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*d2 as usize] = v;
+                }
+                TsInsn::SigBit2 { d1, sig1, bit1, d2, sig2, bit2 } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig1 as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig1 as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*d1 as usize] = (v >> bit1) & 1;
+                    let (v, x) = match self.signal_inline_bits.get(*sig2 as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig2 as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*d2 as usize] = (v >> bit2) & 1;
+                }
+                TsInsn::LoadSigLogOr { dl, sig, d, a, b } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*dl as usize] = v;
+                    regs[*d as usize] = (regs[*a as usize] != 0 || regs[*b as usize] != 0) as u64;
+                }
+                TsInsn::LoadSigAnd { dl, sig, d, a, b } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*dl as usize] = v;
+                    regs[*d as usize] = regs[*a as usize] & regs[*b as usize];
+                }
+                TsInsn::LoadSigRepl { dl, sig, d, w, count } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*dl as usize] = v;
+                    let mut acc = 0u64;
+                    for _ in 0..*count {
+                        acc = (acc << *w) | v;
+                    }
+                    regs[*d as usize] = acc;
+                }
+                TsInsn::LoadSigSigRange { dl, sig, d, sig2, lo, mask } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*dl as usize] = v;
+                    let (v, x) = match self.signal_inline_bits.get(*sig2 as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig2 as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*d as usize] = (v >> lo) & mask;
+                }
+                TsInsn::SigRangeAnd { dr, sig, lo, mask, d, a, b } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*dr as usize] = (v >> lo) & mask;
+                    regs[*d as usize] = regs[*a as usize] & regs[*b as usize];
+                }
+                TsInsn::SigRangeEq { dr, sig, lo, mask, d, a, b } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*dr as usize] = (v >> lo) & mask;
+                    regs[*d as usize] = (regs[*a as usize] == regs[*b as usize]) as u64;
+                }
+                TsInsn::ConstEq { dc, v, d, a, b } => {
+                    regs[*dc as usize] = *v;
+                    regs[*d as usize] = (regs[*a as usize] == regs[*b as usize]) as u64;
+                }
+                TsInsn::LogOrStore { d, a, b, sig, mask } => {
+                    let rv = (regs[*a as usize] != 0 || regs[*b as usize] != 0) as u64;
+                    regs[*d as usize] = rv;
+                    self.ts_store(*sig as usize, rv & mask, *mask);
+                }
+                TsInsn::AndOr { d1, a1, b1, d, a, b } => {
+                    regs[*d1 as usize] = regs[*a1 as usize] & regs[*b1 as usize];
+                    regs[*d as usize] = regs[*a as usize] | regs[*b as usize];
+                }
+                TsInsn::OrRangeStore { d, a, b, sig, hi, lo, mask } => {
+                    let rv = regs[*a as usize] | regs[*b as usize];
+                    regs[*d as usize] = rv;
+                    self.ts_range_store(*sig as usize, rv & mask, *lo, *hi);
+                }
+                TsInsn::LoadSigBrNz { dl, sig, t } => {
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*dl as usize] = v;
+                    if v != 0 {
+                        pc = *t as usize;
+                        continue;
+                    }
+                }
+                TsInsn::BrFalseLoadSig { s, t, dl, sig } => {
+                    if regs[*s as usize] == 0 {
+                        pc = *t as usize;
+                        continue;
+                    }
+                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[*sig as usize].raw_bits(),
+                    };
+                    if x != 0 {
+                        xbail!();
+                    }
+                    regs[*dl as usize] = v;
+                }
+                TsInsn::EqBrFalse { d, a, b, t } => {
+                    let rv = (regs[*a as usize] == regs[*b as usize]) as u64;
+                    regs[*d as usize] = rv;
+                    if rv == 0 {
+                        pc = *t as usize;
+                        continue;
+                    }
                 }
                 TsInsn::Lt { d, a, b } => {
                     regs[*d as usize] = (regs[*a as usize] < regs[*b as usize]) as u64;
