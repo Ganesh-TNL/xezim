@@ -51028,8 +51028,7 @@ impl Simulator {
                 for qi in 0..gate_queue.len() {
                     let g = gate_queue[qi] as usize;
                     gate_queued[g] = false;
-                    let op = self.gate_ops[g];
-                    let (dst, new_bit) = self.fused_gate_eval(&op);
+                    let (dst, new_bit) = self.fused_gate_eval(&self.gate_ops[g]);
                     if self.fused_bit_commit(dst, new_bit, sdf_any) {
                         n_writes += 1;
                     }
@@ -77085,7 +77084,7 @@ impl Simulator {
         self.after_signal_write_observed(id, premirrored, edge_sidecar, armed_sidecar);
     }
 
-    #[inline(never)]
+    #[inline]
     fn after_signal_write_observed(
         &mut self,
         id: usize,
