@@ -22509,13 +22509,18 @@ impl Simulator {
     /// `ts_range_store` with an explicit x/z plane, for a folded 4-state
     /// constant source (`y[hi:lo] = 'x;`).
     pub(crate) fn ts_range_store_xz(&mut self, id: usize, v: u64, x: u64, lo: u32, hi: u32) {
-        let (base_v, base_x) = self.signal_table[id].raw_bits();
+        // Ids come from lowered streams, validated against the table when
+        // the block was lowered: one unchecked entry reference replaces the
+        // three bounds checks this helper paid per store.
+        debug_assert!(id < self.signal_table.len());
+        let entry: &mut Value = unsafe { self.signal_table.get_unchecked_mut(id) };
+        let (base_v, base_x) = entry.raw_bits();
         let (new_v, new_x) =
             Self::compose_inline_range_bits(base_v, base_x, v, x, lo, hi);
         if new_v == base_v && new_x == base_x {
             return;
         }
-        if !self.signal_table[id].set_inline_bits(new_v, new_x) {
+        if !entry.set_inline_bits(new_v, new_x) {
             let mut val = Value::from_inline(new_v, new_x, self.signal_widths[id]);
             val.is_signed = self.signal_signed[id];
             self.signal_table[id] = val;
@@ -22565,9 +22570,11 @@ impl Simulator {
     // `signal_signed` (write_sig!), so re-stamping here only cost a random
     // load from a 35M-entry table per store.
     pub(crate) fn ts_store(&mut self, id: usize, v: u64, mask: u64) {
-        let (dv, dx) = self.signal_table[id].raw_bits();
+        debug_assert!(id < self.signal_table.len());
+        let entry: &mut Value = unsafe { self.signal_table.get_unchecked_mut(id) };
+        let (dv, dx) = entry.raw_bits();
         if v != (dv & mask) || (dx & mask) != 0 {
-            if self.signal_table[id].set_inline_bits(v, 0) {
+            if entry.set_inline_bits(v, 0) {
                 self.sync_mirror(id);
             } else {
                 let mut val = Value::from_u64(v, self.signal_widths[id]);
