@@ -283,6 +283,11 @@ and testbench flows. Portable code should not rely on them.
   mirror that only native (JIT) code reads is no longer maintained on
   every write in ordinary runs. C906 memcpy (2000 iterations) 295 s to
   275 s, output identical; UVM benchmarks unchanged.
+* A write to a signal that no clocked block or edge sensitivity observes
+  (59 % of all writes on the C906) skips the write observer after one
+  lookup, and single-bit gates feeding only clocked blocks commit through
+  a direct inline path. C906 memcpy 275 s to 263 s, output identical; UVM
+  benchmarks unchanged.
 
 ### 0.10.5 — class covergroups, DPI exports and unit scope, faster UVM (September 2026)
 * **Typedef'd packed arrays keep their dimensions inside instances**: a
