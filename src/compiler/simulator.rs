@@ -4411,6 +4411,10 @@ pub struct Simulator {
     /// generic entry path.
     gate_lane: Vec<u32>,
     gate_ops: Vec<FusedGate>,
+    /// Per lane op: bit0 = destination is an armed edge-block input, bit1 =
+    /// destination is edge-sensitive. Decides which write notes the fast
+    /// commit must make.
+    gate_obs: Vec<u8>,
     gate_queue: Vec<u32>,
     gate_queued: Vec<bool>,
     gate_lane_valid: bool,
@@ -8544,6 +8548,7 @@ impl Simulator {
             is_clock_tree_entry: Vec::new(),
             gate_lane: Vec::new(),
             gate_ops: Vec::new(),
+            gate_obs: Vec::new(),
             gate_queue: Vec::new(),
             gate_queued: Vec::new(),
             gate_lane_valid: false,
@@ -13822,6 +13827,7 @@ impl Simulator {
             .map_or(0, |sid| sid.saturating_add(1));
         self.sig_to_edge_pos = vec![-1i32; edge_lookup_len];
         self.quiet_valid = false;
+        self.gate_lane_valid = false;
         for (pos, &sid) in self.edge_signal_ids.iter().enumerate() {
             if sid < self.sig_to_edge_pos.len() {
                 self.sig_to_edge_pos[sid] = pos as i32;
@@ -49972,6 +49978,7 @@ impl Simulator {
         self.gate_lane.clear();
         self.gate_lane.resize(n, u32::MAX);
         self.gate_ops.clear();
+        self.gate_obs.clear();
         for eidx in 0..n {
             let CombItem::FusedGate { op } = &self.comb_entries[eidx].item else { continue };
             if self.is_clock_tree_entry.get(eidx).copied().unwrap_or(false) {
@@ -49994,6 +50001,9 @@ impl Simulator {
             }
             self.gate_lane[eidx] = self.gate_ops.len() as u32;
             self.gate_ops.push(*op);
+            let armed = self.armed_input_set(id);
+            let edge = self.sig_to_edge_pos.get(id).is_some_and(|&p| p >= 0);
+            self.gate_obs.push((armed as u8) | ((edge as u8) << 1));
         }
         self.gate_queued.clear();
         self.gate_queued.resize(self.gate_ops.len(), false);
@@ -51191,12 +51201,12 @@ impl Simulator {
             // tight loop. None of them feeds a comb entry, so nothing here
             // can trigger further work in this pass.
             if !gate_queue.is_empty() {
-                let sdf_any = !self.sdf_delays.is_empty();
                 for qi in 0..gate_queue.len() {
                     let g = gate_queue[qi] as usize;
                     gate_queued[g] = false;
                     let (dst, new_bit) = self.fused_gate_eval(&self.gate_ops[g]);
-                    if self.fused_bit_commit(dst, new_bit, sdf_any) {
+                    let obs = self.gate_obs[g];
+                    if self.gate_lane_commit(dst, new_bit, obs) {
                         n_writes += 1;
                     }
                 }
@@ -76398,6 +76408,48 @@ impl Simulator {
     /// of its per-destination loop — SDF annotation cannot change while a
     /// fanout group is being written.
     #[inline(always)]
+    /// Gate-lane commit for a ≤64-bit destination (always inline storage):
+    /// direct plane update, and only the write notes the destination needs
+    /// (`obs` bits from `build_gate_lane`). Falls back to the generic commit
+    /// when any global observer is active.
+    #[inline(always)]
+    fn gate_lane_commit(&mut self, dst: BitRef, new_bit: u8, obs: u8) -> bool {
+        let id = dst.sig_id as usize;
+        let global = self.value_trace_ids.is_some()
+            || self.dump_dirty_active
+            || !self.active_force_exprs.is_empty()
+            || !self.signal_inline_bits.is_empty()
+            || (self.event_measure && !self.armed_edge)
+            || !self.sdf_delays.is_empty()
+            || !self.signal_commit_plan.is_empty();
+        if global || self.signal_widths.get(id).copied().unwrap_or(65) > 64 {
+            let sdf_any = !self.sdf_delays.is_empty();
+            return self.fused_bit_commit(dst, new_bit, sdf_any);
+        }
+        let entry: &mut Value = unsafe { self.signal_table.get_unchecked_mut(id) };
+        let (v, x) = entry.raw_bits();
+        let bit = dst.bit as usize;
+        let m = 1u64 << bit;
+        let cur = ((((x >> bit) & 1) << 1) | ((v >> bit) & 1)) as u8;
+        if cur == new_bit {
+            return false;
+        }
+        let nv = if new_bit & 1 != 0 { v | m } else { v & !m };
+        let nx = if new_bit & 2 != 0 { x | m } else { x & !m };
+        if !entry.set_inline_bits(nv, nx) {
+            let sdf_any = !self.sdf_delays.is_empty();
+            return self.fused_bit_commit(dst, new_bit, sdf_any);
+        }
+        self.table_modified = true;
+        if obs & 1 != 0 {
+            self.note_armed_write(id);
+        }
+        if obs & 2 != 0 {
+            self.note_edge_write(id);
+        }
+        true
+    }
+
     fn fused_bit_commit(&mut self, dst: BitRef, new_bit: u8, sdf_any: bool) -> bool {
         let id = dst.sig_id as usize;
         // Late (runtime $sdf_annotate) SDF delay on a fused destination:
@@ -77707,6 +77759,7 @@ impl Simulator {
             .map_or(0, |(sid, _)| *sid as usize + 1);
         self.armed_input_bitmap = vec![0u64; bitmap_len.div_ceil(64)];
         self.quiet_valid = false;
+        self.gate_lane_valid = false;
         self.armed_input_ranges = vec![(0, 0); bitmap_len];
         self.armed_input_blocks.reserve(pairs.len());
         let mut cursor = 0usize;
