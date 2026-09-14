@@ -4418,6 +4418,9 @@ pub struct Simulator {
     gate_queue: Vec<u32>,
     gate_queued: Vec<bool>,
     gate_lane_valid: bool,
+    /// Paths of instances whose definition is an interface (see
+    /// `is_interface_instance`); filled on first use.
+    iface_instance_paths: std::cell::OnceCell<std::collections::HashSet<String>>,
     /// Quiet signals: neither an armed edge-block input nor edge-sensitive,
     /// so a write to one has no side-table work at all. One bit per signal;
     /// rebuilt when either table changes. A quiet store skips the write
@@ -8556,6 +8559,7 @@ impl Simulator {
             gate_queue: Vec::new(),
             gate_queued: Vec::new(),
             gate_lane_valid: false,
+            iface_instance_paths: std::cell::OnceCell::new(),
             quiet_bits: Vec::new(),
             quiet_valid: false,
             prof_quiet_stores: 0,
@@ -98349,10 +98353,18 @@ impl Simulator {
     /// `vif = <instance>` alias assignment (LRM §25.9) so an unrelated
     /// value assignment never records a bogus alias.
     fn is_interface_instance(&self, path: &str) -> bool {
-        self.module
-            .instances
-            .iter()
-            .any(|i| i.path == path && self.module.interfaces.contains(&i.def_name))
+        // Built once: the instance list is fixed after elaboration, and this
+        // is asked per virtual-interface operand at run time (a linear scan
+        // with a string compare per instance was 1.5 % of a c910 run).
+        let set = self.iface_instance_paths.get_or_init(|| {
+            self.module
+                .instances
+                .iter()
+                .filter(|i| self.module.interfaces.contains(&i.def_name))
+                .map(|i| i.path.clone())
+                .collect()
+        });
+        set.contains(path)
     }
 
     /// Is `dt` a virtual-interface variable type — the `virtual <iface>`
