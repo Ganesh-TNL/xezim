@@ -179,6 +179,17 @@ and testbench flows. Portable code should not rely on them.
 
 **Performance** (instruction counts, output identical)
 
+* A testbench loop that writes a memory through an absolute hierarchical
+  path (`tb.x_soc.<...>.ram0.mem[i][7:0] = ...`) now compiles to bytecode
+  like a local-array store. The XuanTie C910 and C906 memory-image loops
+  (2.1 million stores at time 0) run in 0.9 s instead of 2.9 s; C906
+  memcpy at 300 iterations: 7.7 % fewer instructions, output identical.
+* A successful run exits as soon as its output is complete instead of
+  first freeing the whole design; on the C910 that was 1.6 s after the
+  last line of output.
+* Statements run by the interpreter no longer scan the design's whole
+  instance list to tell an interface instance from a signal on every
+  execution; C910 memcpy at 200 iterations: 135 s -> 127 s.
 * The edge detector no longer re-baselines every edge signal after each
   pass: under the dirty-edge scan only the signals that changed are
   re-baselined (plus the operands of sampled-value functions), which is

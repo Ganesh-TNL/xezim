@@ -2976,7 +2976,15 @@ suppressed but the explicit SDF annotation still applies."
             if code != 0 {
                 std::process::exit(code);
             }
-            0
+            // Exit here rather than returning: `main` exits with the code
+            // anyway, and returning would first drop the simulator (tens of
+            // millions of signal values, every side table, the elaborated
+            // module). On c910 that teardown is ~1.6 s after the last line of
+            // output. Everything with an observable side effect is already
+            // done: waves, traces and the `$display` writer are flushed and
+            // synced at the end of `simulate()`, the stats footer is printed,
+            // and `process::exit` flushes Rust's own stdout buffer.
+            std::process::exit(0);
         }
         Err(e) => {
             eprintln!("Simulation error: {}", e);
