@@ -5446,6 +5446,18 @@ impl<'a> BytecodeCompiler<'a> {
                 return dense(leaf).then_some(leaf.clone());
             }
         }
+        // Top-prefix strip, as `resolve_signal_id` does for scalars: an
+        // absolute `<top>.<inst>.<mem>` path names the array registered as
+        // `<inst>.<mem>` (top-level instances carry no prefix). Without it a
+        // testbench's memory-image loops (`tb.x_soc...ram0.mem[i][7:0] = ...`)
+        // bailed to the statement interpreter at ~1.5 us a store.
+        if let Some(top) = &self.top_module_name {
+            if let Some(stripped) = raw.strip_prefix(&format!("{}.", top)) {
+                if self.arrays.contains_key(stripped) {
+                    return dense(stripped).then_some(stripped.to_string());
+                }
+            }
+        }
         None
     }
 
