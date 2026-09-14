@@ -117,6 +117,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_INIT_REG", "Init: initial value policy for registers (x/0/rand)"),
     ("XEZIM_INIT_ZERO", "Init: start all state at 0 instead of x"),
     ("XEZIM_INIT_ZERO_PATHS", "Init: comma-separated hierarchical prefixes to zero-initialize"),
+    ("XEZIM_INJECT_PREFETCH", "Settle: prefetch the next injected entry's two-state header one pop ahead (default 1; 0 disables)"),
     ("XEZIM_INLINE_BITS", "Inline-bits signal mirror: 1 forces it on, 0 off; default on only with XEZIM_JIT"),
     ("XEZIM_INST_PROF", "Elab: profile per-instance elaboration cost"),
     ("XEZIM_ISLAND_CENSUS", "Island phase 1: report per-clock-domain size, comb cone, boundary and observability"),

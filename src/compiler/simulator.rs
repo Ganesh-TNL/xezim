@@ -50265,6 +50265,10 @@ impl Simulator {
         let prefetch_mode = *PREFETCH_MODE.get_or_init(|| {
             std::env::var("XEZIM_PREFETCH_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
         });
+        static INJECT_PREFETCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let inject_prefetch = *INJECT_PREFETCH.get_or_init(|| {
+            std::env::var("XEZIM_INJECT_PREFETCH").ok().as_deref() != Some("0")
+        });
         let mon_on = self.activity_mon;
         let trace_on = self.trace_always.is_some();
         let warn_x_on = self.warn_x && self.time > 0;
@@ -50438,6 +50442,24 @@ impl Simulator {
                         inject_sum[e >> 12] &= !(1u64 << ((e >> 6) & 63));
                     }
                     next_inject = next_set_bit(&inject_bits, &inject_sum, e + 1);
+                    // One-ahead prefetch of the NEXT injected entry's packed
+                    // two-state header. The distance-8 prefetch below walks
+                    // `cur_list` only; entries injected during the pass (the
+                    // majority on the C906/C910 fabrics) are popped from the
+                    // bitset and their header load — the loop's dominant
+                    // stall — was never prefetched. The next index is known
+                    // here, and this entry's evaluation (~500 host
+                    // instructions) covers an L3 round trip. Bounds-checked
+                    // index; the prefetch itself is inert.
+                    #[cfg(target_arch = "x86_64")]
+                    if inject_prefetch && next_inject < self.ts_hdr.len() {
+                        unsafe {
+                            core::arch::x86_64::_mm_prefetch(
+                                self.ts_hdr.as_ptr().add(next_inject) as *const i8,
+                                core::arch::x86_64::_MM_HINT_T0,
+                            );
+                        }
+                    }
                     e
                 } else {
                     cur_pos += 1;
