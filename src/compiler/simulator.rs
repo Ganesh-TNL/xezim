@@ -5770,6 +5770,10 @@ pub struct Simulator {
     forever_cont_cache: HashMap<(usize, usize, usize, usize, u8), Arc<[Statement]>>,
     /// Pending-injection bitset for `settle_combinatorial_inner` (kept to avoid reallocation).
     settle_inject_bits: Vec<u64>,
+    /// Summary of `settle_inject_bits` (one bit per word); sized from the
+    /// entry count like the bitset itself. A fixed 32-word array here
+    /// overflowed on c910 (218k entries).
+    settle_inject_sum: Vec<u64>,
     /// A `return <virtual interface>` left `__vif_return__` for the next assignment.
     vif_return_pending: bool,
     /// Static lvalue widths of bare-leaf identifiers, per identifier span (see infer_lhs_width).
@@ -9036,6 +9040,7 @@ impl Simulator {
             forever_depth: 0,
             forever_cont_cache: HashMap::default(),
             settle_inject_bits: Vec::new(),
+            settle_inject_sum: Vec::new(),
             vif_return_pending: false,
             lhs_leaf_width_cache: HashMap::default(),
             blocking_cont_cache: HashMap::default(),
@@ -50275,9 +50280,12 @@ impl Simulator {
         // forward scan for the next injected entry skips empty words in
         // one step instead of walking the whole (30k-entry / 470-word on
         // c906) bitset each time — that walk was 6% of the settle loop.
-        let mut inject_sum: [u64; 32] = [0; 32];
-        debug_assert!(words <= 32 * 64, "settle inject summary covers 2048 words");
-        fn next_set_bit(bits: &[u64], sum: &[u64; 32], from: usize) -> usize {
+        let mut inject_sum: Vec<u64> = std::mem::take(&mut self.settle_inject_sum);
+        let sum_words = words.div_ceil(64).max(1);
+        if inject_sum.len() < sum_words {
+            inject_sum.resize(sum_words, 0);
+        }
+        fn next_set_bit(bits: &[u64], sum: &[u64], from: usize) -> usize {
             let w = from >> 6;
             if w >= bits.len() {
                 return usize::MAX;
@@ -51269,6 +51277,7 @@ impl Simulator {
         self.is_clock_tree_signal = tree_sig;
         self.is_clock_tree_entry = tree_entry;
         self.settle_inject_bits = inject_bits;
+        self.settle_inject_sum = inject_sum;
         self.settle_triggered = triggered;
         self.settle_triggered_list = next_list;
         self.gate_lane = gate_lane;
