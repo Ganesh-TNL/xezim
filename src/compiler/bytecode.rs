@@ -12791,6 +12791,26 @@ pub fn ts_insn_name(i: &TsInsn) -> &'static str {
     leaked
 }
 
+/// Boxed payload of `RangeStoreX`/`RangeStoreXW` (rare: folded x-constant
+/// range stores), kept off the hot enum size.
+#[derive(Debug, Clone)]
+pub struct TsRangeStoreX {
+    pub sig: u32,
+    pub hi: u32,
+    pub lo: u32,
+    pub v: u64,
+    pub x: u64,
+}
+
+/// Boxed payload of `CaseMaskJmp`.
+#[derive(Debug, Clone)]
+pub struct TsCaseMaskJmp {
+    pub mask: u64,
+    pub lo: u32,
+    pub wmask: u64,
+    pub mj: Box<CaseMaskJumpData>,
+}
+
 #[derive(Debug, Clone)]
 pub enum TsInsn {
     /// regs[d] = signal_table[sig] (raw value bits; proven X-free by the
@@ -12838,12 +12858,14 @@ pub enum TsInsn {
     /// two component instructions run back to back — same register writes,
     /// same order — minus one dispatch through the executor's jump table.
     LoadSigNot { dl: u16, d: u16, sig: u32 },
-    SigRangeEqC { dr: u16, d: u16, sig: u32, lo: u16, mask: u64, k: u64 },
+    /// `lo`/`w` (width) instead of `lo`/`mask`: keeps the payload ≤ 22 bytes
+    /// so `TsInsn` is 24 bytes (was 32); the executor rebuilds the mask.
+    SigRangeEqC { dr: u16, d: u16, sig: u32, lo: u8, w: u8, k: u64 },
     LoadSigLogAnd { dl: u16, sig: u32, d: u16, a: u16, b: u16 },
     LogNotAnd { dn: u16, s: u16, d: u16, a: u16, b: u16 },
     LogNotLogAnd { dn: u16, s: u16, d: u16, a: u16, b: u16 },
     LogAndStore { d: u16, a: u16, b: u16, sig: u32, mask: u64 },
-    AndRangeStore { d: u16, a: u16, b: u16, sig: u32, hi: u32, lo: u32, mask: u64 },
+    AndRangeStore { d: u16, a: u16, b: u16, sig: u32, hi: u32, lo: u32 },
     SigBitNot { db: u16, d: u16, sig: u32, bit: u16 },
     /// Second fusion batch (same rules).
     LoadSig2 { d1: u16, sig1: u32, d2: u16, sig2: u32 },
@@ -12860,7 +12882,7 @@ pub enum TsInsn {
     ConstEq { dc: u16, v: u64, d: u16, a: u16, b: u16 },
     LogOrStore { d: u16, a: u16, b: u16, sig: u32, mask: u64 },
     AndOr { d1: u16, a1: u16, b1: u16, d: u16, a: u16, b: u16 },
-    OrRangeStore { d: u16, a: u16, b: u16, sig: u32, hi: u32, lo: u32, mask: u64 },
+    OrRangeStore { d: u16, a: u16, b: u16, sig: u32, hi: u32, lo: u32 },
     Lt { d: u16, a: u16, b: u16 },
     /// Signed relational compare (§11.8.1: both operands signed). `sa`/`sb`
     /// are the shifts that sign-extend each operand from its static width;
@@ -12900,7 +12922,7 @@ pub enum TsInsn {
     /// Bucket-window jump table (§12.5 `case` with wildcard-free windows).
     /// X-free registers make the 4-state `xz_path` (wildcard selector can
     /// match several buckets) unreachable, leaving a plain window index.
-    CaseMaskJmp { s: u16, mask: u64, lo: u32, wmask: u64, mj: Box<CaseMaskJumpData> },
+    CaseMaskJmp { s: u16, mj: Box<TsCaseMaskJmp> },
     /// regs[d] = (regs[s] != 0) — §11.4.9 reduction OR on an X-free operand.
     RedOr { d: u16, s: u16 },
     /// Wide (65..128-bit) reduction OR: reads the WIDE register file. The
@@ -12923,7 +12945,7 @@ pub enum TsInsn {
     /// the raw value/xz planes, already masked to the assigned width.
     ConstStoreX { sig: u32, v: u64, x: u64 },
     /// Partial-range counterpart (`y[hi:lo] = 'x;`).
-    RangeStoreX { sig: u32, hi: u32, lo: u32, v: u64, x: u64 },
+    RangeStoreX(Box<TsRangeStoreX>),
     /// Write back `regs[s] & mask` to `sig` with change-detect + dirty
     /// marking (the eval site mirrors the 4-state fast-path bookkeeping).
     Store { sig: u32, s: u16, mask: u64 },
@@ -12960,7 +12982,7 @@ pub enum TsInsn {
     RangeFillW { sig: u32, hi: u32, lo: u32, bit: u8 },
     RangeFillNbaW { sig: u32, hi: u32, lo: u32, bit: u8 },
     /// `RangeStoreX` into a >64-bit destination (folded 4-state constant).
-    RangeStoreXW { sig: u32, hi: u32, lo: u32, v: u64, x: u64 },
+    RangeStoreXW(Box<TsRangeStoreX>),
     /// Dynamic array-element read: eid = first + (regs[idx] - lo). ABORTS
     /// the two-state run (caller re-runs 4-state) when the index is out of
     /// range or the element holds X — both produce X in 4-state. Lowering
@@ -13317,6 +13339,7 @@ fn fuse_ts_pairs(out: &mut Vec<TsInsn>) {
                 }
             }
             TsInsn::CaseMaskJmp { mj, .. } => {
+                let mj = &mj.mj;
                 for t in mj.table.iter().chain(std::iter::once(&mj.xz_path)) {
                     if (*t as usize) <= n {
                         is_tgt[*t as usize] = true;
@@ -13344,8 +13367,8 @@ fn fuse_ts_pairs(out: &mut Vec<TsInsn>) {
                 (TsInsn::LoadSig { d: dl, sig }, TsInsn::LogNot { d, s }) if s == dl => {
                     Some(TsInsn::LoadSigNot { dl: *dl, d: *d, sig: *sig })
                 }
-                (TsInsn::SigRange { d: dr, sig, lo, mask }, TsInsn::EqC { d, s, k }) if s == dr => {
-                    Some(TsInsn::SigRangeEqC { dr: *dr, d: *d, sig: *sig, lo: *lo, mask: *mask, k: *k })
+                (TsInsn::SigRange { d: dr, sig, lo, mask }, TsInsn::EqC { d, s, k }) if s == dr && *lo < 64 && mask.count_ones() as u64 == 64 - mask.leading_zeros() as u64 => {
+                    Some(TsInsn::SigRangeEqC { dr: *dr, d: *d, sig: *sig, lo: *lo as u8, w: (64 - mask.leading_zeros()) as u8, k: *k })
                 }
                 (TsInsn::LoadSig { d: dl, sig }, TsInsn::LogAnd { d, a, b }) if a == dl || b == dl => {
                     Some(TsInsn::LoadSigLogAnd { dl: *dl, sig: *sig, d: *d, a: *a, b: *b })
@@ -13359,8 +13382,8 @@ fn fuse_ts_pairs(out: &mut Vec<TsInsn>) {
                 (TsInsn::LogAnd { d, a, b }, TsInsn::Store { sig, s, mask }) if s == d => {
                     Some(TsInsn::LogAndStore { d: *d, a: *a, b: *b, sig: *sig, mask: *mask })
                 }
-                (TsInsn::And { d, a, b }, TsInsn::RangeStore { sig, hi, lo, s, mask }) if s == d => {
-                    Some(TsInsn::AndRangeStore { d: *d, a: *a, b: *b, sig: *sig, hi: *hi, lo: *lo, mask: *mask })
+                (TsInsn::And { d, a, b }, TsInsn::RangeStore { sig, hi, lo, s, mask }) if s == d && *mask == ts_mask(*hi - *lo + 1) => {
+                    Some(TsInsn::AndRangeStore { d: *d, a: *a, b: *b, sig: *sig, hi: *hi, lo: *lo })
                 }
                 (TsInsn::SigBit { d: db, sig, bit }, TsInsn::LogNot { d, s }) if s == db => {
                     Some(TsInsn::SigBitNot { db: *db, d: *d, sig: *sig, bit: *bit })
@@ -13407,8 +13430,8 @@ fn fuse_ts_pairs(out: &mut Vec<TsInsn>) {
                 (TsInsn::And { d: d1, a: a1, b: b1 }, TsInsn::Or { d, a, b }) if a == d1 || b == d1 => {
                     Some(TsInsn::AndOr { d1: *d1, a1: *a1, b1: *b1, d: *d, a: *a, b: *b })
                 }
-                (TsInsn::Or { d, a, b }, TsInsn::RangeStore { sig, hi, lo, s, mask }) if s == d => {
-                    Some(TsInsn::OrRangeStore { d: *d, a: *a, b: *b, sig: *sig, hi: *hi, lo: *lo, mask: *mask })
+                (TsInsn::Or { d, a, b }, TsInsn::RangeStore { sig, hi, lo, s, mask }) if s == d && *mask == ts_mask(*hi - *lo + 1) => {
+                    Some(TsInsn::OrRangeStore { d: *d, a: *a, b: *b, sig: *sig, hi: *hi, lo: *lo })
                 }
                 _ => None,
             }
@@ -13439,6 +13462,7 @@ fn fuse_ts_pairs(out: &mut Vec<TsInsn>) {
             | TsInsn::EqBrFalse { t, .. }
             | TsInsn::Jmp { t } => *t = new_of[(*t as usize).min(n)],
             TsInsn::CaseMaskJmp { mj, .. } => {
+                let mj = &mut mj.mj;
                 for t in mj.table.iter_mut().chain(std::iter::once(&mut mj.xz_path)) {
                     *t = new_of[(*t as usize).min(n)];
                 }
@@ -13453,6 +13477,8 @@ fn fuse_ts_pairs(out: &mut Vec<TsInsn>) {
     }
     *out = fused;
 }
+
+const _: () = assert!(std::mem::size_of::<TsInsn>() <= 24, "TsInsn grew past 24 bytes");
 
 pub fn lower_two_state(
     cb: &CompiledBlock,
@@ -14380,10 +14406,12 @@ pub fn lower_two_state(
                 }
                 out.push(TsInsn::CaseMaskJmp {
                     s: *src as u16,
-                    mask: ts_mask(sw),
-                    lo: mj.lo,
-                    wmask: ts_mask(mj.width),
-                    mj: mj.clone(),
+                    mj: Box::new(TsCaseMaskJmp {
+                        mask: ts_mask(sw),
+                        lo: mj.lo,
+                        wmask: ts_mask(mj.width),
+                        mj: mj.clone(),
+                    }),
                 });
             }
             Insn::ReduceOr(d, src) => {
@@ -14551,23 +14579,8 @@ pub fn lower_two_state(
                     let m = ts_mask(high - low + 1);
                     side_effects = true;
                     stored.push(sig as u32);
-                    out.push(if wide_dest {
-                        TsInsn::RangeStoreXW {
-                            sig: sig as u32,
-                            hi: high,
-                            lo: low,
-                            v: v & m,
-                            x: x & m,
-                        }
-                    } else {
-                        TsInsn::RangeStoreX {
-                            sig: sig as u32,
-                            hi: high,
-                            lo: low,
-                            v: v & m,
-                            x: x & m,
-                        }
-                    });
+                    let px = Box::new(TsRangeStoreX { sig: sig as u32, hi: high, lo: low, v: v & m, x: x & m });
+                    out.push(if wide_dest { TsInsn::RangeStoreXW(px) } else { TsInsn::RangeStoreX(px) });
                     continue;
                 }
                 let Some(cw) = rw[*r as usize] else {
@@ -14955,6 +14968,7 @@ pub fn lower_two_state(
                 // `xz_path` is unreachable on X-free registers but is still
                 // remapped: leaving a 4-state index in a lowered stream would
                 // be a live landmine if the invariant ever weakened.
+                let mj = &mut mj.mj;
                 for t in mj.table.iter_mut().chain(std::iter::once(&mut mj.xz_path)) {
                     let old = *t as usize;
                     if old >= idx_map.len() {
@@ -15000,7 +15014,7 @@ pub fn lower_two_state(
                     | TsInsn::BitStoreDyn { .. }
                     | TsInsn::BitStoreNbaDyn { .. }
                     | TsInsn::ConstStoreX { .. }
-                    | TsInsn::RangeStoreX { .. }
+                    | TsInsn::RangeStoreX(..)
                     | TsInsn::RangeStoreW { .. }
                     | TsInsn::RangeStoreNbaW { .. }
                     | TsInsn::RangeFillW { .. }
@@ -15009,7 +15023,7 @@ pub fn lower_two_state(
                     | TsInsn::WRangeStoreNba { .. }
                     | TsInsn::LogOrStore { .. }
                     | TsInsn::OrRangeStore { .. }
-                    | TsInsn::RangeStoreXW { .. }
+                    | TsInsn::RangeStoreXW(..)
                     | TsInsn::ElemStore { .. }
                     | TsInsn::ElemStoreNba { .. }
                     | TsInsn::NbaFromElem { .. }

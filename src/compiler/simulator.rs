@@ -21243,7 +21243,9 @@ impl Simulator {
                     regs[*dl as usize] = v;
                     regs[*d as usize] = (v == 0) as u64;
                 }
-                TsInsn::SigRangeEqC { dr, d, sig, lo, mask, k } => {
+                TsInsn::SigRangeEqC { dr, d, sig, lo, w, k } => {
+                    let mask = if *w >= 64 { u64::MAX } else { (1u64 << *w) - 1 };
+                    let mask = &mask;
                     let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
                         Some(sl) => (sl[0], sl[1]),
                         None => self.signal_table[*sig as usize].raw_bits(),
@@ -21279,7 +21281,9 @@ impl Simulator {
                     regs[*d as usize] = rv;
                     self.ts_store(*sig as usize, rv & mask, *mask);
                 }
-                TsInsn::AndRangeStore { d, a, b, sig, hi, lo, mask } => {
+                TsInsn::AndRangeStore { d, a, b, sig, hi, lo } => {
+                    let mask = if *hi - *lo + 1 >= 64 { u64::MAX } else { (1u64 << (*hi - *lo + 1)) - 1 };
+                    let mask = &mask;
                     let rv = regs[*a as usize] & regs[*b as usize];
                     regs[*d as usize] = rv;
                     self.ts_range_store(*sig as usize, rv & mask, *lo, *hi);
@@ -21422,7 +21426,9 @@ impl Simulator {
                     regs[*d1 as usize] = regs[*a1 as usize] & regs[*b1 as usize];
                     regs[*d as usize] = regs[*a as usize] | regs[*b as usize];
                 }
-                TsInsn::OrRangeStore { d, a, b, sig, hi, lo, mask } => {
+                TsInsn::OrRangeStore { d, a, b, sig, hi, lo } => {
+                    let mask = if *hi - *lo + 1 >= 64 { u64::MAX } else { (1u64 << (*hi - *lo + 1)) - 1 };
+                    let mask = &mask;
                     let rv = regs[*a as usize] | regs[*b as usize];
                     regs[*d as usize] = rv;
                     self.ts_range_store(*sig as usize, rv & mask, *lo, *hi);
@@ -21523,10 +21529,12 @@ impl Simulator {
                     let v = regs[*s as usize] & mask;
                     self.ts_wide_range_store(*sig as usize, *lo, *hi, v, 0);
                 }
-                TsInsn::RangeStoreXW { sig, hi, lo, v, x } => {
+                TsInsn::RangeStoreXW(p) => {
+                    let (sig, hi, lo, v, x) = (&p.sig, &p.hi, &p.lo, &p.v, &p.x);
                     self.ts_wide_range_store(*sig as usize, *lo, *hi, *v, *x);
                 }
-                TsInsn::RangeStoreX { sig, hi, lo, v, x } => {
+                TsInsn::RangeStoreX(p) => {
+                    let (sig, hi, lo, v, x) = (&p.sig, &p.hi, &p.lo, &p.v, &p.x);
                     self.ts_range_store_xz(*sig as usize, *v, *x, *lo, *hi);
                 }
                 TsInsn::LogAnd { d, a, b } => {
@@ -21629,7 +21637,8 @@ impl Simulator {
                         .unwrap_or(cj.default) as usize;
                     continue;
                 }
-                TsInsn::CaseMaskJmp { s, mask, lo, wmask, mj } => {
+                TsInsn::CaseMaskJmp { s, mj: cm } => {
+                    let (mask, lo, wmask, mj) = (&cm.mask, &cm.lo, &cm.wmask, &cm.mj);
                     // The window is fully defined on an X-free selector, so
                     // `xz_path` (the wildcard compare chain) cannot be taken.
                     let v = regs[*s as usize] & *mask;
@@ -22054,7 +22063,9 @@ impl Simulator {
                     r!(*dl) = v;
                     r!(*d) = (v == 0) as u64;
                 }
-                TsInsn::SigRangeEqC { dr, d, sig, lo, mask, k } => {
+                TsInsn::SigRangeEqC { dr, d, sig, lo, w, k } => {
+                    let mask = if *w >= 64 { u64::MAX } else { (1u64 << *w) - 1 };
+                    let mask = &mask;
                     let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
                         Some(sl) => (sl[0], sl[1]),
                         None => self.signal_table[*sig as usize].raw_bits(),
@@ -22090,7 +22101,9 @@ impl Simulator {
                     r!(*d) = rv;
                     self.ts_store(*sig as usize, rv & mask, *mask);
                 }
-                TsInsn::AndRangeStore { d, a, b, sig, hi, lo, mask } => {
+                TsInsn::AndRangeStore { d, a, b, sig, hi, lo } => {
+                    let mask = if *hi - *lo + 1 >= 64 { u64::MAX } else { (1u64 << (*hi - *lo + 1)) - 1 };
+                    let mask = &mask;
                     let rv = r!(*a) & r!(*b);
                     r!(*d) = rv;
                     self.ts_range_store(*sig as usize, rv & mask, *lo, *hi);
@@ -22233,7 +22246,9 @@ impl Simulator {
                     r!(*d1) = r!(*a1) & r!(*b1);
                     r!(*d) = r!(*a) | r!(*b);
                 }
-                TsInsn::OrRangeStore { d, a, b, sig, hi, lo, mask } => {
+                TsInsn::OrRangeStore { d, a, b, sig, hi, lo } => {
+                    let mask = if *hi - *lo + 1 >= 64 { u64::MAX } else { (1u64 << (*hi - *lo + 1)) - 1 };
+                    let mask = &mask;
                     let rv = r!(*a) | r!(*b);
                     r!(*d) = rv;
                     self.ts_range_store(*sig as usize, rv & mask, *lo, *hi);
@@ -22292,10 +22307,12 @@ impl Simulator {
                     let v = r!(*s) & mask;
                     self.ts_wide_range_store(*sig as usize, *lo, *hi, v, 0);
                 }
-                TsInsn::RangeStoreXW { sig, hi, lo, v, x } => {
+                TsInsn::RangeStoreXW(p) => {
+                    let (sig, hi, lo, v, x) = (&p.sig, &p.hi, &p.lo, &p.v, &p.x);
                     self.ts_wide_range_store(*sig as usize, *lo, *hi, *v, *x);
                 }
-                TsInsn::RangeStoreX { sig, hi, lo, v, x } => {
+                TsInsn::RangeStoreX(p) => {
+                    let (sig, hi, lo, v, x) = (&p.sig, &p.hi, &p.lo, &p.v, &p.x);
                     self.ts_range_store_xz(*sig as usize, *v, *x, *lo, *hi);
                 }
                 TsInsn::LogAnd { d, a, b } => {
@@ -22975,7 +22992,9 @@ impl Simulator {
                     (*rp.add(*dl as usize)) = v;
                     (*rp.add(*d as usize)) = (v == 0) as u64;
                 }
-                TsInsn::SigRangeEqC { dr, d, sig, lo, mask, k } => {
+                TsInsn::SigRangeEqC { dr, d, sig, lo, w, k } => {
+                    let mask = if *w >= 64 { u64::MAX } else { (1u64 << *w) - 1 };
+                    let mask = &mask;
                     let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
                         Some(sl) => (sl[0], sl[1]),
                         None => self.signal_table[*sig as usize].raw_bits(),
@@ -23011,7 +23030,9 @@ impl Simulator {
                     (*rp.add(*d as usize)) = rv;
                     self.ts_store(*sig as usize, rv & mask, *mask);
                 }
-                TsInsn::AndRangeStore { d, a, b, sig, hi, lo, mask } => {
+                TsInsn::AndRangeStore { d, a, b, sig, hi, lo } => {
+                    let mask = if *hi - *lo + 1 >= 64 { u64::MAX } else { (1u64 << (*hi - *lo + 1)) - 1 };
+                    let mask = &mask;
                     let rv = (*rp.add(*a as usize)) & (*rp.add(*b as usize));
                     (*rp.add(*d as usize)) = rv;
                     self.ts_range_store(*sig as usize, rv & mask, *lo, *hi);
@@ -23154,7 +23175,9 @@ impl Simulator {
                     (*rp.add(*d1 as usize)) = (*rp.add(*a1 as usize)) & (*rp.add(*b1 as usize));
                     (*rp.add(*d as usize)) = (*rp.add(*a as usize)) | (*rp.add(*b as usize));
                 }
-                TsInsn::OrRangeStore { d, a, b, sig, hi, lo, mask } => {
+                TsInsn::OrRangeStore { d, a, b, sig, hi, lo } => {
+                    let mask = if *hi - *lo + 1 >= 64 { u64::MAX } else { (1u64 << (*hi - *lo + 1)) - 1 };
+                    let mask = &mask;
                     let rv = (*rp.add(*a as usize)) | (*rp.add(*b as usize));
                     (*rp.add(*d as usize)) = rv;
                     self.ts_range_store(*sig as usize, rv & mask, *lo, *hi);
@@ -23249,10 +23272,12 @@ impl Simulator {
                     let v = (*rp.add(*s as usize)) & mask;
                     self.ts_wide_range_store(*sig as usize, *lo, *hi, v, 0);
                 }
-                TsInsn::RangeStoreXW { sig, hi, lo, v, x } => {
+                TsInsn::RangeStoreXW(p) => {
+                    let (sig, hi, lo, v, x) = (&p.sig, &p.hi, &p.lo, &p.v, &p.x);
                     self.ts_wide_range_store(*sig as usize, *lo, *hi, *v, *x);
                 }
-                TsInsn::RangeStoreX { sig, hi, lo, v, x } => {
+                TsInsn::RangeStoreX(p) => {
+                    let (sig, hi, lo, v, x) = (&p.sig, &p.hi, &p.lo, &p.v, &p.x);
                     self.ts_range_store_xz(*sig as usize, *v, *x, *lo, *hi);
                 }
                 TsInsn::LogAnd { d, a, b } => {
@@ -23342,7 +23367,8 @@ impl Simulator {
                         .unwrap_or(cj.default) as usize;
                     continue;
                 }
-                TsInsn::CaseMaskJmp { s, mask, lo, wmask, mj } => {
+                TsInsn::CaseMaskJmp { s, mj: cm } => {
+                    let (mask, lo, wmask, mj) = (&cm.mask, &cm.lo, &cm.wmask, &cm.mj);
                     // The window is fully defined on an X-free selector, so
                     // `xz_path` (the wildcard compare chain) cannot be taken.
                     let v = (*rp.add(*s as usize)) & *mask;

@@ -61,12 +61,12 @@ pub mod enabled {
         use TsInsn as T;
         Some(match i {
             T::LoadSigNot { dl, d, sig } => vec![T::LoadSig { d: *dl, sig: *sig }, T::LogNot { d: *d, s: *dl }],
-            T::SigRangeEqC { dr, d, sig, lo, mask, k } => vec![T::SigRange { d: *dr, sig: *sig, lo: *lo, mask: *mask }, T::EqC { d: *d, s: *dr, k: *k }],
+            T::SigRangeEqC { dr, d, sig, lo, w, k } => vec![T::SigRange { d: *dr, sig: *sig, lo: *lo as u16, mask: if *w >= 64 { u64::MAX } else { (1u64 << *w) - 1 } }, T::EqC { d: *d, s: *dr, k: *k }],
             T::LoadSigLogAnd { dl, sig, d, a, b } => vec![T::LoadSig { d: *dl, sig: *sig }, T::LogAnd { d: *d, a: *a, b: *b }],
             T::LogNotAnd { dn, s, d, a, b } => vec![T::LogNot { d: *dn, s: *s }, T::And { d: *d, a: *a, b: *b }],
             T::LogNotLogAnd { dn, s, d, a, b } => vec![T::LogNot { d: *dn, s: *s }, T::LogAnd { d: *d, a: *a, b: *b }],
             T::LogAndStore { d, a, b, sig, mask } => vec![T::LogAnd { d: *d, a: *a, b: *b }, T::Store { sig: *sig, s: *d, mask: *mask }],
-            T::AndRangeStore { d, a, b, sig, hi, lo, mask } => vec![T::And { d: *d, a: *a, b: *b }, T::RangeStore { sig: *sig, hi: *hi, lo: *lo, s: *d, mask: *mask }],
+            T::AndRangeStore { d, a, b, sig, hi, lo } => vec![T::And { d: *d, a: *a, b: *b }, T::RangeStore { sig: *sig, hi: *hi, lo: *lo, s: *d, mask: if *hi - *lo + 1 >= 64 { u64::MAX } else { (1u64 << (*hi - *lo + 1)) - 1 } }],
             T::SigBitNot { db, d, sig, bit } => vec![T::SigBit { d: *db, sig: *sig, bit: *bit }, T::LogNot { d: *d, s: *db }],
             T::LoadSig2 { d1, sig1, d2, sig2 } => vec![T::LoadSig { d: *d1, sig: *sig1 }, T::LoadSig { d: *d2, sig: *sig2 }],
             T::SigBit2 { d1, sig1, bit1, d2, sig2, bit2 } => vec![T::SigBit { d: *d1, sig: *sig1, bit: *bit1 }, T::SigBit { d: *d2, sig: *sig2, bit: *bit2 }],
@@ -79,7 +79,7 @@ pub mod enabled {
             T::ConstEq { dc, v, d, a, b } => vec![T::Const { d: *dc, v: *v }, T::Eq { d: *d, a: *a, b: *b }],
             T::LogOrStore { d, a, b, sig, mask } => vec![T::LogOr { d: *d, a: *a, b: *b }, T::Store { sig: *sig, s: *d, mask: *mask }],
             T::AndOr { d1, a1, b1, d, a, b } => vec![T::And { d: *d1, a: *a1, b: *b1 }, T::Or { d: *d, a: *a, b: *b }],
-            T::OrRangeStore { d, a, b, sig, hi, lo, mask } => vec![T::Or { d: *d, a: *a, b: *b }, T::RangeStore { sig: *sig, hi: *hi, lo: *lo, s: *d, mask: *mask }],
+            T::OrRangeStore { d, a, b, sig, hi, lo } => vec![T::Or { d: *d, a: *a, b: *b }, T::RangeStore { sig: *sig, hi: *hi, lo: *lo, s: *d, mask: if *hi - *lo + 1 >= 64 { u64::MAX } else { (1u64 << (*hi - *lo + 1)) - 1 } }],
             T::LoadSigBrNz { .. } | T::BrFalseLoadSig { .. } | T::EqBrFalse { .. } => return None,
             other => vec![other.clone()],
         })
@@ -505,12 +505,12 @@ pub mod enabled {
                         let id = b.ins().iconst(types::I32, *sig as i64);
                         b.ins().call(r_sxz, &[sim, id, vv, xx]);
                     }
-                    T::RangeStoreX { sig, hi, lo, v, x } => {
-                        let vv = b.ins().iconst(types::I64, *v as i64);
-                        let xx = b.ins().iconst(types::I64, *x as i64);
-                        let id = b.ins().iconst(types::I32, *sig as i64);
-                        let l = b.ins().iconst(types::I32, *lo as i64);
-                        let h = b.ins().iconst(types::I32, *hi as i64);
+                    T::RangeStoreX(p) => {
+                        let vv = b.ins().iconst(types::I64, p.v as i64);
+                        let xx = b.ins().iconst(types::I64, p.x as i64);
+                        let id = b.ins().iconst(types::I32, p.sig as i64);
+                        let l = b.ins().iconst(types::I32, p.lo as i64);
+                        let h = b.ins().iconst(types::I32, p.hi as i64);
                         b.ins().call(r_rxz, &[sim, id, vv, xx, l, h]);
                     }
                     T::BitStoreDyn { sig, i, s, w } if *w <= 64 => {
