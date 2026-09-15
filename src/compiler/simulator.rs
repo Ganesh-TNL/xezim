@@ -21142,6 +21142,10 @@ impl Simulator {
         macro_rules! xbail {
             () => {{
                 self.ts_xread_bail = true;
+                #[cfg(feature = "opcode-census")]
+                {
+                    *self.ts_census.entry(("XBAIL", "line")).or_insert(0) += 1;
+                }
                 bail!();
             }};
         }
@@ -22000,6 +22004,10 @@ impl Simulator {
         macro_rules! xbail {
             () => {{
                 self.ts_xread_bail = true;
+                #[cfg(feature = "opcode-census")]
+                {
+                    *self.ts_census.entry(("XBAIL", "line")).or_insert(0) += 1;
+                }
                 return false;
             }};
         }
@@ -22956,6 +22964,10 @@ impl Simulator {
         macro_rules! xbail {
             () => {{
                 self.ts_xread_bail = true;
+                #[cfg(feature = "opcode-census")]
+                {
+                    *self.ts_census.entry(("XBAIL", "ctrl")).or_insert(0) += 1;
+                }
                 return false;
             }};
         }
@@ -39046,6 +39058,11 @@ impl Simulator {
             let mut sv: Vec<_> = singles.into_iter().collect();
             sv.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
             eprintln!("[TS-CENSUS] total_insns={}", total);
+            for (&(a, b), &c) in self.ts_census.iter() {
+                if a == "XBAIL" {
+                    eprintln!("[TS-CENSUS] xbail after {:>16} {:>14}", b, c);
+                }
+            }
             for &(n, c) in sv.iter().take(25) {
                 eprintln!("[TS-CENSUS] op {:>16} {:>14} ({:.1}%)", n, c, 100.0 * c as f64 / total as f64);
             }
