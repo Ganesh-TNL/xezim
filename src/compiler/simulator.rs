@@ -3160,12 +3160,26 @@ fn bytecode_array_elem_width(
 /// simulator in `tests/misc/operators_11_select_reduce.rs`). Some tools
 /// read the WHOLE select x instead when any position is out of range;
 /// `XEZIM_OOB_SELECT=whole` selects that form.
+/// `XEZIM_OOB_SELECT=whole`: a partially out-of-range select reads x as a
+/// whole and a partially out-of-range WRITE is discarded (some tools);
+/// default is the §11.5.1 per-bit form for both.
+#[inline]
+pub(crate) fn oob_select_whole() -> bool {
+    static WHOLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WHOLE.get_or_init(|| std::env::var("XEZIM_OOB_SELECT").ok().as_deref() == Some("whole"))
+}
+
+/// §11.5.1 partial-write rule: `true` when a write through a select whose
+/// physical range `[hi:lo]` leaves `[0, w)` must be discarded entirely
+/// (`XEZIM_OOB_SELECT=whole`); by default only the in-range bits are stored.
+#[inline]
+pub(crate) fn oob_write_discard(hi: i64, lo: i64, w: u32) -> bool {
+    oob_select_whole() && (lo < 0 || hi >= w as i64)
+}
+
 #[inline]
 pub(crate) fn oob_range_select(base: &Value, hi: i64, lo: i64) -> Value {
-    static PER_BIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let per_bit = *PER_BIT.get_or_init(|| {
-        std::env::var("XEZIM_OOB_SELECT").ok().as_deref() != Some("whole")
-    });
+    let per_bit = !oob_select_whole();
     if hi < lo {
         return Value::new(1);
     }
@@ -25411,6 +25425,10 @@ impl Simulator {
                 Insn::NbaAssignRange(sig_id, hi, lo, val_reg) => {
                     let sig_id = &(*sig_id as usize);
                     let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
+                    if oob_write_discard(high as i64, low as i64, signal_table[*sig_id].width) {
+                        pc += 1;
+                        continue;
+                    }
                     let w = high - low + 1;
                     let val = vm_regs[*val_reg as usize].resize(w);
                     let existing = nba_out.iter().rposition(|n| n.signal_id == *sig_id);
@@ -26228,6 +26246,10 @@ impl Simulator {
                     let id = *sig_id;
                     let sig_w = signal_widths[id];
                     let high_eff = high.min(sig_w.saturating_sub(1));
+                    if oob_write_discard(high as i64, low as i64, sig_w) {
+                        pc += 1;
+                        continue;
+                    }
                     if low == 0 && high_eff + 1 >= sig_w {
                         let mut v = val.resize_for_assign(sig_w);
                         v.is_signed = signal_signed[id];
@@ -26321,6 +26343,10 @@ impl Simulator {
                 Insn::NbaAssignRange(sig_id, hi, lo, val_reg) => {
                     let sig_id = &(*sig_id as usize);
                     let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
+                    if oob_write_discard(high as i64, low as i64, signal_widths[*sig_id]) {
+                        pc += 1;
+                        continue;
+                    }
                     let w = high - low + 1;
                     let val = vm_regs[*val_reg as usize].resize(w);
                     let existing = nba_out.iter().rposition(|n| n.signal_id == *sig_id);
@@ -27700,6 +27726,10 @@ impl Simulator {
                     // entry AND the merged result matches signal_table[id],
                     // skip the push (apply_nba would drop it anyway).
                     let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
+                    if oob_write_discard(high as i64, low as i64, self.signal_widths[*sig_id]) {
+                        pc += 1;
+                        continue;
+                    }
                     let w = high - low + 1;
                     let val = self.vm_regs[*val_reg as usize].resize(w);
                     let id = *sig_id;
@@ -27767,6 +27797,10 @@ impl Simulator {
                     let id = *sig_id;
                     let sig_w = self.signal_widths[id];
                     let high_eff = high.min(sig_w.saturating_sub(1));
+                    if oob_write_discard(high as i64, low as i64, sig_w) {
+                        pc += 1;
+                        continue;
+                    }
                     let copy_count = high_eff.saturating_add(1).saturating_sub(low) as usize;
 
                     if low == 0 && high_eff + 1 >= sig_w {
@@ -28020,6 +28054,10 @@ impl Simulator {
                     let id = *sig_id;
                     let sig_w = self.signal_widths[id];
                     let high_eff = high.min(sig_w.saturating_sub(1));
+                    if oob_write_discard(high as i64, low as i64, sig_w) {
+                        pc += 1;
+                        continue;
+                    }
                     let copy_count = high_eff.saturating_add(1).saturating_sub(low) as usize;
 
                     if low == 0 && high_eff + 1 >= sig_w {
@@ -28103,6 +28141,10 @@ impl Simulator {
                     let id = *sig_id;
                     let sig_w = self.signal_widths[id];
                     let high_eff = high.min(sig_w.saturating_sub(1));
+                    if oob_write_discard(high as i64, low as i64, sig_w) {
+                        pc += 1;
+                        continue;
+                    }
                     let copy_count = high_eff.saturating_add(1).saturating_sub(low) as usize;
 
                     if low == 0 && high_eff + 1 >= sig_w {
@@ -28376,6 +28418,10 @@ impl Simulator {
                         }
                         let sig_w = self.signal_widths[eid];
                         let high_eff = high.min(sig_w.saturating_sub(1));
+                        if oob_write_discard(high as i64, low as i64, sig_w) {
+                            pc += 1;
+                            continue;
+                        }
 
                         if low == 0 && high_eff + 1 >= sig_w {
                             // Whole-element write — §10.4.2 last-write-wins
@@ -28480,6 +28526,10 @@ impl Simulator {
                         }
                         let sig_w = self.signal_widths[eid];
                         let high_eff = high.min(sig_w.saturating_sub(1));
+                        if oob_write_discard(high as i64, low as i64, sig_w) {
+                            pc += 1;
+                            continue;
+                        }
 
                         if low == 0 && high_eff + 1 >= sig_w {
                             let mut v = val.resize_for_assign(sig_w);
@@ -55132,6 +55182,9 @@ impl Simulator {
                         if let Some(mut current) = self.get_signal_value_by_name(&element_name) {
                             let width = current.width as usize;
                             let hi = msb.min(width.saturating_sub(1));
+                            if oob_write_discard(msb_i, src_base, width as u32) {
+                                return false;
+                            }
                             let base = if src_base < 0 { src_base } else { lsb as i64 };
                             let mut changed = false;
                             if msb_i >= 0 && hi >= lsb {
@@ -55198,6 +55251,9 @@ impl Simulator {
                         let w = self.packed.width(id);
                         let mut cur = self.packed.read(id);
                         let hi = (msb as usize).min(w.saturating_sub(1) as usize);
+                        if oob_write_discard(msb_i, src_base, w) {
+                            return false;
+                        }
                         for i in lsb..=hi {
                             let src = if src_base < 0 { i as i64 + src_base } else { i as i64 - lsb as i64 };
                             if src >= 0 && (src as u32) < val.width {
@@ -55229,6 +55285,9 @@ impl Simulator {
                     }
                     let mut changed = false;
                     let hi = msb.min(width.saturating_sub(1));
+                    if oob_write_discard(msb_i, src_base, width as u32) {
+                        return false;
+                    }
                     // The source offset is the EFFECTIVE low bit — `lsb` after
                     // the element-scaling and ascending-declaration rewrites
                     // above, which is what the loop always used. Only a
@@ -78893,6 +78952,9 @@ impl Simulator {
         // interpreter's NbaAssignRange read-modify-write pattern.
         let sig_w = self.signal_widths[id];
         let high_eff = high.min(sig_w.saturating_sub(1));
+        if oob_write_discard(high as i64, low as i64, sig_w) {
+            return;
+        }
         if let Some(i) = self.nba_fast_index.get(id) {
             let target = &mut self.nba_fast[i].value;
             for bit_pos in low..=high_eff {
@@ -79023,6 +79085,9 @@ impl Simulator {
         } else {
             let val = Value::from_inline(val_bits, xz_bits, w);
             let high_eff = high.min(sig_w.saturating_sub(1));
+            if oob_write_discard(high as i64, low as i64, sig_w) {
+                return;
+            }
             let mut changed = false;
             for bit_pos in low..=high_eff {
                 let src_bit = val.get_bit((bit_pos - low) as usize);

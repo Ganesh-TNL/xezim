@@ -13,8 +13,9 @@
 //!
 //! A PARTIALLY out-of-range select reads x per bit (`v[12:9]` on `[10:3]`
 //! is `xx10`), differential-verified in `misc/operators_11_select_reduce.rs`;
-//! `XEZIM_OOB_SELECT=whole` gives the whole-x form some tools use. A
-//! partial WRITE stores the in-range bits (§11.5.1), pinned in
+//! `XEZIM_OOB_SELECT=whole` gives the whole-x form some tools use, and
+//! discards a partially out-of-range WRITE. By default a partial write
+//! stores the in-range bits (§11.5.1), pinned in
 //! `collections/stream_justify_assoc_default_partsel.rs`.
 use xezim::simulate;
 

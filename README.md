@@ -122,8 +122,8 @@ and testbench flows. Portable code should not rely on them.
   an out-of-range or unknown element index into a packed 2-D value reads a
   whole-x element. A part-select that is partially out of range keeps the
   §11.5.1 per-bit form (only the out-of-range bits read x);
-  `XEZIM_OOB_SELECT=whole` makes such a select read x as a whole, as some
-  simulators do.
+  `XEZIM_OOB_SELECT=whole` makes such a select read x as a whole and
+  discards a write through it, as some simulators do.
 * An intra-assignment delay inside an edge-triggered `always` block is
   honoured: `q <= #5 v;` schedules the update five time units out and
   `q = #5 v;` suspends the block, as in an `initial` block. Both forms

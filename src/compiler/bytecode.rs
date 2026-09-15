@@ -8771,7 +8771,7 @@ impl<'a> BytecodeCompiler<'a> {
                                     // below: nothing is written.
                                     let (phys_hi, phys_lo) = (hi as i64 - base_lo, lo as i64 - base_lo);
                                     let (phys_hi, phys_lo) = (phys_hi.max(phys_lo), phys_hi.min(phys_lo));
-                                    if phys_hi < 0 {
+                                    if phys_hi < 0 || (phys_lo < 0 && crate::compiler::simulator::oob_select_whole()) {
                                         return true;
                                     }
                                     let val_reg = if phys_lo < 0 {
@@ -9378,7 +9378,7 @@ impl<'a> BytecodeCompiler<'a> {
                                     // shifted to its in-range bits.
                                     let (phys_hi, phys_lo) = (hi as i64 - base_lo, lo as i64 - base_lo);
                                     let (phys_hi, phys_lo) = (phys_hi.max(phys_lo), phys_hi.min(phys_lo));
-                                    if phys_hi < 0 {
+                                    if phys_hi < 0 || (phys_lo < 0 && crate::compiler::simulator::oob_select_whole()) {
                                         return true;
                                     }
                                     let val_reg = if phys_lo < 0 {
