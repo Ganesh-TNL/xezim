@@ -49,6 +49,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_COACT_CENSUS", "Phase 2: per-dep-edge same-slot co-activation stats; sizes convex-cluster fusion (wants profiling on)"),
     ("XEZIM_COACT_FILE", "Phase 2: coact census writes per-edge ratios here; region fusion reads it to gate merging"),
     ("XEZIM_COACT_MIN", "Phase 2: minimum same-slot ratio for a fusion edge (default 0.9)"),
+    ("XEZIM_COMB_GRAPH", "Profiling: write the comb operand graph (entry read/write ids, edge-block write ids) to the given path"),
     ("XEZIM_COMB_OPS", "Profiling: with COMB_PATHS, emit the per-block opcode SET of each interp-bound entry (two-state closure analysis)"),
     ("XEZIM_COMB_PATHS", "Profiling: count settle path (two-state/JIT/interp) per comb entry; ranked dump at end"),
     ("XEZIM_COMB_PATHS_BY", "Profiling: `insns` ranks the COMB_PATHS dump by interpreted VM instructions instead of evaluations"),

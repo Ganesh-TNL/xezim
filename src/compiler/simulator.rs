@@ -13755,6 +13755,7 @@ impl Simulator {
         }
         mark_compile_phase("structural delay setup", &mut compile_phase_start);
         self.build_comb_entries();
+        self.dump_comb_graph();
         #[cfg(feature = "jit")]
         self.jit_compile_comb_entries();
         #[cfg(feature = "jit")]
@@ -50255,6 +50256,62 @@ impl Simulator {
             }
         }
         self.quiet_valid = true;
+    }
+
+    /// Operand graph census (`XEZIM_COMB_GRAPH=<path>`): one line per comb
+    /// entry, `E <eidx> R <read ids> W <write ids>`, then one line per edge
+    /// block, `B <bidx> W <write ids>` (`A<first>` for a dense array
+    /// target), so a placement study can tell which operands are comb
+    /// outputs, flop outputs or primary inputs, and how far apart an entry's
+    /// operands sit in id space. Runs after the entries exist on BOTH paths
+    /// (built, or restored from the prepared-comb cache).
+    fn dump_comb_graph(&self) {
+        use std::io::Write;
+        use super::bytecode::Insn as EI;
+        let Ok(path) = std::env::var("XEZIM_COMB_GRAPH") else { return };
+        let Ok(mut f) = std::fs::File::create(&path) else { return };
+        for (i, e) in self.comb_entries.iter().enumerate() {
+            let _ = write!(f, "E {} R", i);
+            for r in &e.cold.read_signal_ids {
+                let _ = write!(f, " {}", r);
+            }
+            let _ = write!(f, " W");
+            for w in &e.cold.write_signal_ids {
+                let _ = write!(f, " {}", w);
+            }
+            let _ = writeln!(f);
+        }
+        let mut n_blocks = 0usize;
+        for (b, cb) in self.compiled_edge_blocks.iter().enumerate() {
+            let Some(cb) = cb else { continue };
+            n_blocks += 1;
+            let _ = write!(f, "B {} W", b);
+            for ins in cb.instructions.iter() {
+                match ins {
+                    EI::NbaAssign(sig, ..)
+                    | EI::NbaAssignConst(sig, ..)
+                    | EI::NbaAssignRange(sig, ..)
+                    | EI::NbaAssignRangeDyn(sig, ..)
+                    | EI::NbaAssignBitDyn(sig, ..)
+                    | EI::NbaAssignArrayRead(sig, ..) => {
+                        let _ = write!(f, " {}", sig);
+                    }
+                    EI::NbaAssignArray(arr, ..) | EI::NbaAssignArrayRange(arr, ..) => {
+                        if let super::bytecode::ArrayOperand::Dense { first_id, .. } = arr.as_ref() {
+                            let _ = write!(f, " A{}", first_id);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let _ = writeln!(f);
+        }
+        eprintln!(
+            "[COMB-GRAPH] wrote {} entries, {} edge blocks to {}",
+            self.comb_entries.len(),
+            n_blocks,
+            path
+        );
     }
 
     fn build_gate_lane(&mut self) {
