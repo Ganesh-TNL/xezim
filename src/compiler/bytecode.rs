@@ -12915,6 +12915,13 @@ pub enum TsInsn {
     LogOr { d: u16, a: u16, b: u16 },
     /// MSB-first parts, mirroring `Value::concat_refs`.
     Concat { d: u16, parts: Box<[(u16, u8)]> },
+    /// Two- and three-part `Concat` with the operands in the instruction
+    /// itself: `d = (a << wb) | b` and `d = ((a << wb | b) << wc) | c`.
+    /// The boxed-parts form chases a heap pointer per evaluation; on the
+    /// C910 `Concat` was 8% of executor time and most concats have two or
+    /// three parts.
+    Concat2 { d: u16, a: u16, wa: u8, b: u16, wb: u8 },
+    Concat3 { d: u16, a: u16, wa: u8, b: u16, wb: u8, c: u16, wc: u8 },
     /// In-place truncation (a `Resize` that narrows; widening is free).
     Mask { d: u16, mask: u64 },
     /// Jump to `t` when the signal (or its `bit`, when != u32::MAX) is zero.
@@ -14278,6 +14285,24 @@ pub fn lower_two_state(
                 def!(rw, *d, total);
                 out.push(if total > 64 || any_wide {
                     TsInsn::WConcat { d: *d as u16, parts: lowered.into_boxed_slice() }
+                } else if lowered.len() == 2 {
+                    TsInsn::Concat2 {
+                        d: *d as u16,
+                        a: lowered[0].0,
+                        wa: lowered[0].1,
+                        b: lowered[1].0,
+                        wb: lowered[1].1,
+                    }
+                } else if lowered.len() == 3 {
+                    TsInsn::Concat3 {
+                        d: *d as u16,
+                        a: lowered[0].0,
+                        wa: lowered[0].1,
+                        b: lowered[1].0,
+                        wb: lowered[1].1,
+                        c: lowered[2].0,
+                        wc: lowered[2].1,
+                    }
                 } else {
                     TsInsn::Concat {
                         d: *d as u16,

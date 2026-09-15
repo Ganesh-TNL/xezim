@@ -21561,6 +21561,13 @@ impl Simulator {
                     }
                     regs[*d as usize] = acc;
                 }
+                TsInsn::Concat2 { d, a, wa: _, b, wb } => {
+                    regs[*d as usize] = (regs[*a as usize] << *wb) | regs[*b as usize];
+                }
+                TsInsn::Concat3 { d, a, wa: _, b, wb, c, wc } => {
+                    let acc = (regs[*a as usize] << *wb) | regs[*b as usize];
+                    regs[*d as usize] = (acc << *wc) | regs[*c as usize];
+                }
                 TsInsn::Mask { d, mask } => {
                     regs[*d as usize] &= mask;
                 }
@@ -22338,6 +22345,13 @@ impl Simulator {
                         acc = (acc << w) | r!(r);
                     }
                     r!(*d) = acc;
+                }
+                TsInsn::Concat2 { d, a, wa: _, b, wb } => {
+                    r!(*d) = (r!(*a) << *wb) | r!(*b);
+                }
+                TsInsn::Concat3 { d, a, wa: _, b, wb, c, wc } => {
+                    let acc = (r!(*a) << *wb) | r!(*b);
+                    r!(*d) = (acc << *wc) | r!(*c);
                 }
                 TsInsn::Mask { d, mask } => {
                     r!(*d) &= mask;
@@ -23303,6 +23317,14 @@ impl Simulator {
                         acc = (acc << w) | (*rp.add(r as usize));
                     }
                     (*rp.add(*d as usize)) = acc;
+                }
+                TsInsn::Concat2 { d, a, wa: _, b, wb } => {
+                    (*rp.add(*d as usize)) =
+                        ((*rp.add(*a as usize)) << *wb) | (*rp.add(*b as usize));
+                }
+                TsInsn::Concat3 { d, a, wa: _, b, wb, c, wc } => {
+                    let acc = ((*rp.add(*a as usize)) << *wb) | (*rp.add(*b as usize));
+                    (*rp.add(*d as usize)) = (acc << *wc) | (*rp.add(*c as usize));
                 }
                 TsInsn::Mask { d, mask } => {
                     (*rp.add(*d as usize)) &= mask;

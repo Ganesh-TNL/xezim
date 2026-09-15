@@ -81,6 +81,8 @@ pub mod enabled {
             T::AndOr { d1, a1, b1, d, a, b } => vec![T::And { d: *d1, a: *a1, b: *b1 }, T::Or { d: *d, a: *a, b: *b }],
             T::OrRangeStore { d, a, b, sig, hi, lo } => vec![T::Or { d: *d, a: *a, b: *b }, T::RangeStore { sig: *sig, hi: *hi, lo: *lo, s: *d, mask: if *hi - *lo + 1 >= 64 { u64::MAX } else { (1u64 << (*hi - *lo + 1)) - 1 } }],
             T::LoadSigBrNz { .. } | T::BrFalseLoadSig { .. } | T::EqBrFalse { .. } => return None,
+            T::Concat2 { d, a, wa, b, wb } => vec![T::Concat { d: *d, parts: vec![(*a, *wa), (*b, *wb)].into_boxed_slice() }],
+            T::Concat3 { d, a, wa, b, wb, c, wc } => vec![T::Concat { d: *d, parts: vec![(*a, *wa), (*b, *wb), (*c, *wc)].into_boxed_slice() }],
             other => vec![other.clone()],
         })
     }
