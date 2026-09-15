@@ -50447,16 +50447,25 @@ impl Simulator {
             pos.insert(n.as_str(), i);
         }
         let n = names.len();
-        let mut placed = vec![false; n];
-        let mut order: Vec<usize> = Vec::with_capacity(n);
+        // Undirected adjacency between the names one assign/block relates:
+        // every operand is linked to every target of that statement. A
+        // breadth-first walk over this graph, starting from the lowest
+        // unplaced name and expanding a degree-sorted frontier (Cuthill–
+        // McKee), keeps each entry's operands and outputs within a few ids
+        // of each other while leaving declaration-adjacent bus bits, which
+        // share writers, together. The earlier source-order greedy walk
+        // scattered those bits and measured negative.
+        let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
         let mut reads: Vec<String> = Vec::new();
         let mut writes: Vec<String> = Vec::new();
-        let mut place = |list: &[String], placed: &mut Vec<bool>, order: &mut Vec<usize>| {
-            for nm in list {
-                if let Some(&i) = pos.get(nm.as_str()) {
-                    if !placed[i] {
-                        placed[i] = true;
-                        order.push(i);
+        let mut link = |reads: &[String], writes: &[String], adj: &mut Vec<Vec<u32>>| {
+            let rs: Vec<usize> = reads.iter().filter_map(|r| pos.get(r.as_str()).copied()).collect();
+            let ws: Vec<usize> = writes.iter().filter_map(|w| pos.get(w.as_str()).copied()).collect();
+            for &w in &ws {
+                for &r in &rs {
+                    if r != w {
+                        adj[w].push(r as u32);
+                        adj[r].push(w as u32);
                     }
                 }
             }
@@ -50471,26 +50480,56 @@ impl Simulator {
                 writes.push(first.clone());
             }
             reads.extend(lhs.into_iter().skip(1));
-            place(&reads, &mut placed, &mut order);
-            place(&writes, &mut placed, &mut order);
+            link(&reads, &writes, &mut adj);
         }
         for ab in &module.always_blocks {
             reads.clear();
             writes.clear();
             stmt_names(&ab.stmt, module, &mut reads, &mut writes);
-            place(&reads, &mut placed, &mut order);
-            place(&writes, &mut placed, &mut order);
+            link(&reads, &writes, &mut adj);
         }
         for pa in &module.pending_always {
             reads.clear();
             writes.clear();
             stmt_names(&pa.source, module, &mut reads, &mut writes);
-            place(&reads, &mut placed, &mut order);
-            place(&writes, &mut placed, &mut order);
+            link(&reads, &writes, &mut adj);
         }
-        for i in 0..n {
-            if !placed[i] {
-                order.push(i);
+        for a in adj.iter_mut() {
+            a.sort_unstable();
+            a.dedup();
+        }
+        if std::env::var("XEZIM_PLACE_DBG").is_ok() {
+            let linked = adj.iter().filter(|a| !a.is_empty()).count();
+            let edges: usize = adj.iter().map(|a| a.len()).sum::<usize>() / 2;
+            eprintln!(
+                "[PLACE] names={} linked={} edges={} cont_assigns={} always={} pending={}",
+                n, linked, edges,
+                module.continuous_assigns.len(), module.always_blocks.len(), module.pending_always.len()
+            );
+        }
+        let mut placed = vec![false; n];
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        let mut frontier: Vec<usize> = Vec::new();
+        for seed in 0..n {
+            if placed[seed] {
+                continue;
+            }
+            placed[seed] = true;
+            queue.push_back(seed);
+            while let Some(v) = queue.pop_front() {
+                order.push(v);
+                frontier.clear();
+                for &u in &adj[v] {
+                    let u = u as usize;
+                    if !placed[u] {
+                        placed[u] = true;
+                        frontier.push(u);
+                    }
+                }
+                // Low-degree neighbours first (Cuthill–McKee), ties by name.
+                frontier.sort_by_key(|&u| (adj[u].len(), u));
+                queue.extend(frontier.iter().copied());
             }
         }
         let mut names = names;
