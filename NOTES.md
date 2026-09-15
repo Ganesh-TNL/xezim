@@ -9,6 +9,9 @@ and the development workflow are in [README.md](README.md).
 
 **Correctness**
 
+* A non-blocking read of an array element through an index that holds x or
+  z (`q <= mem[idx]`) queues an all-x element instead of element 0, in the
+  two-state and four-state engines alike.
 * A constant part-select `[l:r]` whose bound is a variable is now an
   elaboration error, as IEEE 1800 §11.5.1 requires; only `[base +: width]`
   and `[base -: width]` take a variable base. Every engine previously read
