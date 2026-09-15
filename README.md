@@ -114,6 +114,16 @@ and testbench flows. Portable code should not rely on them.
 
 **Correctness**
 
+* Bit- and part-selects follow IEEE 1800 §11.5.1 in every engine: an
+  index or bound with an x or z bit reads x and discards the write instead of
+  using bit 0; a constant select below a vector's declared low bound reads x
+  instead of the low bits; an ascending vector (`logic [3:10] a`) places label
+  `p` at bit `10 - p` for reads and writes alike, so `a[3] = 1` sets the MSB;
+  an out-of-range or unknown element index into a packed 2-D value reads a
+  whole-x element. A part-select that is partially out of range keeps the
+  §11.5.1 per-bit form (only the out-of-range bits read x);
+  `XEZIM_OOB_SELECT=whole` makes such a select read x as a whole, as some
+  simulators do.
 * An intra-assignment delay inside an edge-triggered `always` block is
   honoured: `q <= #5 v;` schedules the update five time units out and
   `q = #5 v;` suspends the block, as in an `initial` block. Both forms

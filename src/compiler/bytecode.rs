@@ -329,6 +329,11 @@ pub enum Insn {
     BitSelectConst(RegId, RegId, u32), // (dest, base, index)
     /// Range select: dest = src[left:right]
     RangeSelect(RegId, RegId, RegId, RegId), // (dest, base, left, right)
+    /// Indexed part-select `base[idx +: w]` (up) / `base[idx -: w]` (down)
+    /// with a constant width: the width survives an x/z index, which the
+    /// two-register form loses (§11.5.1: unknown index → whole-x result of
+    /// the select's width). (dest, base, idx, width, up)
+    RangeSelectW(RegId, RegId, RegId, u32, bool),
     /// Range select with compile-time constant bounds.
     RangeSelectConst(RegId, RegId, u32, u32), // (dest, base, left, right)
     /// Concatenation: dest = {parts...}, part register IDs stored in
@@ -638,6 +643,11 @@ impl Insn {
                 *c += rb;
                 *d += rb;
             }
+            RangeSelectW(a, b, c, _, _) => {
+                *a += rb;
+                *b += rb;
+                *c += rb;
+            }
             Concat(a, v) => {
                 *a += rb;
                 for r in v.iter_mut() {
@@ -735,6 +745,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::BitSelect(..) => "BitSel",
         Insn::BitSelectConst(..) => "BitSelC",
         Insn::RangeSelect(..) => "RngSel",
+        Insn::RangeSelectW(..) => "RngSelW",
         Insn::RangeSelectConst(..) => "RngSelC",
         Insn::Concat(..) => "Concat",
         Insn::Replicate(..) => "Repl",
@@ -7749,8 +7760,13 @@ impl<'a> BytecodeCompiler<'a> {
                     // Saturate rather than wrap: an out-of-range declared index
                     // is already x-valued, and a negative operand would read as
                     // a huge unsigned bit position.
-                    let phys = (idx as i64 - base_lo).max(0) as u32;
-                    self.emit(Insn::BitSelectConst(dest, base, phys));
+                    let phys = idx as i64 - base_lo;
+                    if phys < 0 {
+                        // §11.5.1: below the declared low bound reads x.
+                        self.emit(Insn::LoadConst(dest, Box::new(Value::new(1))));
+                        return Some(dest);
+                    }
+                    self.emit(Insn::BitSelectConst(dest, base, phys as u32));
                     return Some(dest);
                 }
                 let idx = self.compile_expr(index, 0)?;
@@ -7814,11 +7830,22 @@ impl<'a> BytecodeCompiler<'a> {
                             }
                         }
                         let dest = self.alloc_reg();
+                        if phys_l.min(phys_r) < 0 {
+                            // A bound below the declared low bound: the
+                            // out-of-range positions read x (§11.5.1), which
+                            // the signed dynamic form does per bit.
+                            let lr = self.alloc_reg();
+                            let rr = self.alloc_reg();
+                            self.emit(Insn::LoadConst(lr, Box::new(Value::from_u64(phys_l as u32 as u64, 32))));
+                            self.emit(Insn::LoadConst(rr, Box::new(Value::from_u64(phys_r as u32 as u64, 32))));
+                            self.emit(Insn::RangeSelect(dest, base, lr, rr));
+                            return Some(dest);
+                        }
                         self.emit(Insn::RangeSelectConst(
                             dest,
                             base,
-                            phys_l.max(0) as u32,
-                            phys_r.max(0) as u32,
+                            phys_l as u32,
+                            phys_r as u32,
                         ));
                         return Some(dest);
                     }
@@ -7887,22 +7914,14 @@ impl<'a> BytecodeCompiler<'a> {
                         _ => idx,
                     };
                     let dest = self.alloc_reg();
-                    if width == 1 {
-                        self.emit(Insn::RangeSelect(dest, base, idx, idx));
-                    } else {
-                        let delta = self.alloc_reg();
-                        self.emit(Insn::LoadConst(
-                            delta,
-                            Box::new(Value::from_u64((width - 1) as u64, 32)),
+                    {
+                        self.emit(Insn::RangeSelectW(
+                            dest,
+                            base,
+                            idx,
+                            width,
+                            *kind == RangeKind::IndexedUp,
                         ));
-                        let other = self.alloc_reg();
-                        if *kind == RangeKind::IndexedUp {
-                            self.emit(Insn::Add(other, idx, delta));
-                            self.emit(Insn::RangeSelect(dest, base, other, idx));
-                        } else {
-                            self.emit(Insn::Sub(other, idx, delta));
-                            self.emit(Insn::RangeSelect(dest, base, idx, other));
-                        }
                     }
                     Some(dest)
                 }
@@ -8745,8 +8764,26 @@ impl<'a> BytecodeCompiler<'a> {
                                 if let (Some(hi), Some(lo)) =
                                     (self.eval_const_expr(left), self.eval_const_expr(right))
                                 {
-                                    let hi = (hi as i64 - base_lo).max(0) as u32;
-                                    let lo = (lo as i64 - base_lo).max(0) as u32;
+                                    // §11.5.1: labels below the declared low
+                                    // bound are outside the vector; only the
+                                    // in-range labels are written, from the
+                                    // value's corresponding bits. Entirely
+                                    // below: nothing is written.
+                                    let (phys_hi, phys_lo) = (hi as i64 - base_lo, lo as i64 - base_lo);
+                                    let (phys_hi, phys_lo) = (phys_hi.max(phys_lo), phys_hi.min(phys_lo));
+                                    if phys_hi < 0 {
+                                        return true;
+                                    }
+                                    let val_reg = if phys_lo < 0 {
+                                        let shifted = self.alloc_reg();
+                                        let amt = self.alloc_reg();
+                                        self.emit(Insn::LoadConst(amt, Box::new(Value::from_u64((-phys_lo) as u64, 32))));
+                                        self.emit(Insn::Shr(shifted, val_reg, amt));
+                                        shifted
+                                    } else {
+                                        val_reg
+                                    };
+                                    let (hi, lo) = (phys_hi as u32, phys_lo.max(0) as u32);
                                     self.emit(Insn::NbaAssignRange(as_sig_id(id), hi, lo, val_reg));
                                     return true;
                                 }
@@ -9336,8 +9373,24 @@ impl<'a> BytecodeCompiler<'a> {
                                 if let (Some(hi), Some(lo)) =
                                     (self.eval_const_expr(left), self.eval_const_expr(right))
                                 {
-                                    let hi = (hi as i64 - base_lo).max(0) as u32;
-                                    let lo = (lo as i64 - base_lo).max(0) as u32;
+                                    // §11.5.1: see the NBA arm — labels below
+                                    // the low bound are dropped, the value is
+                                    // shifted to its in-range bits.
+                                    let (phys_hi, phys_lo) = (hi as i64 - base_lo, lo as i64 - base_lo);
+                                    let (phys_hi, phys_lo) = (phys_hi.max(phys_lo), phys_hi.min(phys_lo));
+                                    if phys_hi < 0 {
+                                        return true;
+                                    }
+                                    let val_reg = if phys_lo < 0 {
+                                        let shifted = self.alloc_reg();
+                                        let amt = self.alloc_reg();
+                                        self.emit(Insn::LoadConst(amt, Box::new(Value::from_u64((-phys_lo) as u64, 32))));
+                                        self.emit(Insn::Shr(shifted, val_reg, amt));
+                                        shifted
+                                    } else {
+                                        val_reg
+                                    };
+                                    let (hi, lo) = (phys_hi as u32, phys_lo.max(0) as u32);
                                     let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
                                     if let Some(range_w) =
                                         high.checked_sub(low).and_then(|w| w.checked_add(1))
@@ -10606,6 +10659,7 @@ impl<'a> BytecodeCompiler<'a> {
             Insn::BitSelect(_, b, i) => *b == r || *i == r,
             Insn::BitSelectConst(_, b, _) => *b == r,
             Insn::RangeSelect(_, b, l, rr) => *b == r || *l == r || *rr == r,
+            Insn::RangeSelectW(_, b, i, _, _) => *b == r || *i == r,
             Insn::RangeSelectConst(_, b, _, _) => *b == r,
             Insn::Concat(_, parts) => parts.contains(&r),
             Insn::BranchIfFalse(c, _) => *c == r,
@@ -11012,6 +11066,7 @@ impl<'a> BytecodeCompiler<'a> {
                 | Insn::BitSelect(d, _, _)
                 | Insn::BitSelectConst(d, _, _)
                 | Insn::RangeSelect(d, _, _, _)
+                | Insn::RangeSelectW(d, _, _, _, _)
                 | Insn::RangeSelectConst(d, _, _, _)
                 | Insn::CaseLut(d, _, _) => Some(d),
                 _ => None,
@@ -11501,6 +11556,7 @@ impl<'a> BytecodeCompiler<'a> {
                 | Insn::BitSelect(d, _, _)
                 | Insn::BitSelectConst(d, _, _)
                 | Insn::RangeSelect(d, _, _, _)
+                | Insn::RangeSelectW(d, _, _, _, _)
                 | Insn::RangeSelectConst(d, _, _, _)
                 | Insn::Concat(d, _)
                 | Insn::Replicate(d, _, _)
@@ -12107,7 +12163,9 @@ impl<'a> BytecodeCompiler<'a> {
                 // dynamic range select are register values, and an array
                 // element read that fails to resolve returns a 1-bit X
                 // instead of the element.
-                Insn::RangeSelect(d, _, _, _) | Insn::LoadArrayElem(d, _, _) => {
+                Insn::RangeSelect(d, _, _, _)
+                | Insn::RangeSelectW(d, _, _, _, _)
+                | Insn::LoadArrayElem(d, _, _) => {
                     store(&mut rw, *d, None)
                 }
 

@@ -133,6 +133,8 @@ mod negative_lsb_range_select;
 mod nonansi_function_args;
 #[path = "misc/nonzero_lsb_indexed_part_select.rs"]
 mod nonzero_lsb_indexed_part_select;
+#[path = "misc/select_semantics_11_5_1.rs"]
+mod select_semantics_11_5_1;
 #[path = "misc/obj_assocd_event_disable_fork.rs"]
 mod obj_assocd_event_disable_fork;
 #[path = "misc/operators_11_select_reduce.rs"]

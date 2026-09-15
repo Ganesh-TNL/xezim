@@ -150,6 +150,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_NO_NATIVE_CACHE", "AOT: disable the persistent native-library cache (~/.cache/xezim/native)"),
     ("XEZIM_NO_PARALLEL", "Parallel: disable all multithreaded execution"),
     ("XEZIM_NO_PARALLEL_RANGE", "Parallel: disable parallel range-partitioned apply"),
+    ("XEZIM_OOB_SELECT", "Semantics: `whole` makes a partially out-of-range part-select read x as a whole (some tools); default follows IEEE 1800 11.5.1, where only the out-of-range bits read x"),
     ("XEZIM_OPCODE_CENSUS", "Print executed-insn opcode histogram at end of sim"),
     ("XEZIM_PACKED_MEM", "Memory: opt-in packed byte storage for large narrow arrays (0/1)"),
     ("XEZIM_PARALLEL_SERIALIZE", "Parallel: run parallel plan serially (debug determinism check)"),

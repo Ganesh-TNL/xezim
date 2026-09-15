@@ -137,6 +137,7 @@ impl Opcode {
             Insn::BitSelect(_, _, _) => Self::BitSelect,
             Insn::BitSelectConst(_, _, _) => Self::BitSelectConst,
             Insn::RangeSelect(_, _, _, _) => Self::RangeSelect,
+            Insn::RangeSelectW(_, _, _, _, _) => Self::RangeSelect,
             Insn::RangeSelectConst(_, _, _, _) => Self::RangeSelectConst,
             Insn::Concat(_, _) => Self::Concat,
             Insn::Replicate(_, _, _) => Self::Replicate,

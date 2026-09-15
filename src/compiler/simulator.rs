@@ -3153,6 +3153,33 @@ fn bytecode_array_elem_width(
 /// unknown. Out-of-range indices need no help here: `Value::set_bit` already
 /// drops them. Same defect, and same fix, as the `LoadArrayElem` x-index
 /// sentinel on the read side.
+
+/// §11.5.1 part-select whose physical range `[hi:lo]` may leave `[0, w)`.
+/// Out-of-range positions read x, and the in-range positions read their
+/// bits (IEEE 1800 §11.5.1; differential-verified against a reference
+/// simulator in `tests/misc/operators_11_select_reduce.rs`). Some tools
+/// read the WHOLE select x instead when any position is out of range;
+/// `XEZIM_OOB_SELECT=whole` selects that form.
+#[inline]
+pub(crate) fn oob_range_select(base: &Value, hi: i64, lo: i64) -> Value {
+    static PER_BIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let per_bit = *PER_BIT.get_or_init(|| {
+        std::env::var("XEZIM_OOB_SELECT").ok().as_deref() != Some("whole")
+    });
+    if hi < lo {
+        return Value::new(1);
+    }
+    let width = (hi - lo + 1) as u32;
+    let w = base.width as i64;
+    if lo >= 0 && hi < w {
+        return base.range_select(hi as usize, lo as usize);
+    }
+    if !per_bit && !base.is_fill {
+        return Value::new(width);
+    }
+    base.range_select_signed(hi, lo)
+}
+
 #[inline]
 fn dyn_bit_index(v: &Value) -> Option<usize> {
     if v.has_xz() {
@@ -25121,11 +25148,27 @@ impl Simulator {
                     vm_regs[*d as usize] = vm_regs[*s as usize].reduce_xor();
                 }
                 Insn::BitSelect(d, base, idx) => {
-                    let i = vm_regs[*idx as usize].to_u64().unwrap_or(0) as usize;
-                    vm_regs[*d as usize] = vm_regs[*base as usize].bit_select(i);
+                    // §11.5.1: an x/z or negative index reads x.
+                    vm_regs[*d as usize] = match vm_regs[*idx as usize].to_index() {
+                        Some(i) if i >= 0 => vm_regs[*base as usize].bit_select(i as usize),
+                        _ => Value::new(1),
+                    };
                 }
                 Insn::BitSelectConst(d, base, idx) => {
                     vm_regs[*d as usize] = vm_regs[*base as usize].bit_select(*idx as usize);
+                }
+                Insn::RangeSelectW(d, base, idx, w, up) => {
+                    // §11.5.1: an x/z index reads a whole-x select of the
+                    // declared width; otherwise the bounds are formed here.
+                    let dv = match vm_regs[*idx as usize].to_index() {
+                        None => Value::new(*w),
+                        Some(i) => {
+                            let i = i as i32 as i64;
+                            let (lo, hi) = if *up { (i, i + *w as i64 - 1) } else { (i - *w as i64 + 1, i) };
+                            oob_range_select(&vm_regs[*base as usize], hi, lo)
+                        }
+                    };
+                    vm_regs[*d as usize] = dv;
                 }
                 Insn::RangeSelect(d, base, l, r) => {
                     // §11.5.1: bounds are 32-bit index arithmetic; a `[l -: W]`
@@ -25133,24 +25176,39 @@ impl Simulator {
                     // the signed value and, only when the low bound is <0, take
                     // the x-filling signed path (the fast path handles the common
                     // in-range + high-overrun cases).
-                    let a = (vm_regs[*l as usize].to_u64().unwrap_or(0) as u32) as i32 as i64;
-                    let b = (vm_regs[*r as usize].to_u64().unwrap_or(0) as u32) as i32 as i64;
-                    let (lo, hi) = (a.min(b), a.max(b));
-                    vm_regs[*d as usize] = if lo < 0 {
-                        vm_regs[*base as usize].range_select_signed(hi, lo)
-                    } else {
-                        vm_regs[*base as usize].range_select(hi as usize, lo as usize)
+                    // §11.5.1: an x/z bound selects nothing: whole-x at the
+                    // select's width, recovered from the masked bound values
+                    // (an indexed form's bounds differ by the constant width
+                    // even when the base is unknown).
+                    let (av, bv) = (&vm_regs[*l as usize], &vm_regs[*r as usize]);
+                    let (Some(a), Some(b)) = (av.to_index(), bv.to_index()) else {
+                        let a = av.to_u64().unwrap_or(0) as u32 as i32 as i64;
+                        let b = bv.to_u64().unwrap_or(0) as u32 as i32 as i64;
+                        vm_regs[*d as usize] = Value::new(((a - b).unsigned_abs() + 1) as u32);
+                        pc += 1;
+                        continue;
                     };
+                    let (a, b) = (a as i32 as i64, b as i32 as i64);
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    vm_regs[*d as usize] = oob_range_select(&vm_regs[*base as usize], hi, lo);
                 }
                 Insn::RangeSelectConst(d, base, l, r) => {
-                    vm_regs[*d as usize] =
-                        vm_regs[*base as usize].range_select(*l as usize, *r as usize);
+                    vm_regs[*d as usize] = oob_range_select(
+                        &vm_regs[*base as usize],
+                        (*l).max(*r) as i64,
+                        (*l).min(*r) as i64,
+                    );
                 }
                 // Fused load+select (finish() peephole).
                 Insn::LoadSignalRange(d, sig_id, l, r) => {
                     let sig_id = &(*sig_id as usize);
-                    vm_regs[*d as usize] =
-                        signal_table[*sig_id].range_select(*l as usize, *r as usize);
+                    // §11.5.1: a select past the signal's MSB is partially
+                    // out of range (see `oob_range_select`).
+                    vm_regs[*d as usize] = oob_range_select(
+                        &signal_table[*sig_id],
+                        (*l).max(*r) as i64,
+                        (*l).min(*r) as i64,
+                    );
                 }
                 Insn::LoadSignalBit(d, sig_id, idx) => {
                     let sig_id = &(*sig_id as usize);
@@ -25461,7 +25519,13 @@ impl Simulator {
                     }
                 }
                 Insn::NbaAssignArray(array_name, idx_reg, val_reg, width) => {
-                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as i64;
+                    // §11.5.1: an x/z index selects no element: the write
+                    // is discarded (an out-of-range index is dropped by the
+                    // element resolver below).
+                    let Some(idx) = vm_regs[*idx_reg as usize].to_index() else {
+                        pc += 1;
+                        continue;
+                    };
                     let id = resolve_bytecode_array_elem(
                         array_name,
                         idx,
@@ -25782,11 +25846,27 @@ impl Simulator {
                     vm_regs[*d as usize] = vm_regs[*s as usize].reduce_xor();
                 }
                 Insn::BitSelect(d, base, idx) => {
-                    let i = vm_regs[*idx as usize].to_u64().unwrap_or(0) as usize;
-                    vm_regs[*d as usize] = vm_regs[*base as usize].bit_select(i);
+                    // §11.5.1: an x/z or negative index reads x.
+                    vm_regs[*d as usize] = match vm_regs[*idx as usize].to_index() {
+                        Some(i) if i >= 0 => vm_regs[*base as usize].bit_select(i as usize),
+                        _ => Value::new(1),
+                    };
                 }
                 Insn::BitSelectConst(d, base, idx) => {
                     vm_regs[*d as usize] = vm_regs[*base as usize].bit_select(*idx as usize);
+                }
+                Insn::RangeSelectW(d, base, idx, w, up) => {
+                    // §11.5.1: an x/z index reads a whole-x select of the
+                    // declared width; otherwise the bounds are formed here.
+                    let dv = match vm_regs[*idx as usize].to_index() {
+                        None => Value::new(*w),
+                        Some(i) => {
+                            let i = i as i32 as i64;
+                            let (lo, hi) = if *up { (i, i + *w as i64 - 1) } else { (i - *w as i64 + 1, i) };
+                            oob_range_select(&vm_regs[*base as usize], hi, lo)
+                        }
+                    };
+                    vm_regs[*d as usize] = dv;
                 }
                 Insn::RangeSelect(d, base, l, r) => {
                     // §11.5.1: bounds are 32-bit index arithmetic; a `[l -: W]`
@@ -25794,24 +25874,38 @@ impl Simulator {
                     // the signed value and, only when the low bound is <0, take
                     // the x-filling signed path (the fast path handles the common
                     // in-range + high-overrun cases).
-                    let a = (vm_regs[*l as usize].to_u64().unwrap_or(0) as u32) as i32 as i64;
-                    let b = (vm_regs[*r as usize].to_u64().unwrap_or(0) as u32) as i32 as i64;
-                    let (lo, hi) = (a.min(b), a.max(b));
-                    vm_regs[*d as usize] = if lo < 0 {
-                        vm_regs[*base as usize].range_select_signed(hi, lo)
-                    } else {
-                        vm_regs[*base as usize].range_select(hi as usize, lo as usize)
+                    // §11.5.1: an x/z bound selects nothing: whole-x at the
+                    // select's width, recovered from the masked bound values
+                    // (an indexed form's bounds differ by the constant width
+                    // even when the base is unknown).
+                    let (av, bv) = (&vm_regs[*l as usize], &vm_regs[*r as usize]);
+                    let (Some(a), Some(b)) = (av.to_index(), bv.to_index()) else {
+                        let a = av.to_u64().unwrap_or(0) as u32 as i32 as i64;
+                        let b = bv.to_u64().unwrap_or(0) as u32 as i32 as i64;
+                        vm_regs[*d as usize] = Value::new(((a - b).unsigned_abs() + 1) as u32);
+                        pc += 1;
+                        continue;
                     };
+                    let (a, b) = (a as i32 as i64, b as i32 as i64);
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    vm_regs[*d as usize] = oob_range_select(&vm_regs[*base as usize], hi, lo);
                 }
                 Insn::RangeSelectConst(d, base, l, r) => {
-                    vm_regs[*d as usize] =
-                        vm_regs[*base as usize].range_select(*l as usize, *r as usize);
+                    vm_regs[*d as usize] = oob_range_select(
+                        &vm_regs[*base as usize],
+                        (*l).max(*r) as i64,
+                        (*l).min(*r) as i64,
+                    );
                 }
                 // Fused load+select (finish() peephole).
                 Insn::LoadSignalRange(d, sig_id, l, r) => {
                     let sig_id = &(*sig_id as usize);
-                    vm_regs[*d as usize] =
-                        view[*sig_id].range_select(*l as usize, *r as usize);
+                    // §11.5.1: a select past the MSB is partially out of range.
+                    vm_regs[*d as usize] = oob_range_select(
+                        &view[*sig_id],
+                        (*l).max(*r) as i64,
+                        (*l).min(*r) as i64,
+                    );
                 }
                 Insn::LoadSignalBit(d, sig_id, idx) => {
                     let sig_id = &(*sig_id as usize);
@@ -26119,8 +26213,15 @@ impl Simulator {
                 }
                 Insn::BlockingAssignRangeDyn(sig_id, hi_reg, lo_reg, val_reg) => {
                     let sig_id = &(*sig_id as usize);
-                    let hi = vm_regs[*hi_reg as usize].to_u64().unwrap_or(0) as u32;
-                    let lo = vm_regs[*lo_reg as usize].to_u64().unwrap_or(0) as u32;
+                    // §11.5.1: an x/z bound discards the write.
+                    let (Some(hi), Some(lo)) = (
+                        vm_regs[*hi_reg as usize].to_index(),
+                        vm_regs[*lo_reg as usize].to_index(),
+                    ) else {
+                        pc += 1;
+                        continue;
+                    };
+                    let (hi, lo) = (hi as u32, lo as u32);
                     let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
                     let w = high - low + 1;
                     let val = vm_regs[*val_reg as usize].resize(w);
@@ -26152,7 +26253,13 @@ impl Simulator {
                     }
                 }
                 Insn::BlockingAssignArray(array_name, idx_reg, val_reg, width) => {
-                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as i64;
+                    // §11.5.1: an x/z index selects no element: the write
+                    // is discarded (an out-of-range index is dropped by the
+                    // element resolver below).
+                    let Some(idx) = vm_regs[*idx_reg as usize].to_index() else {
+                        pc += 1;
+                        continue;
+                    };
                     let id = resolve_bytecode_array_elem(
                         array_name,
                         idx,
@@ -26276,7 +26383,13 @@ impl Simulator {
                     }
                 }
                 Insn::NbaAssignArray(array_name, idx_reg, val_reg, width) => {
-                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as i64;
+                    // §11.5.1: an x/z index selects no element: the write
+                    // is discarded (an out-of-range index is dropped by the
+                    // element resolver below).
+                    let Some(idx) = vm_regs[*idx_reg as usize].to_index() else {
+                        pc += 1;
+                        continue;
+                    };
                     let id = resolve_bytecode_array_elem(
                         array_name,
                         idx,
@@ -27168,7 +27281,13 @@ impl Simulator {
                 }
                 Insn::BitSelect(d, base, idx) => {
                     let (d, base) = (*d as usize, *base as usize);
-                    let i = self.vm_regs[*idx as usize].to_u64().unwrap_or(0) as usize;
+                    // §11.5.1: an x/z or negative index reads x.
+                    let Some(i) = self.vm_regs[*idx as usize].to_index().filter(|&i| i >= 0) else {
+                        self.vm_regs[d] = Value::new(1);
+                        pc += 1;
+                        continue;
+                    };
+                    let i = i as usize;
                     match vm_bit_select(&self.vm_regs[base], i) {
                         Some((v, x)) => vm_store(&mut self.vm_regs[d], v, x, 1, false),
                         None => self.vm_regs[d] = self.vm_regs[base].bit_select(i),
@@ -27181,22 +27300,44 @@ impl Simulator {
                         None => self.vm_regs[d] = self.vm_regs[base].bit_select(i),
                     }
                 }
+                Insn::RangeSelectW(d, base, idx, w, up) => {
+                    // §11.5.1: an x/z index reads a whole-x select of the
+                    // declared width; otherwise the bounds are formed here.
+                    let dv = match self.vm_regs[*idx as usize].to_index() {
+                        None => Value::new(*w),
+                        Some(i) => {
+                            let i = i as i32 as i64;
+                            let (lo, hi) = if *up { (i, i + *w as i64 - 1) } else { (i - *w as i64 + 1, i) };
+                            oob_range_select(&self.vm_regs[*base as usize], hi, lo)
+                        }
+                    };
+                    self.vm_regs[*d as usize] = dv;
+                }
                 Insn::RangeSelect(d, base, l, r) => {
                     // §11.5.1 signed low-bound recovery — see the twin site.
-                    let a = (self.vm_regs[*l as usize].to_u64().unwrap_or(0) as u32) as i32 as i64;
-                    let b = (self.vm_regs[*r as usize].to_u64().unwrap_or(0) as u32) as i32 as i64;
-                    let (lo, hi) = (a.min(b), a.max(b));
-                    self.vm_regs[*d as usize] = if lo < 0 {
-                        self.vm_regs[*base as usize].range_select_signed(hi, lo)
-                    } else {
-                        self.vm_regs[*base as usize].range_select(hi as usize, lo as usize)
+                    // §11.5.1: an x/z bound selects nothing (see the twin site).
+                    let (av, bv) = (&self.vm_regs[*l as usize], &self.vm_regs[*r as usize]);
+                    let (Some(a), Some(b)) = (av.to_index(), bv.to_index()) else {
+                        let a = av.to_u64().unwrap_or(0) as u32 as i32 as i64;
+                        let b = bv.to_u64().unwrap_or(0) as u32 as i32 as i64;
+                        self.vm_regs[*d as usize] = Value::new(((a - b).unsigned_abs() + 1) as u32);
+                        pc += 1;
+                        continue;
                     };
+                    let (a, b) = (a as i32 as i64, b as i32 as i64);
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    self.vm_regs[*d as usize] = oob_range_select(&self.vm_regs[*base as usize], hi, lo);
                 }
                 Insn::RangeSelectConst(d, base, l, r) => {
                     let (d, base, l, r) = (*d as usize, *base as usize, *l as usize, *r as usize);
-                    match vm_range_select(&self.vm_regs[base], l, r) {
-                        Some((v, x, w)) => vm_store(&mut self.vm_regs[d], v, x, w, false),
-                        None => self.vm_regs[d] = self.vm_regs[base].range_select(l, r),
+                    if l.max(r) >= self.vm_regs[base].width as usize {
+                        // Partially out of range: §11.5.1 whole-x (see the helper).
+                        self.vm_regs[d] = oob_range_select(&self.vm_regs[base], l.max(r) as i64, l.min(r) as i64);
+                    } else {
+                        match vm_range_select(&self.vm_regs[base], l, r) {
+                            Some((v, x, w)) => vm_store(&mut self.vm_regs[d], v, x, w, false),
+                            None => self.vm_regs[d] = self.vm_regs[base].range_select(l, r),
+                        }
                     }
                 }
                 // Fused load+select (finish() peephole): slice straight out of
@@ -27204,10 +27345,15 @@ impl Simulator {
                 Insn::LoadSignalRange(d, sig_id, l, r) => {
                     let sig_id = &(*sig_id as usize);
                     let (d, l, r) = (*d as usize, *l as usize, *r as usize);
-                    match vm_range_select(&self.signal_table[*sig_id], l, r) {
-                        Some((v, x, w)) => vm_store(&mut self.vm_regs[d], v, x, w, false),
-                        None => {
-                            self.vm_regs[d] = self.signal_table[*sig_id].range_select(l, r)
+                    if l.max(r) >= self.signal_table[*sig_id].width as usize {
+                        // §11.5.1: partially out of range (see `oob_range_select`).
+                        self.vm_regs[d] = oob_range_select(&self.signal_table[*sig_id], l.max(r) as i64, l.min(r) as i64);
+                    } else {
+                        match vm_range_select(&self.signal_table[*sig_id], l, r) {
+                            Some((v, x, w)) => vm_store(&mut self.vm_regs[d], v, x, w, false),
+                            None => {
+                                self.vm_regs[d] = self.signal_table[*sig_id].range_select(l, r)
+                            }
                         }
                     }
                 }
@@ -27606,8 +27752,15 @@ impl Simulator {
                 }
                 Insn::NbaAssignRangeDyn(sig_id, hi_reg, lo_reg, val_reg) => {
                     let sig_id = &(*sig_id as usize);
-                    let hi = self.vm_regs[*hi_reg as usize].to_u64().unwrap_or(0) as u32;
-                    let lo = self.vm_regs[*lo_reg as usize].to_u64().unwrap_or(0) as u32;
+                    // §11.5.1: an x/z bound discards the write.
+                    let (Some(hi), Some(lo)) = (
+                        self.vm_regs[*hi_reg as usize].to_index(),
+                        self.vm_regs[*lo_reg as usize].to_index(),
+                    ) else {
+                        pc += 1;
+                        continue;
+                    };
+                    let (hi, lo) = (hi as u32, lo as u32);
                     let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
                     let w = high - low + 1;
                     let val = self.vm_regs[*val_reg as usize].resize(w);
@@ -27935,8 +28088,15 @@ impl Simulator {
                 }
                 Insn::BlockingAssignRangeDyn(sig_id, hi_reg, lo_reg, val_reg) => {
                     let sig_id = &(*sig_id as usize);
-                    let hi = self.vm_regs[*hi_reg as usize].to_u64().unwrap_or(0) as u32;
-                    let lo = self.vm_regs[*lo_reg as usize].to_u64().unwrap_or(0) as u32;
+                    // §11.5.1: an x/z bound discards the write.
+                    let (Some(hi), Some(lo)) = (
+                        self.vm_regs[*hi_reg as usize].to_index(),
+                        self.vm_regs[*lo_reg as usize].to_index(),
+                    ) else {
+                        pc += 1;
+                        continue;
+                    };
+                    let (hi, lo) = (hi as u32, lo as u32);
                     let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
                     let w = high - low + 1;
                     let val = self.vm_regs[*val_reg as usize].resize(w);
@@ -28094,7 +28254,11 @@ impl Simulator {
                     }
                 }
                 Insn::NbaAssignArray(array_name, idx_reg, val_reg, width) => {
-                    let idx = self.vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as i64;
+                    // §11.5.1: an x/z index selects no element: discarded.
+                    let Some(idx) = self.vm_regs[*idx_reg as usize].to_index() else {
+                        pc += 1;
+                        continue;
+                    };
                     if let Some(eid) = resolve_bytecode_array_elem(
                         array_name,
                         idx,
@@ -28133,7 +28297,11 @@ impl Simulator {
                     }
                 }
                 Insn::BlockingAssignArray(array_name, idx_reg, val_reg, width) => {
-                    let idx = self.vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as i64;
+                    // §11.5.1: an x/z index selects no element: discarded.
+                    let Some(idx) = self.vm_regs[*idx_reg as usize].to_index() else {
+                        pc += 1;
+                        continue;
+                    };
                     if let Some(eid) = resolve_bytecode_array_elem(
                         array_name,
                         idx,
@@ -28162,7 +28330,11 @@ impl Simulator {
                     }
                 }
                 Insn::NbaAssignArrayRange(array_name, idx_reg, hi_reg, lo_reg, val_reg) => {
-                    let idx = self.vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as i64;
+                    // §11.5.1: an x/z index selects no element: discarded.
+                    let Some(idx) = self.vm_regs[*idx_reg as usize].to_index() else {
+                        pc += 1;
+                        continue;
+                    };
                     if let Some(eid) = resolve_bytecode_array_elem(
                         array_name,
                         idx,
@@ -28271,7 +28443,11 @@ impl Simulator {
                     }
                 }
                 Insn::BlockingAssignArrayRange(array_name, idx_reg, hi_reg, lo_reg, val_reg) => {
-                    let idx = self.vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as i64;
+                    // §11.5.1: an x/z index selects no element: discarded.
+                    let Some(idx) = self.vm_regs[*idx_reg as usize].to_index() else {
+                        pc += 1;
+                        continue;
+                    };
                     if let Some(eid) = resolve_bytecode_array_elem(
                         array_name,
                         idx,
@@ -39447,6 +39623,7 @@ impl Simulator {
             Insn::BitSelect(..) => "BitSelect",
             Insn::BitSelectConst(..) => "BitSelectConst",
             Insn::RangeSelect(..) => "RangeSelect",
+            Insn::RangeSelectW(..) => "RangeSelectW",
             Insn::RangeSelectConst(..) => "RangeSelectConst",
             Insn::Concat(..) => "Concat",
             Insn::Replicate(..) => "Replicate",
@@ -52884,11 +53061,14 @@ impl Simulator {
         // label i targets internal bit (W-1)-i (LRM §7.4.1, §11.5.1).
         if let ExprKind::Ident(h) = &expr.kind {
             let nm = self.resolve_hier_name(h);
-            if let Some(w) = self.module.ascending_packed.get(&*nm).copied() {
+            if let Some((lo_l, hi_l)) = self.module.ascending_packed.get(&*nm).copied() {
                 if let Some(&id) = self.signal_name_to_id.get(nm.as_ref()) {
-                    let i = self.eval_expr(index).to_u64().unwrap_or(0) as u32;
-                    if i < w {
-                        let pos = (w - 1 - i) as usize;
+                    // §11.5.1: an x/z or out-of-range label writes nothing.
+                    let Some(i) = self.eval_expr(index).to_index() else {
+                        return false;
+                    };
+                    if i >= lo_l && i <= hi_l {
+                        let pos = (hi_l - i) as usize;
                         let mut cur = self.signal_table[id].clone();
                         let prev = cur.clone();
                         cur.set_bit(pos, val.get_bit(0));
@@ -53025,7 +53205,9 @@ impl Simulator {
                     let elem = format!("{}[{}]", name, i);
                     if let Some(&id) = self.signal_name_to_id.get(elem.as_str()) {
                         let w = self.signal_widths[id];
-                        let raw = self.eval_expr(index).to_i64().unwrap_or(-1);
+                        let Some(raw) = self.eval_expr(index).to_index() else {
+                            return false; // §11.5.1: x/z index writes nothing
+                        };
                         // Handle only the plain 0-based case here; a
                         // NEGATIVE or otherwise exotic packed label
                         // (`logic [-1:-5][31:0] d [-2:-4]`) falls
@@ -53033,8 +53215,8 @@ impl Simulator {
                         // paths below, which already resolve it.
                         // (Casting such a label to u32 overflowed.)
                         let pos = match self.module.ascending_packed.get(&*name).copied() {
-                            Some(aw) if raw >= 0 && (raw as u32) < aw => {
-                                Some(aw - 1 - raw as u32)
+                            Some((lo_l, hi_l)) if raw >= lo_l && raw <= hi_l => {
+                                Some((hi_l - raw) as u32)
                             }
                             Some(_) => None,
                             None if raw >= 0 => Some(raw as u32),
@@ -54799,7 +54981,14 @@ impl Simulator {
                 };
                 // The SOURCE bit for target bit `i` is `i - lsb_i`, which stays
                 // signed: with lsb_i = -1 the vector's bit 0 takes source bit 1.
-                let src_base = lsb_i;
+                let mut src_base = lsb_i;
+                let mut msb_i = msb_i;
+                // Ascending vector: the value's bit 0 lands on the select's
+                // LAST label, which is its LOWEST physical bit, so source
+                // bits count up from `phys_lo` — the same as a descending
+                // select. Kept for the partial-OOB case where the physical
+                // range is clamped: the loop needs the UNCLAMPED high end.
+                let mut asc_phys_hi: Option<i64> = None;
                 let l = li.max(0) as usize;
                 let r = ri.max(0) as usize;
                 let (mut msb, mut lsb) = (msb_i.max(0) as usize, lsb_i.max(0) as usize);
@@ -54853,17 +55042,29 @@ impl Simulator {
                 if !elem_scaled {
                     if let ExprKind::Ident(h) = &expr.kind {
                         let nm = self.resolve_hier_name(h);
-                        if let Some(w) = self.module.ascending_packed.get(&*nm).copied() {
-                            let top = w as usize - 1;
+                        if let Some((_, hi_l)) = self.module.ascending_packed.get(&*nm).copied() {
+                            // Labels were kept raw above (no low-bound offset
+                            // for ascending vectors); label p is physical bit
+                            // `high - p`, so the select's high label is its
+                            // LOW physical bit.
                             // The bounds reaching here are already resolved to a
                             // [msb:lsb] pair for every RangeKind, so one mapping
                             // serves the constant and indexed forms alike.
                             // Restricting it to the constant form wrote
                             // `aw[4 +: 4]` at the DESCENDING position.
-                            let (new_msb, new_lsb) =
-                                (top.saturating_sub(lsb), top.saturating_sub(msb));
-                            msb = new_msb;
-                            lsb = new_lsb;
+                            // A label past the LSB gives a NEGATIVE physical
+                            // low bit: keep it in `src_base` (the store loop
+                            // maps source bits from there, as for a negative
+                            // constant bound) and clamp only the loop bounds.
+                            // A label before the MSB overruns the width; the
+                            // loop's `min(width - 1)` drops those bits.
+                            let phys_lo = hi_l - msb_i;
+                            let phys_hi = hi_l - lsb_i;
+                            src_base = phys_lo;
+                            msb = phys_hi.max(0) as usize;
+                            lsb = phys_lo.max(0) as usize;
+                            msb_i = phys_hi;
+                            asc_phys_hi = Some(phys_hi);
                         }
                     } else if let Some((dl, dr)) = elem_ascending_dim {
                         // Ascending ELEMENT dim (`logic [0:23] a[0:0];
@@ -55038,6 +55239,21 @@ impl Simulator {
                     // nothing is written (the clamped msb/lsb would otherwise
                     // both read 0 and clobber the low bit).
                     if msb_i >= 0 && hi >= lsb {
+                        // Width of the SELECT in bits (unclamped), so a value
+                        // wider than the select is truncated to it before the
+                        // in-range bits are placed (§10.7 / §11.5.1).
+                        // Only for a plain vector: an element-scaled select
+                        // keeps its label-level `msb_i`/`src_base`, and its
+                        // value is already element-sized.
+                        let sel_w = if elem_scaled { 0 } else { (msb_i - src_base + 1).max(0) as u32 };
+                        let fitted;
+                        let val: &Value = if sel_w > 0 && val.width > sel_w {
+                            fitted = val.resize(sel_w);
+                            &fitted
+                        } else {
+                            val
+                        };
+                        let _ = asc_phys_hi;
                         for i in lsb..=hi {
                             let src = i as i64 - base;
                             if src < 0 {
@@ -61900,18 +62116,19 @@ impl Simulator {
                                 // `eval_expr`: that path routes multi-dim
                                 // packed reads back through this function, so
                                 // delegating recurses forever.
-                                if let Some(i) = self.eval_expr(index).to_u64() {
-                                    let base_v = self.eval_expr(expr);
-                                    if base_v.width as usize > ew as usize {
-                                        if let Some(lo) =
-                                            self.packed_elem_lsb(nm, i as i64, ew)
-                                        {
-                                            let hi = lo + ew as usize - 1;
-                                            if hi < base_v.width as usize {
-                                                return base_v.range_select(hi, lo);
+                                let base_v = self.eval_expr(expr);
+                                if base_v.width as usize > ew as usize {
+                                    // §11.5.1: an x/z or out-of-range element
+                                    // index reads a whole-x element.
+                                    return match self.eval_expr(index).to_index() {
+                                        Some(i) => match self.packed_elem_lsb(nm, i, ew) {
+                                            Some(lo) if lo + ew as usize <= base_v.width as usize => {
+                                                base_v.range_select(lo + ew as usize - 1, lo)
                                             }
-                                        }
-                                    }
+                                            _ => Value::new(ew),
+                                        },
+                                        None => Value::new(ew),
+                                    };
                                 }
                             }
                         }
@@ -62084,12 +62301,13 @@ impl Simulator {
                 // (LRM §7.4.1, §11.5.1). Whole-value storage is normal.
                 if let ExprKind::Ident(h) = &expr.kind {
                     let nm = base_nm.as_deref().unwrap_or("");
-                    if let Some(w) = self.module.ascending_packed.get(nm).copied() {
-                        let i = self.eval_expr(index).to_u64().unwrap_or(0) as u32;
-                        let sig = self.eval_expr(expr);
-                        if i < w {
-                            let pos = (w - 1 - i) as usize;
-                            return sig.range_select(pos, pos);
+                    if let Some((lo_l, hi_l)) = self.module.ascending_packed.get(nm).copied() {
+                        // §11.5.1: unknown or out-of-range label reads x.
+                        if let Some(i) = self.eval_expr(index).to_index() {
+                            if i >= lo_l && i <= hi_l {
+                                let pos = (hi_l - i) as usize;
+                                return self.eval_expr(expr).range_select(pos, pos);
+                            }
                         }
                         return Value::new(1);
                     }
@@ -62098,7 +62316,10 @@ impl Simulator {
                 // (e.g. `instr_category[cat][i]`). The base `assoc[key]` maps to
                 // a compound queue name; read its `[i]` element.
                 if let Some(cn) = self.nested_index_name(expr) {
-                    let i = self.eval_expr(index).to_u64().unwrap_or(0);
+                    // §11.5.1: an x/z index reads x.
+                    let Some(i) = self.eval_expr(index).to_index() else {
+                        return Value::new(ctx_width.max(1));
+                    };
                     return self
                         .get_signal_value_by_name(&format!("{}[{}]", cn, i))
                         .unwrap_or_else(|| Value::zero(32));
@@ -62116,6 +62337,13 @@ impl Simulator {
                     let idx_val = self.eval_expr(index);
                     if is_dyn {
                         self.dollar_bound.pop();
+                    }
+                    // §11.5.1: an x/z index into a queue or dynamic array
+                    // reads an all-x element (an associative array's key may
+                    // legitimately carry x bits, so it is left alone).
+                    if !self.is_associative_array(&an) && idx_val.has_xz() && !idx_val.is_real {
+                        let ew = self.assoc_elem_width(&an).unwrap_or(ctx_width.max(1));
+                        return Value::new(ew.max(1));
                     }
                     let idx_str = self.assoc_key_str(&an, &idx_val);
                     let elem_name = format!("{}[{}]", an, idx_str);
@@ -62186,8 +62414,14 @@ impl Simulator {
                             }
                         }
                         if self.module.arrays_2d.contains_key(&*name) {
-                            let i = self.eval_expr(inner_idx).to_u64().unwrap_or(0) as i64;
-                            let j = self.eval_expr(index).to_u64().unwrap_or(0) as i64;
+                            // §11.5.1: an x/z index reads an all-x element.
+                            let (Some(i), Some(j)) = (
+                                self.eval_expr(inner_idx).to_index(),
+                                self.eval_expr(index).to_index(),
+                            ) else {
+                                let ew = self.module.arrays_2d.get(&*name).map(|d| d.2).unwrap_or(ctx_width.max(1));
+                                return Value::new(ew.max(1));
+                            };
                             let elem_name = format!("{}[{}][{}]", name, i, j);
                             if let Some(&eid) = self.signal_name_to_id.get(elem_name.as_str()) {
                                 let mut v = self.signal_table[eid].clone();
@@ -62341,7 +62575,11 @@ impl Simulator {
                                 self.array_first_id.get(name.as_ref())
                             {
                                 // §7.4.6: SIGNED index — negative-lo arrays.
-                                let idx = idx_val.to_i64().unwrap_or(0);
+                                // §11.5.1: an x/z index reads an all-x element.
+                                let Some(idx) = idx_val.to_index() else {
+                                    let ew = self.module.arrays.get(&*name).map(|a| a.2).unwrap_or(ctx_width.max(1));
+                                    return Value::new(ew.max(1));
+                                };
                                 if idx >= lo && idx <= hi {
                                     let eid = first_id + (idx - lo) as usize;
                                     // Packed-arena cell: no signal_table slot
@@ -62653,7 +62891,18 @@ impl Simulator {
                         if !self.signal_name_to_id.contains_key(base.as_ref())
                             && !self.signals.contains_key(&*base)
                         {
-                            let i = self.eval_expr(index).to_i64().unwrap_or(0);
+                            // §11.5.1: an x/z index reads an all-x element,
+                            // sized from the array's element width.
+                            let Some(i) = self.eval_expr(index).to_index() else {
+                                let ew = self
+                                    .module
+                                    .arrays
+                                    .get(base.as_ref())
+                                    .map(|a| a.2)
+                                    .or_else(|| self.assoc_elem_width(base.as_ref()))
+                                    .unwrap_or(ctx_width.max(1));
+                                return Value::new(ew.max(1));
+                            };
                             let elem = format!("{}[{}]", base, i);
                             if let Some(v) = self.get_signal_value_by_name(&elem) {
                                 return v;
@@ -62668,14 +62917,22 @@ impl Simulator {
                         if let Some(&(dl, dr)) = dims.first() {
                             let lo_b = dl.min(dr);
                             if lo_b != 0 {
-                                let idx = self.eval_expr(index).to_i64().unwrap_or(0) - lo_b;
-                                return self.eval_expr(expr).bit_select(idx.max(0) as usize);
+                                // §11.5.1: below the declared low bound (or an
+                                // x/z index) reads x, not the low bit.
+                                return match self.eval_expr(index).to_index() {
+                                    Some(i) if i >= lo_b => {
+                                        self.eval_expr(expr).bit_select((i - lo_b) as usize)
+                                    }
+                                    _ => Value::new(1),
+                                };
                             }
                         }
                     }
                 }
-                self.eval_expr(expr)
-                    .bit_select(self.eval_expr(index).to_u64().unwrap_or(0) as usize)
+                match self.eval_expr(index).to_index() {
+                    Some(i) if i >= 0 => self.eval_expr(expr).bit_select(i as usize),
+                    _ => Value::new(1),
+                }
             }
             ExprKind::RangeSelect {
                 expr,
@@ -62776,10 +63033,10 @@ impl Simulator {
                             };
                             let lsb_l = lsb_of(l);
                             let lsb_r = lsb_of(r);
-                            let lo = lsb_l.min(lsb_r).max(0) as usize;
-                            let hi = (lsb_l.max(lsb_r) + elem_w as i64 - 1).max(0) as usize;
+                            let lo = lsb_l.min(lsb_r);
+                            let hi = lsb_l.max(lsb_r) + elem_w as i64 - 1;
                             let base_v = self.eval_expr(expr);
-                            return base_v.range_select(hi, lo);
+                            return oob_range_select(&base_v, hi, lo);
                         }
                     }
                 }
@@ -62788,34 +63045,34 @@ impl Simulator {
                 // [(W-1)-a : (W-1)-b] (LRM §7.4.1, §11.5.1).
                 if let ExprKind::Ident(h) = &expr.kind {
                     let nm = self.resolve_hier_name(h);
-                    if let Some(w) = self.module.ascending_packed.get(&*nm).copied() {
-                        if matches!(kind, RangeKind::Constant) {
-                            let a = self.eval_expr(left).to_u64().unwrap_or(0) as u32;
-                            let b = self.eval_expr(right).to_u64().unwrap_or(0) as u32;
-                            let base = self.eval_expr(expr);
-                            let hi = (w - 1).saturating_sub(a.min(b)) as usize;
-                            let lo = (w - 1).saturating_sub(a.max(b)) as usize;
-                            return base.range_select(hi, lo);
-                        }
+                    if let Some((_, hi_l)) = self.module.ascending_packed.get(&*nm).copied() {
+                        // Label p is physical bit `high - p`. Every position
+                        // outside the declared range reads x (§11.5.1), which
+                        // `range_select_signed` does per bit; an x/z bound
+                        // makes the whole select x.
+                        let base = self.eval_expr(expr);
+                        let (av, bv) = (self.eval_expr(left), self.eval_expr(right));
+                        let (Some(a), Some(b)) = (av.to_index(), bv.to_index()) else {
+                            let n = match kind {
+                                RangeKind::Constant => 1,
+                                _ => bv.to_u64().unwrap_or(1).max(1),
+                            };
+                            return Value::new(n as u32);
+                        };
+                        let (hi, lo) = match kind {
+                            RangeKind::Constant => (hi_l - a.min(b), hi_l - a.max(b)),
+                            RangeKind::IndexedUp => (hi_l - a, hi_l - a - (b - 1)),
+                            RangeKind::IndexedDown => (hi_l - a + (b - 1), hi_l - a),
+                        };
+                        return oob_range_select(&base, hi, lo);
+                        #[allow(unreachable_code)]
+                        {
                         // §11.5.1: the INDEXED forms need the same mapping. Only
                         // the constant form was remapped, so `av[4 +: 4]` on a
                         // `logic [0:15]` read the bits a DESCENDING vector would
                         // have — the labels run from the MSB end, and a bit
                         // select on the same vector already honoured that, so
                         // the two disagreed about what `av[4]` meant.
-                        let a = self.eval_expr(left).to_i64().unwrap_or(0);
-                        let n = self.eval_expr(right).to_i64().unwrap_or(0);
-                        if n > 0 {
-                            let top = w as i64 - 1;
-                            let (hi, lo) = match kind {
-                                RangeKind::IndexedUp => (top - a, top - a - (n - 1)),
-                                RangeKind::IndexedDown => (top - a + (n - 1), top - a),
-                                RangeKind::Constant => unreachable!(),
-                            };
-                            if lo >= 0 && hi < w as i64 {
-                                let base = self.eval_expr(expr);
-                                return base.range_select(hi as usize, lo as usize);
-                            }
                         }
                     }
                 }
@@ -62834,8 +63091,16 @@ impl Simulator {
                 // `[base +: W]` / `[base -: W]` the right operand is a WIDTH,
                 // not an index, so it is not shifted — only the constant
                 // `[msb:lsb]` form has two indices (LRM §7.4.1 / §11.5.1).
-                let mut li = self.eval_expr(left).to_i64().unwrap_or(0);
-                let mut ri = self.eval_expr(right).to_i64().unwrap_or(0);
+                let (li_v, ri_v) = (self.eval_expr(left), self.eval_expr(right));
+                let (Some(mut li), Some(mut ri)) = (li_v.to_index(), ri_v.to_index()) else {
+                    // §11.5.1: an x/z bound selects nothing: the whole
+                    // select reads x at the select's width.
+                    let n = match kind {
+                        RangeKind::Constant => 1,
+                        _ => ri_v.to_u64().unwrap_or(1).max(1),
+                    };
+                    return Value::new(n as u32);
+                };
                 // Plain packed vector: the declared lower bound offsets the
                 // labels (`logic [7:4] v; v[6:5]` → storage bits [2:1]),
                 // mirroring the WRITE path. Ascending plain vectors were
@@ -62884,10 +63149,7 @@ impl Simulator {
                                 phys_lo = dr - li;
                             }
                         }
-                        if phys_lo >= 0 && phys_hi >= phys_lo {
-                            return base.range_select(phys_hi as usize, phys_lo as usize);
-                        }
-                        return base.range_select_signed(phys_hi, phys_lo);
+                        return oob_range_select(&base, phys_hi, phys_lo);
                     }
                     let lo_b = dr.min(dl);
                     if lo_b != 0 {
@@ -62902,30 +63164,17 @@ impl Simulator {
 
                 match kind {
                     RangeKind::Constant => {
-                        if li >= 0 && ri >= 0 {
-                            base.range_select(l, r)
-                        } else {
-                            base.range_select_signed(li.max(ri), li.min(ri))
-                        }
+                        let _ = (l, r);
+                        oob_range_select(&base, li.max(ri), li.min(ri))
                     }
-                    RangeKind::IndexedUp => {
-                        if li >= 0 {
-                            base.range_select(l + r - 1, l)
-                        } else {
-                            base.range_select_signed(li + ri - 1, li)
-                        }
-                    }
+                    RangeKind::IndexedUp => oob_range_select(&base, li + ri - 1, li),
                     RangeKind::IndexedDown => {
                         // §11.5.1: `[l -: r]` selects r bits down from l. When
                         // `l < r-1` the low bound is negative — those bits read
                         // x, and saturating to 0 would drop them AND shrink the
                         // width. Use the signed-bound select in that case.
-                        let lo_signed = l as i64 - (r as i64 - 1);
-                        if lo_signed >= 0 {
-                            base.range_select(l, lo_signed as usize)
-                        } else {
-                            base.range_select_signed(l as i64, lo_signed)
-                        }
+                        let lo_signed = li - (ri - 1);
+                        oob_range_select(&base, li, lo_signed)
                     }
                 }
             }
