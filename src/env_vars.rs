@@ -173,6 +173,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_PERLP_AFTER", "Per-LP settle: activate after N ticks"),
     ("XEZIM_PERLP_SETTLE", "Per-LP settle: enable per-logical-partition settle state (0/1)"),
     ("XEZIM_PERLP_SHADOW", "Per-LP settle: shadow-compare against canonical settle"),
+    ("XEZIM_PLACE_DBG", "Layout: print the placement pre-pass's name-graph coverage (names linked, edges)"),
     ("XEZIM_PLACE_SIGNALS", "Layout: 1 orders scalar signal ids by a source-order comb walk (opt-in; measured negative on c906, kept for placement experiments)"),
     ("XEZIM_PREFETCH_DIST", "Settle worklist: entry-array prefetch distance (default 8, 0 disables)"),
     ("XEZIM_PREFETCH_MODE", "Settle: worklist prefetch target — 0 entry table (default), 1 two-state header, 2 header + stream"),
