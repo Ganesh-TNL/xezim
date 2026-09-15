@@ -179,6 +179,10 @@ and testbench flows. Portable code should not rely on them.
 
 **Performance** (instruction counts, output identical)
 
+* Two- and three-part concatenations on the two-state fast path carry their
+  operands in the instruction, and the settle loop prefetches the header of
+  the next injected entry. C906 memcpy at 300 iterations: 2 % fewer cycles
+  across both changes, output identical.
 * A testbench loop that writes a memory through an absolute hierarchical
   path (`tb.x_soc.<...>.ram0.mem[i][7:0] = ...`) now compiles to bytecode
   like a local-array store. The XuanTie C910 and C906 memory-image loops
