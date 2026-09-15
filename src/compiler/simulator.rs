@@ -28858,6 +28858,7 @@ impl Simulator {
         let mut writes: HashSet<String> = HashSet::default();
         let mut ca_compile_fail: HashMap<&'static str, usize> = HashMap::default();
         let mut ca_compile_fail_samples = 0usize;
+        let cont_loop_t0 = std::time::Instant::now();
         for ca in cas
             .into_iter()
             .chain({
@@ -29734,6 +29735,13 @@ impl Simulator {
         // standard latch behaviour). Symptom of missing this: cv32e40p's
         // `cv32e40p_sim_clock_gate` clk_en stayed X, so the gated core
         // clock never propagated and the controller FSM never advanced.
+        if std::env::var("XEZIM_COMPILE_PHASES").is_ok() {
+            eprintln!(
+                "[COMPILE-PHASE]   cont-assign compile loop: {:.1}ms ({} assigns)",
+                cont_loop_t0.elapsed().as_secs_f64() * 1000.0,
+                entries.len()
+            );
+        }
         for ab in &self.module.always_blocks {
             if matches!(
                 ab.kind,
