@@ -21731,6 +21731,24 @@ impl Simulator {
                     }
                     regs[op.s as usize] = v;
                 }
+                TsInsn::ElemStoreNbaFromSig(f) => {
+                    // Data straight from the source signal's planes; x/z bits
+                    // are queued as a 4-state value (see the variant's doc).
+                    let op = &f.op;
+                    let (sv, sx) = self.signal_table[f.sig as usize].raw_bits();
+                    regs[f.dl as usize] = sv;
+                    let i = regs[op.idx as usize] as i64;
+                    if i >= op.lo && i <= op.hi {
+                        let eid = op.first as usize + (i - op.lo) as usize;
+                        if sx & op.mask != 0 {
+                            let mut v = Value::from_inline(sv & op.mask, sx & op.mask, op.w.max(1));
+                            v.is_signed = false;
+                            self.ts_store_nba_val(eid, v);
+                        } else {
+                            self.ts_store_nba(eid, sv & op.mask, op.w);
+                        }
+                    }
+                }
                 TsInsn::ElemStoreNba(op) => {
                     let (first, lo, hi, idx, s, w, mask) =
                         (op.first, op.lo, op.hi, op.idx, op.s, op.w, op.mask);
@@ -22456,6 +22474,24 @@ impl Simulator {
                         return false;
                     }
                     r!(op.s) = v;
+                }
+                TsInsn::ElemStoreNbaFromSig(f) => {
+                    // Data straight from the source signal's planes; x/z bits
+                    // are queued as a 4-state value (see the variant's doc).
+                    let op = &f.op;
+                    let (sv, sx) = self.signal_table[f.sig as usize].raw_bits();
+                    r!(f.dl) = sv;
+                    let i = r!(op.idx) as i64;
+                    if i >= op.lo && i <= op.hi {
+                        let eid = op.first as usize + (i - op.lo) as usize;
+                        if sx & op.mask != 0 {
+                            let mut v = Value::from_inline(sv & op.mask, sx & op.mask, op.w.max(1));
+                            v.is_signed = false;
+                            self.ts_store_nba_val(eid, v);
+                        } else {
+                            self.ts_store_nba(eid, sv & op.mask, op.w);
+                        }
+                    }
                 }
                 TsInsn::ElemStoreNba(op) => {
                     let i = r!(op.idx) as i64;
@@ -23496,6 +23532,24 @@ impl Simulator {
                         return false;
                     }
                     (*rp.add(op.s as usize)) = v;
+                }
+                TsInsn::ElemStoreNbaFromSig(f) => {
+                    // Data straight from the source signal's planes; x/z bits
+                    // are queued as a 4-state value (see the variant's doc).
+                    let op = &f.op;
+                    let (sv, sx) = self.signal_table[f.sig as usize].raw_bits();
+                    (*rp.add(f.dl as usize)) = sv;
+                    let i = (*rp.add(op.idx as usize)) as i64;
+                    if i >= op.lo && i <= op.hi {
+                        let eid = op.first as usize + (i - op.lo) as usize;
+                        if sx & op.mask != 0 {
+                            let mut v = Value::from_inline(sv & op.mask, sx & op.mask, op.w.max(1));
+                            v.is_signed = false;
+                            self.ts_store_nba_val(eid, v);
+                        } else {
+                            self.ts_store_nba(eid, sv & op.mask, op.w);
+                        }
+                    }
                 }
                 TsInsn::ElemStoreNba(op) => {
                     let i = (*rp.add(op.idx as usize)) as i64;

@@ -83,6 +83,7 @@ pub mod enabled {
             T::LoadSigBrNz { .. } | T::BrFalseLoadSig { .. } | T::EqBrFalse { .. } => return None,
             T::Concat2 { d, a, wa, b, wb } => vec![T::Concat { d: *d, parts: vec![(*a, *wa), (*b, *wb)].into_boxed_slice() }],
             T::Concat3 { d, a, wa, b, wb, c, wc } => vec![T::Concat { d: *d, parts: vec![(*a, *wa), (*b, *wb), (*c, *wc)].into_boxed_slice() }],
+            T::ElemStoreNbaFromSig(f) => vec![T::LoadSig { d: f.dl, sig: f.sig }, T::ElemStoreNba(Box::new(f.op.clone()))],
             other => vec![other.clone()],
         })
     }

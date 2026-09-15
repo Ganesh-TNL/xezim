@@ -12816,6 +12816,13 @@ mod tests {
 /// bytes (the `i64` bounds pair alone would push every instruction to 40
 /// bytes and cost measurable dispatch bandwidth on long comb streams).
 #[derive(Debug, Clone)]
+pub struct TsElemStoreFromSig {
+    pub sig: u32,
+    pub dl: u16,
+    pub op: TsElemOp,
+}
+
+#[derive(Debug, Clone)]
 pub struct TsElemOp {
     pub first: u32,
     pub lo: i64,
@@ -13069,6 +13076,13 @@ pub enum TsInsn {
     /// silently (4-state behavior); otherwise mirrors the NbaAssignArray
     /// arm (elide-if-equal, then index+push).
     ElemStoreNba(Box<TsElemOp>),
+    /// `LoadSig { d } ; ElemStoreNba { s: d }` fused: the data comes straight
+    /// from the source signal's planes, and x/z bits are QUEUED as a 4-state
+    /// value instead of bailing the block (a RAM written with x data — the
+    /// image-load phase, uninitialised words — fired that bail on every
+    /// clock edge: c906 1.7M x-read bails per 100 iterations from the
+    /// `if (we) mem[a] <= d` blocks). `d` is still written for later readers.
+    ElemStoreNbaFromSig(Box<TsElemStoreFromSig>),
     /// Dynamic array-element blocking write; out-of-range drops silently.
     ElemStore(Box<TsElemOp>),
     /// Fused array-read-to-NBA (`q <= mem[raddr]`, NbaAssignArrayRead):
@@ -13439,8 +13453,42 @@ fn fuse_ts_pairs(out: &mut Vec<TsInsn>) {
     let mut any = false;
     while i < n {
         new_of[i] = fused.len() as u32;
+        // Three-instruction form: `LoadSig(data) ; LoadSig(index) ;
+        // ElemStoreNba { s: data, idx: index }` (the lowering emits the data
+        // load first). The data load folds into the x-tolerant
+        // `ElemStoreNbaFromSig`; the index load stays. Checked before the
+        // pair rules so the two-load merge does not pre-empt it.
+        if i + 2 < n && !is_tgt[i + 1] && !is_tgt[i + 2] {
+            if let (
+                TsInsn::LoadSig { d: d1, sig: sig1 },
+                TsInsn::LoadSig { d: d2, sig: sig2 },
+                TsInsn::ElemStoreNba(op),
+            ) = (&out[i], &out[i + 1], &out[i + 2])
+            {
+                if op.s == *d1 && op.idx == *d2 {
+                    new_of[i + 1] = fused.len() as u32;
+                    fused.push(TsInsn::LoadSig { d: *d2, sig: *sig2 });
+                    new_of[i + 2] = fused.len() as u32;
+                    fused.push(TsInsn::ElemStoreNbaFromSig(Box::new(TsElemStoreFromSig {
+                        sig: *sig1,
+                        dl: *d1,
+                        op: (**op).clone(),
+                    })));
+                    any = true;
+                    i += 3;
+                    continue;
+                }
+            }
+        }
         let f = if i + 1 < n && !is_tgt[i + 1] {
             match (&out[i], &out[i + 1]) {
+                (TsInsn::LoadSig { d: dl, sig }, TsInsn::ElemStoreNba(op)) if op.s == *dl => {
+                    Some(TsInsn::ElemStoreNbaFromSig(Box::new(TsElemStoreFromSig {
+                        sig: *sig,
+                        dl: *dl,
+                        op: (**op).clone(),
+                    })))
+                }
                 (TsInsn::LoadSig { d: dl, sig }, TsInsn::LogNot { d, s }) if s == dl => {
                     Some(TsInsn::LoadSigNot { dl: *dl, d: *d, sig: *sig })
                 }
@@ -15121,6 +15169,7 @@ pub fn lower_two_state(
                     | TsInsn::RangeStoreXW(..)
                     | TsInsn::ElemStore { .. }
                     | TsInsn::ElemStoreNba { .. }
+                    | TsInsn::ElemStoreNbaFromSig { .. }
                     | TsInsn::NbaFromElem { .. }
                     | TsInsn::WStore { .. }
                     | TsInsn::WStoreNba { .. }
@@ -15197,6 +15246,10 @@ pub fn lower_two_state(
             | TsInsn::WStore { sig, .. }
             | TsInsn::WStoreNba { sig, .. } => writes.push(*sig),
             TsInsn::NbaFromElem(op) => writes.push(op.dst),
+            TsInsn::ElemStoreNbaFromSig(f) => {
+                let op = &f.op;
+                writes_span.push((op.first, (op.hi - op.lo + 1).max(0) as u32));
+            }
             TsInsn::ElemStore(op) | TsInsn::ElemStoreNba(op) => {
                 if op.hi >= op.lo {
                     writes_span.push((op.first, (op.hi - op.lo + 1) as u32));
