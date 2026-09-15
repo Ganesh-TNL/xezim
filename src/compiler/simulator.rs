@@ -7398,6 +7398,22 @@ impl Simulator {
         }
         names.sort();
         names.dedup();
+        // Signal placement (`XEZIM_PLACE_SIGNALS=1`, opt-in; measured NEGATIVE
+        // on c906 memcpy: L2 misses +1.1%, cycles +0.35% — the greedy
+        // source-order walk scatters declaration-adjacent bus bits more than
+        // it gathers operands; a locality-preserving order over the real
+        // entry graph is the form still to try): reorder the
+        // scalar names so that the operands of a continuous assign or always
+        // block get ids next to the signals it writes. Ids are handed out in
+        // this order below, and every per-signal table follows the id, so an
+        // entry's operands then share cache lines instead of sitting at
+        // declaration-order distance (c906: median per-entry operand span 299
+        // ids, 71% of operands are other entries' outputs; the run is
+        // L2-miss bound at ~23 misses per evaluation). Arrays keep their own
+        // contiguous element ids (allocated separately below).
+        if std::env::var("XEZIM_PLACE_SIGNALS").ok().as_deref() == Some("1") {
+            names = Self::place_signal_names(&module, names);
+        }
         let names_ms = phase_names.elapsed().as_secs_f64() * 1000.0;
 
         // §26.3: package-scope names that MORE THAN ONE package declares. Such
@@ -50312,6 +50328,177 @@ impl Simulator {
             n_blocks,
             path
         );
+    }
+
+    /// Comb-graph signal placement: see the call site in `new`. Pure name
+    /// reordering; `names` is sorted and deduplicated on entry and the
+    /// result is a permutation of it.
+    fn place_signal_names(module: &ElaboratedModule, names: Vec<String>) -> Vec<String> {
+        use crate::ast::expr::{ExprKind, Expression};
+        use crate::ast::stmt::{Statement, StatementKind};
+        fn expr_names(e: &Expression, module: &ElaboratedModule, out: &mut Vec<String>) {
+            match &e.kind {
+                ExprKind::Ident(h) => out.push(Simulator::resolve_hier_name_static(h, module)),
+                ExprKind::Unary { operand, .. } => expr_names(operand, module, out),
+                ExprKind::Binary { left, right, .. } => {
+                    expr_names(left, module, out);
+                    expr_names(right, module, out);
+                }
+                ExprKind::Conditional { condition, then_expr, else_expr } => {
+                    expr_names(condition, module, out);
+                    expr_names(then_expr, module, out);
+                    expr_names(else_expr, module, out);
+                }
+                ExprKind::Concatenation(v) => v.iter().for_each(|x| expr_names(x, module, out)),
+                ExprKind::Replication { count, exprs } => {
+                    expr_names(count, module, out);
+                    exprs.iter().for_each(|x| expr_names(x, module, out));
+                }
+                ExprKind::Call { func, args } => {
+                    expr_names(func, module, out);
+                    args.iter().for_each(|x| expr_names(x, module, out));
+                }
+                ExprKind::SystemCall { args, .. } => args.iter().for_each(|x| expr_names(x, module, out)),
+                ExprKind::Inside { expr, ranges } => {
+                    expr_names(expr, module, out);
+                    ranges.iter().for_each(|x| expr_names(x, module, out));
+                }
+                ExprKind::MemberAccess { expr, .. } => expr_names(expr, module, out),
+                ExprKind::Index { expr, index } => {
+                    expr_names(expr, module, out);
+                    expr_names(index, module, out);
+                }
+                ExprKind::RangeSelect { expr, left, right, .. } => {
+                    expr_names(expr, module, out);
+                    expr_names(left, module, out);
+                    expr_names(right, module, out);
+                }
+                ExprKind::Range(a, b) => {
+                    expr_names(a, module, out);
+                    expr_names(b, module, out);
+                }
+                ExprKind::Paren(x) => expr_names(x, module, out),
+                _ => {}
+            }
+        }
+        fn stmt_names(
+            st: &Statement,
+            module: &ElaboratedModule,
+            reads: &mut Vec<String>,
+            writes: &mut Vec<String>,
+        ) {
+            match &st.kind {
+                StatementKind::BlockingAssign { lvalue, rvalue }
+                | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
+                    expr_names(rvalue, module, reads);
+                    // Index/select operands of the target are reads too.
+                    let mut lhs = Vec::new();
+                    expr_names(lvalue, module, &mut lhs);
+                    if let Some(first) = lhs.first() {
+                        writes.push(first.clone());
+                    }
+                    reads.extend(lhs.into_iter().skip(1));
+                }
+                StatementKind::If { condition, then_stmt, else_stmt, .. } => {
+                    expr_names(condition, module, reads);
+                    stmt_names(then_stmt, module, reads, writes);
+                    if let Some(e) = else_stmt {
+                        stmt_names(e, module, reads, writes);
+                    }
+                }
+                StatementKind::Case { expr, items, .. } => {
+                    expr_names(expr, module, reads);
+                    for it in items {
+                        it.patterns.iter().for_each(|x| expr_names(x, module, reads));
+                        stmt_names(&it.stmt, module, reads, writes);
+                    }
+                }
+                StatementKind::For { condition, step, body, .. } => {
+                    if let Some(c) = condition {
+                        expr_names(c, module, reads);
+                    }
+                    step.iter().for_each(|x| expr_names(x, module, reads));
+                    stmt_names(body, module, reads, writes);
+                }
+                StatementKind::Foreach { array, body, .. } => {
+                    expr_names(array, module, reads);
+                    stmt_names(body, module, reads, writes);
+                }
+                StatementKind::While { condition, body } | StatementKind::DoWhile { body, condition } => {
+                    expr_names(condition, module, reads);
+                    stmt_names(body, module, reads, writes);
+                }
+                StatementKind::Repeat { count, body } => {
+                    expr_names(count, module, reads);
+                    stmt_names(body, module, reads, writes);
+                }
+                StatementKind::Forever { body } | StatementKind::ForeverTail { body } => {
+                    stmt_names(body, module, reads, writes)
+                }
+                StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                    stmts.iter().for_each(|x| stmt_names(x, module, reads, writes))
+                }
+                StatementKind::TimingControl { stmt, .. } => stmt_names(stmt, module, reads, writes),
+                _ => {}
+            }
+        }
+        let mut pos: HashMap<&str, usize> = HashMap::default();
+        for (i, n) in names.iter().enumerate() {
+            pos.insert(n.as_str(), i);
+        }
+        let n = names.len();
+        let mut placed = vec![false; n];
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        let mut reads: Vec<String> = Vec::new();
+        let mut writes: Vec<String> = Vec::new();
+        let mut place = |list: &[String], placed: &mut Vec<bool>, order: &mut Vec<usize>| {
+            for nm in list {
+                if let Some(&i) = pos.get(nm.as_str()) {
+                    if !placed[i] {
+                        placed[i] = true;
+                        order.push(i);
+                    }
+                }
+            }
+        };
+        for ca in &module.continuous_assigns {
+            reads.clear();
+            writes.clear();
+            expr_names(&ca.rhs, module, &mut reads);
+            let mut lhs = Vec::new();
+            expr_names(&ca.lhs, module, &mut lhs);
+            if let Some(first) = lhs.first() {
+                writes.push(first.clone());
+            }
+            reads.extend(lhs.into_iter().skip(1));
+            place(&reads, &mut placed, &mut order);
+            place(&writes, &mut placed, &mut order);
+        }
+        for ab in &module.always_blocks {
+            reads.clear();
+            writes.clear();
+            stmt_names(&ab.stmt, module, &mut reads, &mut writes);
+            place(&reads, &mut placed, &mut order);
+            place(&writes, &mut placed, &mut order);
+        }
+        for pa in &module.pending_always {
+            reads.clear();
+            writes.clear();
+            stmt_names(&pa.source, module, &mut reads, &mut writes);
+            place(&reads, &mut placed, &mut order);
+            place(&writes, &mut placed, &mut order);
+        }
+        for i in 0..n {
+            if !placed[i] {
+                order.push(i);
+            }
+        }
+        let mut names = names;
+        let mut out: Vec<String> = Vec::with_capacity(n);
+        for i in order {
+            out.push(std::mem::take(&mut names[i]));
+        }
+        out
     }
 
     fn build_gate_lane(&mut self) {
