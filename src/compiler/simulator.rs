@@ -28539,6 +28539,11 @@ impl Simulator {
                             if self.packed.set_raw(eid, cv, cx) {
                                 self.table_modified = true;
                             }
+                            // Advance past the store: `continue` without it
+                            // re-executed this instruction forever (the C906
+                            // testbench's memory-image loop never finished
+                            // with XEZIM_PACKED_MEM=1).
+                            pc += 1;
                             continue;
                         }
                         let sig_w = self.signal_widths[eid];
