@@ -114,6 +114,10 @@ and testbench flows. Portable code should not rely on them.
 
 **Correctness**
 
+* A constant part-select `[l:r]` whose bound is a variable is now an
+  elaboration error, as IEEE 1800 §11.5.1 requires; only `[base +: width]`
+  and `[base -: width]` take a variable base. Every engine previously read
+  the bound from the variable's current value.
 * Bit- and part-selects follow IEEE 1800 §11.5.1 in every engine: an
   index or bound with an x or z bit reads x and discards the write instead of
   using bit 0; a constant select below a vector's declared low bound reads x
