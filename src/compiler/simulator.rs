@@ -21750,7 +21750,20 @@ impl Simulator {
                     }
                 }
                 TsInsn::NbaFromElem(op) => {
-                    let (iv, _) = self.signal_table[op.idx_sig as usize].raw_bits();
+                    let (iv, ix) = self.signal_table[op.idx_sig as usize].raw_bits();
+                    if ix != 0 {
+                        // §11.5.1: an x/z index reads an all-x element. Queue
+                        // it as a 4-state value (the NBA queue holds Values)
+                        // instead of bailing the block: an idle RAM whose
+                        // address input holds x fired this bail on every
+                        // clock edge (c906: 1.7M x-read bails per 100
+                        // iterations, all from the 32 SPSRAM blocks).
+                        let mut v = Value::new(op.w.max(1));
+                        v.is_signed = false;
+                        self.ts_store_nba_val(op.dst as usize, v);
+                        pc += 1;
+                        continue;
+                    }
                     let i = iv as i64;
                     if i < op.lo || i > op.hi {
                         bail!();
@@ -22462,7 +22475,15 @@ impl Simulator {
                     }
                 }
                 TsInsn::NbaFromElem(op) => {
-                    let (iv, _) = self.signal_table[op.idx_sig as usize].raw_bits();
+                    let (iv, ix) = self.signal_table[op.idx_sig as usize].raw_bits();
+                    if ix != 0 {
+                        // §11.5.1: an x/z index reads an all-x element (see
+                        // the straight-line executor's arm).
+                        let mut v = Value::new(op.w.max(1));
+                        v.is_signed = false;
+                        self.ts_store_nba_val(op.dst as usize, v);
+                        continue;
+                    }
                     let i = iv as i64;
                     if i < op.lo || i > op.hi {
                         return false;
@@ -23494,7 +23515,16 @@ impl Simulator {
                     }
                 }
                 TsInsn::NbaFromElem(op) => {
-                    let (iv, _) = self.signal_table[op.idx_sig as usize].raw_bits();
+                    let (iv, ix) = self.signal_table[op.idx_sig as usize].raw_bits();
+                    if ix != 0 {
+                        // §11.5.1: an x/z index reads an all-x element (see
+                        // the straight-line executor's arm).
+                        let mut v = Value::new(op.w.max(1));
+                        v.is_signed = false;
+                        self.ts_store_nba_val(op.dst as usize, v);
+                        pc += 1;
+                        continue;
+                    }
                     let i = iv as i64;
                     if i < op.lo || i > op.hi {
                         return false;
@@ -25593,15 +25623,19 @@ impl Simulator {
                 // directly. The unresolved-element fallback reproduces
                 // `LoadArrayElem`'s 1-bit X exactly.
                 Insn::NbaAssignArrayRead(sig_id, array_name, idx_sig, width) => {
-                    let idx = signal_table[*idx_sig as usize].to_u64().unwrap_or(0) as i64;
-                    let val = match resolve_bytecode_array_elem(
-                        array_name,
-                        idx,
-                        array_first_id,
-                        signal_name_to_id,
-                    ) {
-                        Some(eid) => signal_table[eid].resize_for_assign(*width),
-                        None => Value::new(1).resize_for_assign(*width),
+                    // §11.5.1: an x/z index reads an all-x element (it used to
+                    // read element 0 through `to_u64`, which masks x to 0).
+                    let val = match signal_table[*idx_sig as usize].to_index() {
+                        None => Value::new((*width).max(1)),
+                        Some(idx) => match resolve_bytecode_array_elem(
+                            array_name,
+                            idx,
+                            array_first_id,
+                            signal_name_to_id,
+                        ) {
+                            Some(eid) => signal_table[eid].resize_for_assign(*width),
+                            None => Value::new(1).resize_for_assign(*width),
+                        },
                     };
                     let sig_id = &(*sig_id as usize);
                     // §10.4.2 last-write-wins: see the NbaAssign arm.
@@ -26332,15 +26366,18 @@ impl Simulator {
                 // Fused LoadSignal + LoadArrayElem + NbaAssign — see the
                 // `exec_insns_isolated` sibling; reads come from `view`.
                 Insn::NbaAssignArrayRead(sig_id, array_name, idx_sig, width) => {
-                    let idx = view[*idx_sig as usize].to_u64().unwrap_or(0) as i64;
-                    let val = match resolve_bytecode_array_elem(
-                        array_name,
-                        idx,
-                        array_first_id,
-                        signal_name_to_id,
-                    ) {
-                        Some(eid) => view[eid].resize_for_assign(*width),
-                        None => Value::new(1).resize_for_assign(*width),
+                    // §11.5.1: an x/z index reads an all-x element.
+                    let val = match view[*idx_sig as usize].to_index() {
+                        None => Value::new((*width).max(1)),
+                        Some(idx) => match resolve_bytecode_array_elem(
+                            array_name,
+                            idx,
+                            array_first_id,
+                            signal_name_to_id,
+                        ) {
+                            Some(eid) => view[eid].resize_for_assign(*width),
+                            None => Value::new(1).resize_for_assign(*width),
+                        },
                     };
                     let sig_id = &(*sig_id as usize);
                     if let Some(i) = if nba_dup {
@@ -27701,9 +27738,19 @@ impl Simulator {
                 // for signals whose inline bits are asserted equal to the
                 // canonical table cell, so reading the table is the same value.
                 Insn::NbaAssignArrayRead(sig_id, array_name, idx_sig, width) => {
-                    let idx = self.signal_table[*idx_sig as usize]
-                        .to_u64()
-                        .unwrap_or(0) as i64;
+                    // §11.5.1: an x/z index reads an all-x element.
+                    let Some(idx) = self.signal_table[*idx_sig as usize].to_index() else {
+                        let val = Value::new((*width).max(1));
+                        let sig_id = *sig_id as usize;
+                        if let Some(i) = self.nba_fast_index.get(sig_id) {
+                            self.nba_fast[i].value = val;
+                        } else if self.signal_table[sig_id] != val {
+                            self.nba_fast_index.insert(sig_id, self.nba_fast.len());
+                            self.nba_fast.push(NbaFast { block_index: 0, signal_id: sig_id, value: val });
+                        }
+                        pc += 1;
+                        continue;
+                    };
                     let val = match resolve_bytecode_array_elem(
                         array_name,
                         idx,

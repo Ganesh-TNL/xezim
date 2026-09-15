@@ -135,6 +135,8 @@ mod nonansi_function_args;
 mod nonzero_lsb_indexed_part_select;
 #[path = "misc/packed_mem_range_store.rs"]
 mod packed_mem_range_store;
+#[path = "misc/nba_array_read_x_index.rs"]
+mod nba_array_read_x_index;
 #[path = "misc/part_select_constant_bounds.rs"]
 mod part_select_constant_bounds;
 #[path = "misc/select_semantics_11_5_1.rs"]
