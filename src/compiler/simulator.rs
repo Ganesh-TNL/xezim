@@ -2698,6 +2698,10 @@ struct AssertionStat {
 /// statement tree compiles fallback-free (see `try_register_proc_fsm`).
 struct ProcFsm {
     compiled: super::bytecode::CompiledBlock,
+    /// Signal ids the body can write (sorted), or None when it has array
+    /// stores or AST fallbacks; lets `note_comb_ran_in_process` skip the
+    /// snapshot of comb outputs this process can never clobber.
+    writes: Option<Arc<[u32]>>,
     /// Event-control specs for WaitEdge insns, with the lazily resolved
     /// sensitivity cached after the first suspension.
     waits: Vec<(crate::ast::stmt::EventControl, Option<Vec<Sensitivity>>)>,
@@ -5172,6 +5176,15 @@ pub struct Simulator {
     cg_event_waiters: Vec<(usize, Vec<SensitivityId>)>,
     /// Swap buffer for event_waiters filtering (avoids allocation per cycle)
     event_waiters_swap: Vec<EventWaiter>,
+    /// Reused per tick: the triggered continuations of
+    /// `drain_triggered_event_waiters` and the clock generators' tree
+    /// roots were fresh Vecs on every tick, and `drain_deferred_comb`
+    /// hands its snapshot vectors back here for `note_comb_ran_in_process`.
+    triggered_conts_buf: Vec<(usize, ProcCont)>,
+    cg_tree_roots_buf: Vec<usize>,
+    deferred_comb_pool: Vec<Vec<(usize, Value)>>,
+    /// Write set of the process FSM currently executing (see `ProcFsm::writes`).
+    cur_fsm_writes: Option<Arc<[u32]>>,
     /// VCD dump state
     /// `--wave`: waveform dumping was requested for this run. Latched from the
     /// global at construction so the model is built consistently — an active
@@ -8937,6 +8950,10 @@ impl Simulator {
             fe_trusted_types: HashSet::default(),
             cg_event_waiters: Vec::new(),
             event_waiters_swap: Vec::new(),
+            triggered_conts_buf: Vec::new(),
+            cg_tree_roots_buf: Vec::new(),
+            deferred_comb_pool: Vec::new(),
+            cur_fsm_writes: None,
             wave: wave_enabled(),
             vcd_file: None,
             vcd_writer: None,
@@ -17671,7 +17688,8 @@ impl Simulator {
         // Collected inside the &mut borrow of `clock_generators`, printed
         // after it ends (the names live in `id_to_name`).
         let mut fired: Vec<(usize, u64)> = Vec::new();
-        let mut tree_roots: Vec<usize> = Vec::new();
+        let mut tree_roots = std::mem::take(&mut self.cg_tree_roots_buf);
+        tree_roots.clear();
         for cg in &mut self.clock_generators {
             if cg.next_toggle_time == self.time {
                 let w = self.signal_widths[cg.signal_id];
@@ -17727,11 +17745,12 @@ impl Simulator {
                 tree_roots.push(cg.signal_id);
             }
         }
-        for root in tree_roots {
+        for &root in tree_roots.iter() {
             if self.is_clock_tree_signal.get(root).copied().unwrap_or(false) {
                 self.eval_clock_tree(root);
             }
         }
+        self.cg_tree_roots_buf = tree_roots;
         for (sig, v) in fired {
             eprintln!(
                 "[sched] t={} | clockgen {} -> {}",
@@ -18889,6 +18908,7 @@ impl Simulator {
         self.proc_fsm.insert(
             pid,
             Box::new(ProcFsm {
+                writes: Self::compiled_block_write_ids(&cb).map(Arc::from),
                 compiled: cb,
                 waits,
                 pc: 0,
@@ -40986,26 +41006,97 @@ impl Simulator {
     /// away), so instead of reordering anything we simply detect the one case
     /// that inline evaluation gets wrong — the process later overwrote what the
     /// block computed — and re-run the block once the process suspends.
+    /// Signal ids a compiled process body can write (sorted, deduped), or
+    /// None when it holds array stores or AST fallbacks whose targets are
+    /// not visible here. NBA targets are included: a superset only keeps a
+    /// snapshot that was not needed.
+    fn compiled_block_write_ids(cb: &super::bytecode::CompiledBlock) -> Option<Vec<u32>> {
+        use super::bytecode::Insn;
+        let mut v: Vec<u32> = Vec::new();
+        for i in &cb.instructions {
+            match i {
+                Insn::BlockingAssign(id, ..)
+                | Insn::BlockingAssignString(id, _)
+                | Insn::BlockingAssignRange(id, ..)
+                | Insn::BlockingAssignRangeDyn(id, ..)
+                | Insn::BlockingAssignBitDyn(id, ..)
+                | Insn::NbaAssign(id, ..)
+                | Insn::NbaAssignConst(id, ..)
+                | Insn::NbaAssignRange(id, ..)
+                | Insn::NbaAssignRangeDyn(id, ..)
+                | Insn::NbaAssignBitDyn(id, ..)
+                | Insn::NbaAssignArrayRead(id, ..) => v.push(*id as u32),
+                Insn::StmtFallback(payload) => {
+                    // Output-only system tasks (the fallbacks the FSM gate
+                    // admits) write no signal; anything else is opaque.
+                    let out_only = match &payload.0.kind {
+                        StatementKind::Expr(e) => match &e.kind {
+                            ExprKind::SystemCall { name, .. } => matches!(
+                                name.as_str(),
+                                "$display" | "$displayb" | "$displayh" | "$displayo"
+                                    | "$write" | "$writeb" | "$writeh" | "$writeo"
+                                    | "$strobe" | "$monitor" | "$fdisplay" | "$fwrite"
+                                    | "$fstrobe" | "$finish" | "$stop" | "$info"
+                                    | "$warning" | "$error" | "$fatal"
+                            ),
+                            _ => false,
+                        },
+                        _ => false,
+                    };
+                    if !out_only {
+                        return None;
+                    }
+                }
+                Insn::NbaAssignArray(..)
+                | Insn::BlockingAssignArray(..)
+                | Insn::NbaAssignArrayRange(..)
+                | Insn::BlockingAssignArrayRange(..) => return None,
+                _ => {}
+            }
+        }
+        v.sort_unstable();
+        v.dedup();
+        Some(v)
+    }
+
     fn note_comb_ran_in_process(&mut self, eidx: usize, entry: &CombEntry) {
         if entry.cold.write_signal_ids.is_empty() {
             return;
         }
-        let snap: Vec<(usize, Value)> = entry
-            .cold
-            .write_signal_ids
-            .iter()
-            .filter(|id| **id < self.signal_table.len())
-            .map(|id| (*id, self.signal_table[*id].clone()))
-            .collect();
-        if snap.is_empty() {
-            return;
+        // A process can only clobber what it writes: an FSM with a known
+        // write set that misses every output of this entry needs no snapshot.
+        if let Some(w) = &self.cur_fsm_writes {
+            if !entry
+                .cold
+                .write_signal_ids
+                .iter()
+                .any(|id| w.binary_search(&(*id as u32)).is_ok())
+            {
+                return;
+            }
         }
         // Last write wins: a block that runs several times in one process only
-        // needs its most recent output compared.
-        if let Some(slot) = self.deferred_comb.iter_mut().find(|(e, _)| *e == eidx) {
-            slot.1 = snap;
-        } else {
-            self.deferred_comb.push((eidx, snap));
+        // needs its most recent output compared. The snapshot vector is a
+        // pooled one — a fresh allocation per comb entry per process run
+        // was 2% of a small clocked testbench.
+        let slot = match self.deferred_comb.iter().position(|(e, _)| *e == eidx) {
+            Some(i) => i,
+            None => {
+                let v = self.deferred_comb_pool.pop().unwrap_or_default();
+                self.deferred_comb.push((eidx, v));
+                self.deferred_comb.len() - 1
+            }
+        };
+        let snap = &mut self.deferred_comb[slot].1;
+        snap.clear();
+        for id in entry.cold.write_signal_ids.iter() {
+            if *id < self.signal_table.len() {
+                snap.push((*id, self.signal_table[*id].clone()));
+            }
+        }
+        if snap.is_empty() {
+            let (_, v) = self.deferred_comb.swap_remove(slot);
+            self.deferred_comb_pool.push(v);
         }
     }
 
@@ -41016,9 +41107,10 @@ impl Simulator {
         if self.deferred_comb.is_empty() {
             return;
         }
-        let pending = std::mem::take(&mut self.deferred_comb);
+        let mut pending = std::mem::take(&mut self.deferred_comb);
         let entries = std::mem::take(&mut self.comb_entries);
-        for (eidx, snap) in pending {
+        for (eidx, snap) in pending.iter() {
+            let eidx = *eidx;
             let Some(entry) = entries.get(eidx) else { continue };
             let clobbered = snap.iter().any(|(id, v)| {
                 self.signal_table.get(*id).is_some_and(|cur| cur != v)
@@ -41060,6 +41152,10 @@ impl Simulator {
             }
         }
         self.comb_entries = entries;
+        for (_, v) in pending.iter_mut() {
+            v.clear();
+        }
+        self.deferred_comb_pool.extend(pending.into_iter().map(|(_, v)| v));
     }
 
     /// §4.5 boundary: run the process, then let the ACTIVE-region work its
@@ -41644,6 +41740,7 @@ impl Simulator {
                     std::sync::atomic::Ordering::Relaxed,
                 );
             }
+            self.cur_fsm_writes = f.writes.clone();
             self.exec_insns(&f.compiled.instructions);
             if self.profile_report {
                 self.prof_cur
@@ -41690,6 +41787,7 @@ impl Simulator {
                 std::mem::swap(&mut self.vm_regs, &mut f.regs);
                 Self::recycle_string(&mut self.hint_string_pool, self.name_resolve_hint.replace(saved_hint.clone()));
                 self.settle_combinatorial();
+                self.cur_fsm_writes = None;
                 return;
             }
             f.pc = 0;
@@ -41705,7 +41803,10 @@ impl Simulator {
         std::mem::swap(&mut self.vm_regs, &mut f.regs);
         Self::recycle_string(&mut self.hint_string_pool, self.name_resolve_hint.replace(saved_hint));
         self.proc_fsm.insert(pid, f);
+        // The comb entries this process's writes trigger run in this settle;
+        // the write set stays visible to `note_comb_ran_in_process` until then.
         self.settle_combinatorial();
+        self.cur_fsm_writes = None;
     }
 
     fn run_fast_delay_always(&mut self, pid: usize) {
@@ -47114,11 +47215,13 @@ impl Simulator {
         if self.event_waiters.is_empty() {
             return Vec::new();
         }
-        let waiters = std::mem::take(&mut self.event_waiters);
+        let mut waiters = std::mem::take(&mut self.event_waiters);
         self.prof_waiter_iters += waiters.len() as u64;
-        self.event_waiters_swap.clear();
-        let mut triggered_conts: Vec<(usize, ProcCont)> = Vec::new();
-        for mut waiter in waiters {
+        let mut triggered_conts = std::mem::take(&mut self.triggered_conts_buf);
+        triggered_conts.clear();
+        // In place: a parked waiter that does not fire stays where it is
+        // (the old drain moved every waiter through a swap vector each tick).
+        waiters.retain_mut(|waiter| {
             let mut triggered = false;
             for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
                 let (pv, px) = waiter.captured_prev[i];
@@ -47167,11 +47270,13 @@ impl Simulator {
                     // Active region — defer the continuation past apply_nba +
                     // tick_clocking_blocks so it reads post-edge state and this
                     // cycle's clocking samples.
-                    self.deferred_clocking_conts
-                        .push((waiter.pid, waiter.continuation));
+                    let cont = std::mem::replace(&mut waiter.continuation, ProcCont::empty());
+                    self.deferred_clocking_conts.push((waiter.pid, cont));
                 } else {
-                    triggered_conts.push((waiter.pid, waiter.continuation));
+                    let cont = std::mem::replace(&mut waiter.continuation, ProcCont::empty());
+                    triggered_conts.push((waiter.pid, cont));
                 }
+                false
             } else {
                 // Refresh this waiter's `captured_prev` baseline to each
                 // sensitivity signal's CURRENT value so that a qualifying
@@ -47199,10 +47304,10 @@ impl Simulator {
                             Some(self.signal_table[sid.signal_id].clone());
                     }
                 }
-                self.event_waiters_swap.push(waiter);
+                true
             }
-        }
-        std::mem::swap(&mut self.event_waiters, &mut self.event_waiters_swap);
+        });
+        self.event_waiters = waiters;
         // Within-region process resumption order is LRM-indeterminate
         // (§4.7), but the reference simulator wakes the LAST-armed waiter
         // first — and this campaign matches the reference's observable
@@ -47210,6 +47315,15 @@ impl Simulator {
         // is FIFO; reverse to LIFO at the single hand-off point.
         triggered_conts.reverse();
         triggered_conts
+    }
+
+    /// Hand a consumed `drain_triggered_event_waiters` vector back for reuse.
+    #[inline]
+    fn recycle_conts(&mut self, mut v: Vec<(usize, ProcCont)>) {
+        if v.capacity() > self.triggered_conts_buf.capacity() {
+            v.clear();
+            self.triggered_conts_buf = v;
+        }
     }
 
     /// §16.9.3 sampled-value function with an EXPLICIT clocking argument
@@ -47672,11 +47786,12 @@ impl Simulator {
             // so loop until no waiter fires. Bounded against #0 event ping-pong.
             let mut settle_guard = 0u32;
             loop {
-                let conts = self.drain_triggered_event_waiters();
+                let mut conts = self.drain_triggered_event_waiters();
                 if conts.is_empty() {
+                    self.recycle_conts(conts);
                     break;
                 }
-                for (pid, stmts) in conts {
+                for (pid, stmts) in conts.drain(..) {
                     if self.finished {
                         break;
                     }
@@ -47692,6 +47807,7 @@ impl Simulator {
                     self.continue_flag = false;
                     self.return_flag = false;
                 }
+                self.recycle_conts(conts);
                 settle_guard += 1;
                 if self.finished || settle_guard > 10_000 {
                     break;
@@ -49299,7 +49415,8 @@ impl Simulator {
         // post-#0 write executed — losing exactly the event this exists for.
         let __prev_edge_cont = self.in_edge_cont;
         self.in_edge_cont = true;
-        for (pid, stmts) in triggered_conts {
+        let mut triggered_conts = triggered_conts;
+        for (pid, stmts) in triggered_conts.drain(..) {
             if self.finished {
                 break;
             }
@@ -49317,6 +49434,7 @@ impl Simulator {
                 self.event_queue.schedule(self.time, pid, stmts);
             }
         }
+        self.recycle_conts(triggered_conts);
         if waiters_first || active_region {
             // Waiters whose trigger was produced DURING this pass — by the
             // blocks just executed (`-> ev` inside an always_ff) or, in
@@ -49330,11 +49448,12 @@ impl Simulator {
             // continuation may fire further events.
             let mut settle_guard = 0u32;
             loop {
-                let conts = self.drain_triggered_event_waiters();
+                let mut conts = self.drain_triggered_event_waiters();
                 if conts.is_empty() {
+                    self.recycle_conts(conts);
                     break;
                 }
-                for (pid, stmts) in conts {
+                for (pid, stmts) in conts.drain(..) {
                     if self.finished {
                         break;
                     }
@@ -49346,6 +49465,7 @@ impl Simulator {
                     self.continue_flag = false;
                     self.return_flag = false;
                 }
+                self.recycle_conts(conts);
                 settle_guard += 1;
                 if self.finished || settle_guard > 10_000 {
                     if env_set_cached!("XEZIM_TRACE_SPIN") && !self.finished {

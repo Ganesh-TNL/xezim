@@ -95,6 +95,13 @@ and the development workflow are in [README.md](README.md).
 
 **Performance** (instruction counts, output identical)
 
+* Small clocked testbenches run about 15% fewer instructions: the per-tick
+  scratch vectors of the waiter drain, the clock generators and the
+  in-process combinational snapshot are reused instead of reallocated,
+  parked waiters that do not fire stay in place, and a compiled stimulus
+  process skips snapshotting the outputs it can never write. A 100k-cycle
+  self-checking testbench: 2.94G to 2.50G instructions, output identical;
+  c906 neutral.
 * Experimental, opt-in: `XEZIM_TS_WIDE512=1` lets the two-state path carry
   registers up to 512 bits (the c906 vector-unit buses) instead of 128. It
   is off by default because on c906 it costs 5% more instructions: the
