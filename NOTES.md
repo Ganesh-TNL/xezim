@@ -91,6 +91,11 @@ and the development workflow are in [README.md](README.md).
 
 **Performance** (instruction counts, output identical)
 
+* `--profile` no longer slows the run it measures: construct times come
+  from a 10 kHz sampler thread instead of two clock reads around every
+  evaluation. On a 16k-cell gate-level DRAM the profiled simulation phase
+  went from 39% slower than an unprofiled run to about 5%; the report's
+  percentages are unchanged and its header now states the sample count.
 * Two- and three-part concatenations on the two-state fast path carry their
   operands in the instruction, and the settle loop prefetches the header of
   the next injected entry. C906 memcpy at 300 iterations: 2 % fewer cycles

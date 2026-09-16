@@ -9,6 +9,7 @@ pub mod bytecode;
 pub mod dispatch;
 pub mod fst_sink;
 pub mod jit;
+pub mod prof_sampler;
 pub mod ts_jit;
 #[cfg(feature = "jit")]
 pub mod aot;

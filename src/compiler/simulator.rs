@@ -5445,8 +5445,6 @@ pub struct Simulator {
     /// unit / instance / construct). Implies per-entry and per-edge-block
     /// nanosecond attribution.
     profile_report: bool,
-    /// Per-comb-entry accumulated eval time (profile_report only).
-    prof_entry_ns: Vec<u64>,
     comb_dep_entries: Vec<u32>,
     /// Bitvec: dirty_signals[signal_id] = true if signal changed since last settle.
     dirty_signals: Vec<bool>,
@@ -5877,6 +5875,10 @@ pub struct Simulator {
     prof_entry_hist: [u64; 12],
     /// Per-entry eval counts (XEZIM_PROFILE_TIMING) for shape attribution.
     prof_entry_counts: Vec<u64>,
+    /// `--profile` sampler thread (see `prof_sampler`); `prof_cur` is the
+    /// slot the simulation thread publishes its current construct into.
+    prof_sampler: Option<crate::compiler::prof_sampler::ProfSampler>,
+    prof_cur: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// XEZIM_CONE: entry is a member of a mergeable chain (static analysis).
     cone_chain_member: Vec<bool>,
     /// XEZIM_CONE: the chains themselves, so the end-of-run report can weigh
@@ -8957,7 +8959,6 @@ impl Simulator {
             ts_comb_abortn: Vec::new(),
             comb_plan_abortn: Vec::new(),
             profile_report: std::env::var("XEZIM_PROFILE_REPORT").ok().as_deref() == Some("1"),
-            prof_entry_ns: Vec::new(),
             comb_dep_entries: Vec::new(),
             dirty_signals: vec![false; num_signals],
             dirty_list: Vec::new(),
@@ -9132,6 +9133,8 @@ impl Simulator {
             prof_settle_repass_evals: 0,
             prof_entry_hist: [0; 12],
             prof_entry_counts: Vec::new(),
+            prof_sampler: None,
+            prof_cur: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cone_chain_member: Vec::new(),
             cone_chains: Vec::new(),
             prof_settle_ca_count: 0,
@@ -19061,13 +19064,37 @@ impl Simulator {
     /// the connect assign becomes a self-copy that `build_comb_entries`
     /// drops. Runs BEFORE edge-block compilation so bytecode binds the
     /// collapsed ids.
+    /// Slot of a comb entry's shape in `prof_entry_hist`.
+    fn entry_hist_kind(item: &CombItem) -> usize {
+        match item {
+            CombItem::Noop => 0,
+            CombItem::FastDirectCopy { .. } => 1,
+            CombItem::DirectCopy { .. } => 2,
+            CombItem::FastDirectFanout { .. } => 3,
+            CombItem::FusedBufFanout { .. } => 4,
+            CombItem::FusedAndFanout { .. } => 5,
+            CombItem::FusedGate { .. } => 6,
+            CombItem::Udp { .. } => 7,
+            CombItem::CompiledContAssign { .. } => 8,
+            CombItem::CompiledAlwaysBlock { .. } => 9,
+            CombItem::ContAssign { .. } => 10,
+            _ => 11,
+        }
+    }
+
     /// XEZIM_PROFILE_REPORT=1: ranked profile in the spirit of the
     /// commercial simulators' reports — percentages by DESIGN UNIT (module
     /// definition), by INSTANCE, and by CONSTRUCT — computed from measured
     /// per-comb-entry and per-edge-block nanoseconds. Times outside those
     /// two attributions (NBA apply, testbench processes, scheduling) are
     /// reported as their own lines from the existing phase buckets.
-    fn print_profile_report(&self, t_nba: u64, t_process: u64, t_sched: u64) {
+    fn print_profile_report(
+        &self,
+        t_nba: u64,
+        t_process: u64,
+        t_sched: u64,
+        tally: Option<&crate::compiler::prof_sampler::SampleTally>,
+    ) {
         struct Agg {
             ns: u64,
             evals: u64,
@@ -19107,13 +19134,24 @@ impl Simulator {
         };
         let mut by_def: HashMap<String, Agg> = HashMap::default();
         let mut by_inst: HashMap<String, (u64, u64)> = HashMap::default();
-        let mut constructs: Vec<(u64, u64, String)> = Vec::new();
+        // Labels are built only for the 20 constructs printed: a comb
+        // entry's label joins every written signal name, and building all
+        // of them first cost 35 ms of string work on a 24k-entry design.
+        let mut constructs: Vec<(u64, u64, Option<usize>, String)> = Vec::new();
         let mut attributed: u64 = 0;
-        for (eidx, &ns) in self.prof_entry_ns.iter().enumerate() {
-            if ns == 0 || eidx >= self.comb_entries.len() {
+        let (comb_samples, edge_samples, ns_per_sample): (&[u64], &[u64], f64) = match tally {
+            Some(t) => (&t.comb, &t.edge, t.ns_per_sample),
+            None => (&[], &[], 0.0),
+        };
+        // Every evaluated entry is aggregated, sampled or not, so the eval
+        // and instance columns stay complete; unsampled entries carry 0 ns.
+        for eidx in 0..self.comb_entries.len() {
+            let n = comb_samples.get(eidx).copied().unwrap_or(0);
+            let evals = self.prof_entry_counts.get(eidx).copied().unwrap_or(0);
+            if n == 0 && evals == 0 {
                 continue;
             }
-            let evals = self.prof_entry_counts.get(eidx).copied().unwrap_or(0);
+            let ns = (n as f64 * ns_per_sample) as u64;
             let inst = entry_instance(eidx);
             let def = def_of(&inst);
             attributed += ns;
@@ -19128,13 +19166,17 @@ impl Simulator {
             let i = by_inst.entry(inst.clone()).or_insert((0, 0));
             i.0 += ns;
             i.1 += evals;
-            let label = self.comb_entry_trace_label(eidx, &self.comb_entries[eidx]);
-            constructs.push((ns, evals, label));
+            constructs.push((ns, evals, Some(eidx), String::new()));
         }
-        for (bi, &ns) in self.edge_block_exec_ns.iter().enumerate() {
-            if ns == 0 || bi >= self.edge_blocks.len() {
+        // Every executed block is aggregated (the per-block timer that the
+        // flag also enables says which ran), sampled or not.
+        for bi in 0..self.edge_blocks.len() {
+            let n = edge_samples.get(bi).copied().unwrap_or(0);
+            let ran = self.edge_block_exec_ns.get(bi).copied().unwrap_or(0) > 0;
+            if n == 0 && !ran {
                 continue;
             }
+            let ns = (n as f64 * ns_per_sample) as u64;
             let inst = self.edge_blocks[bi].scope.clone();
             let def = def_of(&inst);
             attributed += ns;
@@ -19150,6 +19192,7 @@ impl Simulator {
             constructs.push((
                 ns,
                 0,
+                None,
                 format!(
                     "always @(edge) at byte {} ({})",
                     self.edge_blocks[bi].stmt.span.start,
@@ -19171,6 +19214,14 @@ impl Simulator {
         let pct = |ns: u64| ns as f64 * 100.0 / total as f64;
         let ms = |ns: u64| ns as f64 / 1e6;
         eprintln!("================ xezim profile report ================");
+        if let Some(t) = tally {
+            eprintln!(
+                "{} samples over {:.1}ms ({:.1} kHz); construct times are sampled estimates",
+                t.total,
+                t.elapsed_ns as f64 / 1e6,
+                t.total as f64 / (t.elapsed_ns as f64 / 1e6)
+            );
+        }
         eprintln!(
             "attributed {:.1}ms in comb/edge constructs, {:.1}ms elsewhere",
             ms(attributed),
@@ -19205,8 +19256,12 @@ impl Simulator {
         }
         eprintln!("---- by construct (top 20) ---------------------------");
         eprintln!("{:>7}  {:>10}  {:>10}  construct", "%", "time", "evals");
-        constructs.sort_by_key(|&(ns, _, _)| std::cmp::Reverse(ns));
-        for (ns, evals, label) in constructs.into_iter().take(20) {
+        constructs.sort_by_key(|&(ns, _, _, _)| std::cmp::Reverse(ns));
+        for (ns, evals, eidx, label) in constructs.into_iter().take(20) {
+            let label = match eidx {
+                Some(e) => self.comb_entry_trace_label(e, &self.comb_entries[e]),
+                None => label,
+            };
             eprintln!("{:>6.1}%  {:>8.1}ms  {:>10}  {}", pct(ns), ms(ns), evals, label);
         }
         eprintln!("---- outside constructs ------------------------------");
@@ -39239,11 +39294,21 @@ impl Simulator {
             );
         }
         if self.profile_report {
-            self.print_profile_report(t_nba, t_process, t_sched);
+            let tally = self.prof_sampler.take().map(|s| s.finish());
+            self.print_profile_report(t_nba, t_process, t_sched, tally.as_ref());
         }
             {
                 const NAMES: [&str; 12] = ["noop","fastcopy","dircopy","fastfanout","busfanout",
                     "andfanout","gate","udp","contassign_c","alwaysblk_c","contassign_ast","other"];
+                let mut hist = [0u64; 12];
+                for (e, &c) in self.prof_entry_counts.iter().enumerate() {
+                    if c != 0 {
+                        if let Some(ent) = self.comb_entries.get(e) {
+                            hist[Self::entry_hist_kind(&ent.item)] += c;
+                        }
+                    }
+                }
+                self.prof_entry_hist = hist;
                 let tot: u64 = self.prof_entry_hist.iter().sum();
                 if tot > 0 {
                     let mut v: Vec<(usize, u64)> = self.prof_entry_hist.iter().copied()
@@ -48711,7 +48776,17 @@ impl Simulator {
                     } else {
                         None
                     };
+                    if self.profile_report {
+                        self.prof_cur.store(
+                            crate::compiler::prof_sampler::KIND_EDGE | bi as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
                     self.exec_bytecode(bi);
+                    if self.profile_report {
+                        self.prof_cur
+                            .store(crate::compiler::prof_sampler::KIND_OTHER, std::sync::atomic::Ordering::Relaxed);
+                    }
                     if let Some(t) = t {
                         if let Some(slot) = self.edge_block_exec_ns.get_mut(bi) {
                             *slot += t.elapsed().as_nanos() as u64;
@@ -48793,6 +48868,12 @@ impl Simulator {
                 } else {
                     None
                 };
+                if self.profile_report {
+                    self.prof_cur.store(
+                        crate::compiler::prof_sampler::KIND_EDGE | bi as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
                 if needs_hint {
                     let saved_hint = self.name_resolve_hint.borrow().clone();
                     if let Some(scope) = self.edge_block_scope.get(bi).and_then(|s| s.as_ref()) {
@@ -48808,6 +48889,10 @@ impl Simulator {
                     *self.name_resolve_hint.borrow_mut() = saved_hint;
                 } else {
                     self.exec_bytecode(bi);
+                }
+                if self.profile_report {
+                    self.prof_cur
+                        .store(crate::compiler::prof_sampler::KIND_OTHER, std::sync::atomic::Ordering::Relaxed);
                 }
                 if let Some(t) = t_seq {
                     if let Some(slot) = self.edge_block_exec_ns.get_mut(bi) {
@@ -50884,6 +50969,9 @@ impl Simulator {
             self.settle_triggered = triggered;
             self.settle_triggered_list = next_list;
             self.gate_lane = gate_lane;
+if self.profile_report {
+    self.prof_cur.store(crate::compiler::prof_sampler::KIND_OTHER, std::sync::atomic::Ordering::Relaxed);
+}
             self.gate_queue = gate_queue;
             self.gate_queued = gate_queued;
             self.settling = false;
@@ -50913,6 +51001,15 @@ impl Simulator {
         // advance while `settling` is set — so re-reading them from `self` on
         // each of the ~679 entry evaluations per settle call is pure overhead.
         let prof_on = self.profile_timing;
+        // Profile bookkeeping sized once per settle, not per evaluation.
+        if prof_on && self.prof_entry_counts.len() != num_entries {
+            self.prof_entry_counts.resize(num_entries, 0);
+        }
+        if self.profile_report && self.prof_sampler.is_none() {
+            let s = crate::compiler::prof_sampler::ProfSampler::start();
+            self.prof_cur = s.cur.clone();
+            self.prof_sampler = Some(s);
+        }
         // Settle-worklist prefetch distance (entries ahead of the cursor).
         // Latched once per settle: it is a process-wide env knob.
         let prefetch_dist: usize = {
@@ -51328,25 +51425,9 @@ impl Simulator {
                 // mode (it adds Instant::now() on these paths), so a normal
                 // run does not pay for this match.
                 if prof_on {
-                    if self.prof_entry_counts.len() != num_entries {
-                        self.prof_entry_counts.resize(num_entries, 0);
-                    }
+                    // The per-shape histogram is derived from these counts
+                    // and each entry's static kind at report time.
                     self.prof_entry_counts[eidx] += 1;
-                    let k = match &entries[eidx].item {
-                        CombItem::Noop => 0,
-                        CombItem::FastDirectCopy { .. } => 1,
-                        CombItem::DirectCopy { .. } => 2,
-                        CombItem::FastDirectFanout { .. } => 3,
-                        CombItem::FusedBufFanout { .. } => 4,
-                        CombItem::FusedAndFanout { .. } => 5,
-                        CombItem::FusedGate { .. } => 6,
-                        CombItem::Udp { .. } => 7,
-                        CombItem::CompiledContAssign { .. } => 8,
-                        CombItem::CompiledAlwaysBlock { .. } => 9,
-                        CombItem::ContAssign { .. } => 10,
-                        _ => 11,
-                    };
-                    self.prof_entry_hist[k] += 1;
                 }
                 if mon_on {
                     if let Some(slot) = self.activity_counts.get_mut(eidx) {
@@ -51357,14 +51438,15 @@ impl Simulator {
                     let label = self.comb_entry_trace_label(eidx, &entries[eidx]);
                     self.trace_always_fire(&label);
                 }
-                let report_t0 = if self.profile_report {
-                    if self.prof_entry_ns.len() != num_entries {
-                        self.prof_entry_ns.resize(num_entries, 0);
-                    }
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
+                // Profile report: two clock reads per evaluation made the
+                // settle 35% slower on gate-level designs; the sampler
+                // thread times what this one store publishes.
+                if self.profile_report {
+                    self.prof_cur.store(
+                        crate::compiler::prof_sampler::KIND_COMB | eidx as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
                 // Plan-first fast path: an entry with a resolved two-state
                 // plan runs straight from the plan table — no `CombEntry`
                 // load (a cache miss on this design's 30k-entry table), no
@@ -51889,9 +51971,6 @@ impl Simulator {
                     }
                 }
                 }
-                if let Some(t0) = report_t0 {
-                    self.prof_entry_ns[eidx] += t0.elapsed().as_nanos() as u64;
-                }
 
                 // Worklist propagation: any signals newly dirtied by this
                 // entry's evaluation trigger their dependents, which are
@@ -51970,6 +52049,9 @@ impl Simulator {
         self.settle_triggered = triggered;
         self.settle_triggered_list = next_list;
         self.gate_lane = gate_lane;
+if self.profile_report {
+    self.prof_cur.store(crate::compiler::prof_sampler::KIND_OTHER, std::sync::atomic::Ordering::Relaxed);
+}
         self.gate_queue = gate_queue;
         self.gate_queued = gate_queued;
         self.settle_dirty_ids = cur_list;
