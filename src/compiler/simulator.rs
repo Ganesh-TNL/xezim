@@ -1142,7 +1142,7 @@ struct AwaitWaiter {
 #[derive(Clone, Copy, Default)]
 struct TsHdr {
     off: u32,
-    /// Stream length (14 bits) | executor kind (2 bits, `TS_HDR_KIND_SHIFT`);
+    /// Stream length (13 bits) | executor kind (3 bits, `TS_HDR_KIND_SHIFT`);
     /// kind 0 = no arena stream. Eight bytes per entry keeps twice as many
     /// headers per cache line as the unpacked form did — the header load is
     /// the first touch of every settle evaluation.
@@ -1150,7 +1150,7 @@ struct TsHdr {
     num_regs: u16,
 }
 
-const TS_HDR_KIND_SHIFT: u32 = 14;
+const TS_HDR_KIND_SHIFT: u32 = 13;
 const TS_HDR_LEN_MAX: usize = (1 << TS_HDR_KIND_SHIFT) - 1;
 
 impl TsHdr {
@@ -3164,6 +3164,79 @@ fn bytecode_array_elem_width(
 /// whole and a partially out-of-range WRITE is discarded (some tools);
 /// default is the §11.5.1 per-bit form for both.
 #[inline]
+// ---- Wide two-state register word helpers (little-endian `[u64; N]`). ----
+
+/// Top word index of a `w`-bit value and the mask of its live bits.
+#[inline(always)]
+fn wtop(w: u16) -> (usize, u64) {
+    let top = ((w as usize).max(1) - 1) >> 6;
+    let r = w as u32 - (top as u32) * 64;
+    (top, if r >= 64 { u64::MAX } else { (1u64 << r) - 1 })
+}
+
+/// Truncate `x` to `w` bits in place.
+#[inline(always)]
+fn wmask_top<const N: usize>(x: &mut [u64; N], w: u16) {
+    let (top, m) = wtop(w);
+    x[top] &= m;
+    for i in top + 1..N {
+        x[i] = 0;
+    }
+}
+
+/// `x << sh` across N words (bits shifted past the top word are dropped).
+#[inline(always)]
+fn wshl<const N: usize>(x: [u64; N], sh: u32) -> [u64; N] {
+    if sh == 0 {
+        return x;
+    }
+    let ws = (sh >> 6) as usize;
+    let bs = sh & 63;
+    let mut r = [0u64; N];
+    for i in ws..N {
+        let mut v = x[i - ws] << bs;
+        if bs != 0 && i > ws {
+            v |= x[i - ws - 1] >> (64 - bs);
+        }
+        r[i] = v;
+    }
+    r
+}
+
+/// `x >> sh` across N words.
+#[inline(always)]
+fn wshr<const N: usize>(x: [u64; N], sh: u32) -> [u64; N] {
+    if sh == 0 {
+        return x;
+    }
+    let ws = (sh >> 6) as usize;
+    let bs = sh & 63;
+    let mut r = [0u64; N];
+    for i in 0..N.saturating_sub(ws) {
+        let mut v = x[i + ws] >> bs;
+        if bs != 0 && i + ws + 1 < N {
+            v |= x[i + ws + 1] << (64 - bs);
+        }
+        r[i] = v;
+    }
+    r
+}
+
+/// The 64 bits of `x` starting at bit `lo`.
+#[inline(always)]
+fn wget64<const N: usize>(x: &[u64; N], lo: u32) -> u64 {
+    let ws = (lo >> 6) as usize;
+    let bs = lo & 63;
+    if ws >= N {
+        return 0;
+    }
+    let mut v = x[ws] >> bs;
+    if bs != 0 && ws + 1 < N {
+        v |= x[ws + 1] << (64 - bs);
+    }
+    v
+}
+
 pub(crate) fn oob_select_whole() -> bool {
     static WHOLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *WHOLE.get_or_init(|| std::env::var("XEZIM_OOB_SELECT").ok().as_deref() == Some("whole"))
@@ -5414,7 +5487,10 @@ pub struct Simulator {
     ts_regs: Vec<u64>,
     /// Wide (65..=128-bit) two-state register bank; same index space as
     /// `ts_regs` (a register's bank is static, decided at lower time).
-    ts_wregs: Vec<[u64; 2]>,
+    /// Wide two-state banks, flat words viewed as `[u64; N]` registers:
+    /// N = 2 (widths ≤ 128) and N = 8 (≤ 512).
+    ts_wregs: Vec<u64>,
+    ts_wregs8: Vec<u64>,
     /// Two-state eval hits, for the profile report.
     prof_ts_evals: u64,
     /// Why the two-state engine declined an eval — reported so a profile
@@ -5435,6 +5511,8 @@ pub struct Simulator {
     /// Set by a two-state executor that read an x/z bit; the guard reports
     /// it as an x-read bail (no demotion), not as an abort.
     ts_xread_bail: bool,
+    /// Census: x-read bails per comb entry (count, executor kind).
+    ts_xbail_by_entry: HashMap<usize, (u64, u8)>,
     /// Per-slot mid-exec abort counts; at `TS_ABORT_DEMOTE` the slot flips
     /// to No / Interp for the rest of the run. (Re-promotion after init
     /// settles is future work.)
@@ -8952,6 +9030,7 @@ impl Simulator {
             prof_ts_bail_warnx: 0,
             prof_ts_bail_forced: 0,
             prof_ts_bail_xread: 0,
+            ts_wregs8: Vec::new(),
             prof_ts_bail_abort: 0,
             ts_exec_aborted: false,
             ts_xread_bail: false,
@@ -8959,6 +9038,7 @@ impl Simulator {
             ts_comb_abortn: Vec::new(),
             comb_plan_abortn: Vec::new(),
             profile_report: std::env::var("XEZIM_PROFILE_REPORT").ok().as_deref() == Some("1"),
+            ts_xbail_by_entry: HashMap::default(),
             comb_dep_entries: Vec::new(),
             dirty_signals: vec![false; num_signals],
             dirty_list: Vec::new(),
@@ -20538,7 +20618,13 @@ impl Simulator {
                         }
                         TsSlot::Yes(std::sync::Arc::new(ts))
                     }
-                    None => TsSlot::No,
+                    None => {
+                        if std::env::var("XEZIM_TS_DBG").is_ok() {
+                            let (bi, bop) = super::bytecode::ts_last_bail();
+                            eprintln!("[TS-NO] comb eidx={} bail at #{} opcode={} insns={}", eidx, bi, bop, compiled.instructions.len());
+                        }
+                        TsSlot::No
+                    }
                 };
             }
             if let TsSlot::Yes(ts) = &self.ts_comb[eidx] {
@@ -21018,11 +21104,16 @@ impl Simulator {
         self.exec_two_state_parts(&ts.insns, ts.num_regs, Self::ts_kind_of(ts))
     }
 
-    /// Executor selector for a two-state stream: 3 = wide registers,
-    /// 2 = control flow, 1 = straight line.
+    /// Executor selector for a two-state stream: 4 = wide 512-bit
+    /// registers, 3 = wide 128-bit registers, 2 = control flow, 1 =
+    /// straight line.
     fn ts_kind_of(ts: &super::bytecode::TwoStateBlock) -> u8 {
         if ts.has_wide {
-            3
+            if ts.wide_words > 2 {
+                4
+            } else {
+                3
+            }
         } else if ts.has_ctrl {
             2
         } else {
@@ -21037,7 +21128,8 @@ impl Simulator {
         kind: u8,
     ) -> bool {
         match kind {
-            3 => self.exec_two_state_wide(insns, num_regs),
+            4 => self.exec_two_state_wide::<8>(insns, num_regs),
+            3 => self.exec_two_state_wide::<2>(insns, num_regs),
             2 => self.exec_two_state_ctrl(insns, num_regs),
             _ => self.exec_two_state_line(insns, num_regs),
         }
@@ -21081,9 +21173,24 @@ impl Simulator {
         true
     }
 
-    /// Wide writeback: mirrors ts_store's bookkeeping via Value::set_words128.
-    fn ts_store_wide(&mut self, id: usize, v: [u64; 2]) {
-        if self.signal_table[id].set_words128(v) {
+    /// Wide writeback: mirrors ts_store's bookkeeping via Value::set_words.
+    /// Splice `w` bits of little-endian words `v` into `t` at `lo`; true
+    /// when any bit changed.
+    fn splice_words(t: &mut Value, lo: u32, v: &[u64], w: u32) -> bool {
+        let mut changed = false;
+        let mut off = 0u32;
+        let mut i = 0usize;
+        while off < w {
+            let n = (w - off).min(64) as usize;
+            changed |= t.splice_bits64(lo as usize + off as usize, v[i], 0, n);
+            i += 1;
+            off += 64;
+        }
+        changed
+    }
+
+    fn ts_store_wide(&mut self, id: usize, v: &[u64]) {
+        if self.signal_table[id].set_words(v) {
             if self.ts_direct_writes {
                 if self.dirty_list.last() != Some(&id) {
                     self.dirty_list.push(id);
@@ -21100,12 +21207,8 @@ impl Simulator {
 
     /// `sig[lo+w-1:lo] = v` for a 65..=128-bit source window: two splices,
     /// one round of change bookkeeping.
-    fn ts_wide_range_store2(&mut self, id: usize, lo: u32, v: [u64; 2], w: u32) {
-        let n0 = w.min(64) as usize;
-        let n1 = (w - 64) as usize;
-        let c0 = self.signal_table[id].splice_bits64(lo as usize, v[0], 0, n0);
-        let c1 = n1 > 0 && self.signal_table[id].splice_bits64(lo as usize + 64, v[1], 0, n1);
-        if !(c0 || c1) {
+    fn ts_wide_range_store2(&mut self, id: usize, lo: u32, v: &[u64], w: u32) {
+        if !Self::splice_words(&mut self.signal_table[id], lo, v, w) {
             return;
         }
         self.sync_mirror(id);
@@ -21123,20 +21226,13 @@ impl Simulator {
     }
 
     /// Non-blocking twin of `ts_wide_range_store2`.
-    fn ts_wide_range_store2_nba(&mut self, id: usize, lo: u32, v: [u64; 2], w: u32) {
-        let n0 = w.min(64) as usize;
-        let n1 = (w - 64) as usize;
+    fn ts_wide_range_store2_nba(&mut self, id: usize, lo: u32, v: &[u64], w: u32) {
         if let Some(i) = self.nba_fast_index.get(id) {
             let t = &mut self.nba_fast[i].value;
-            t.splice_bits64(lo as usize, v[0], 0, n0);
-            if n1 > 0 {
-                t.splice_bits64(lo as usize + 64, v[1], 0, n1);
-            }
+            Self::splice_words(t, lo, v, w);
         } else {
             let mut nv = self.signal_table[id].clone();
-            let c0 = nv.splice_bits64(lo as usize, v[0], 0, n0);
-            let c1 = n1 > 0 && nv.splice_bits64(lo as usize + 64, v[1], 0, n1);
-            if !(c0 || c1) {
+            if !Self::splice_words(&mut nv, lo, v, w) {
                 self.prof_nba_elided += 1;
             } else {
                 nv.is_signed = self.signal_signed[id];
@@ -21150,8 +21246,8 @@ impl Simulator {
         }
     }
 
-    fn ts_store_nba_wide(&mut self, id: usize, v: [u64; 2], w: u32) {
-        let val = Value::from_words128(v, w);
+    fn ts_store_nba_wide(&mut self, id: usize, v: &[u64], w: u32) {
+        let val = Value::from_words(v, w);
         if let Some(i) = self.nba_fast_index.get(id) {
             self.nba_fast[i].value = val;
         } else if self.signal_table[id] != val {
@@ -21166,10 +21262,15 @@ impl Simulator {
         }
     }
 
-    /// Executor for blocks containing wide (65..=128-bit) ops: full arm set
-    /// with a pc loop. Kept OUT of the narrow executors so their code size
-    /// (and the sbox-class dispatch) is unaffected.
-    fn exec_two_state_wide(&mut self, insns: &[super::bytecode::TsInsn], num_regs: u32) -> bool {
+    /// Executor for blocks containing wide (65..=512-bit) ops: full arm set
+    /// with a pc loop, monomorphized over the wide register word count `N`
+    /// (2 or 8). Kept OUT of the narrow executors so their code size (and
+    /// the sbox-class dispatch) is unaffected.
+    fn exec_two_state_wide<const N: usize>(
+        &mut self,
+        insns: &[super::bytecode::TsInsn],
+        num_regs: u32,
+    ) -> bool {
         use super::bytecode::TsInsn;
         // Registers live in `self.ts_regs` and are used in place: no callee
         // below touches that vector, and it never reallocates during the
@@ -21180,11 +21281,19 @@ impl Simulator {
         }
         let regs: &mut [u64] =
             unsafe { std::slice::from_raw_parts_mut(self.ts_regs.as_mut_ptr(), self.ts_regs.len()) };
-        if self.ts_wregs.len() < num_regs as usize {
-            self.ts_wregs.resize(num_regs as usize, [0, 0]);
+        // One flat bank per word count, viewed as `[u64; N]` registers.
+        let bank: &mut Vec<u64> = if N == 2 { &mut self.ts_wregs } else { &mut self.ts_wregs8 };
+        if bank.len() < num_regs as usize * N {
+            bank.resize(num_regs as usize * N, 0);
         }
-        let wregs: &mut [[u64; 2]] = unsafe {
-            std::slice::from_raw_parts_mut(self.ts_wregs.as_mut_ptr(), self.ts_wregs.len())
+        let wregs: &mut [[u64; N]] = unsafe {
+            std::slice::from_raw_parts_mut(bank.as_mut_ptr() as *mut [u64; N], bank.len() / N)
+                #[cfg(feature = "opcode-census")]
+                {
+                    let e = self.ts_xbail_by_entry.entry(eidx).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 = h.kind();
+                }
         };
         let insns_ptr = insns.as_ptr();
         let insns_len = insns.len();
@@ -21199,7 +21308,7 @@ impl Simulator {
                 self.ts_xread_bail = true;
                 #[cfg(feature = "opcode-census")]
                 {
-                    *self.ts_census.entry(("XBAIL", "line")).or_insert(0) += 1;
+                    *self.ts_census.entry(("XBAIL", if N == 2 { "wide128" } else { "wide512" })).or_insert(0) += 1;
                 }
                 bail!();
             }};
@@ -21618,12 +21727,16 @@ impl Simulator {
                 }
                 TsInsn::WRedOr { d, s } => {
                     let w = wregs[*s as usize];
-                    regs[*d as usize] = ((w[0] | w[1]) != 0) as u64;
+                    regs[*d as usize] = (w.iter().fold(0u64, |a, &b| a | b) != 0) as u64;
                 }
-                TsInsn::WRedAnd { d, s, mask_hi } => {
-                    let w = wregs[*s as usize];
-                    regs[*d as usize] =
-                        (w[0] == u64::MAX && w[1] == *mask_hi) as u64;
+                TsInsn::WRedAnd { d, s, w } => {
+                    let x = wregs[*s as usize];
+                    let (top, m) = wtop(*w);
+                    let mut all = x[top] == m;
+                    for i in 0..top {
+                        all &= x[i] == u64::MAX;
+                    }
+                    regs[*d as usize] = all as u64;
                 }
                 TsInsn::BitStoreDyn { sig, i, s, w } => {
                     // §11.5.1: an out-of-range dynamic bit-select target
@@ -21700,22 +21813,34 @@ impl Simulator {
                     }
                     regs[*d as usize] = acc;
                 }
-                TsInsn::WSigRange { d, sig, lo, w, mask_hi } => {
-                    let v = &self.signal_table[*sig as usize];
-                    let (lo0, _) = Self::raw_bits_slice(v, *lo, 64);
-                    let (hi0, _) = Self::raw_bits_slice(v, *lo + 64, *w - 64);
-                    wregs[*d as usize] = [lo0, hi0 & mask_hi];
+                TsInsn::WSigRange { d, sig, lo, w } => {
+                    // Any X/Z bit in the slice bails to the 4-state path
+                    // (the old 128-bit arm silently dropped the X plane).
+                    let mut acc = [0u64; N];
+                    let mut xz = 0u64;
+                    {
+                        let v = &self.signal_table[*sig as usize];
+                        let mut off = 0u16;
+                        let mut i = 0usize;
+                        while off < *w {
+                            let cw = (*w - off).min(64);
+                            let (b, x) = Self::raw_bits_slice(v, *lo + off, cw);
+                            xz |= x;
+                            acc[i] = b;
+                            i += 1;
+                            off += 64;
+                        }
+                    }
+                    if xz != 0 {
+                        xbail!();
+                    }
+                    wregs[*d as usize] = acc;
                 }
                 TsInsn::WRepl { d, s, w, count } => {
                     let part = regs[*s as usize];
-                    let mut acc = [0u64; 2];
+                    let mut acc = [0u64; N];
                     for _ in 0..*count {
-                        let w = *w as u32;
-                        acc = if w < 64 {
-                            [acc[0] << w, (acc[1] << w) | (acc[0] >> (64 - w))]
-                        } else {
-                            [0, acc[0]]
-                        };
+                        acc = wshl(acc, *w as u32);
                         acc[0] |= part;
                     }
                     wregs[*d as usize] = acc;
@@ -21924,107 +22049,105 @@ impl Simulator {
                 }
                 // ---- wide bank ----
                 TsInsn::WLoadSig { d, sig } => {
-                    let mut w2 = [0u64; 2];
-                    // Prefilter proved cleanliness; a failure here means the
-                    // value changed representation mid-eval — bail safely.
-                    if !self.signal_table[*sig as usize].words128_if_clean(&mut w2) {
+                    let mut wv = [0u64; N];
+                    if !self.signal_table[*sig as usize].words_if_clean(&mut wv) {
                         xbail!();
                     }
-                    wregs[*d as usize] = w2;
+                    wregs[*d as usize] = wv;
                 }
-                TsInsn::WConst { d, v } => wregs[*d as usize] = **v,
+                TsInsn::WConst { d, v } => {
+                    let mut acc = [0u64; N];
+                    for (i, x) in v.iter().enumerate().take(N) {
+                        acc[i] = *x;
+                    }
+                    wregs[*d as usize] = acc;
+                }
                 TsInsn::WXor { d, a, b } => {
                     let (x, y) = (wregs[*a as usize], wregs[*b as usize]);
-                    wregs[*d as usize] = [x[0] ^ y[0], x[1] ^ y[1]];
+                    let mut r = [0u64; N];
+                    for i in 0..N {
+                        r[i] = x[i] ^ y[i];
+                    }
+                    wregs[*d as usize] = r;
                 }
                 TsInsn::WAnd { d, a, b } => {
                     let (x, y) = (wregs[*a as usize], wregs[*b as usize]);
-                    wregs[*d as usize] = [x[0] & y[0], x[1] & y[1]];
+                    let mut r = [0u64; N];
+                    for i in 0..N {
+                        r[i] = x[i] & y[i];
+                    }
+                    wregs[*d as usize] = r;
                 }
                 TsInsn::WOr { d, a, b } => {
                     let (x, y) = (wregs[*a as usize], wregs[*b as usize]);
-                    wregs[*d as usize] = [x[0] | y[0], x[1] | y[1]];
+                    let mut r = [0u64; N];
+                    for i in 0..N {
+                        r[i] = x[i] | y[i];
+                    }
+                    wregs[*d as usize] = r;
                 }
-                TsInsn::WNot { d, s, mask_hi } => {
+                TsInsn::WNot { d, s, w } => {
                     let x = wregs[*s as usize];
-                    wregs[*d as usize] = [!x[0], !x[1] & mask_hi];
+                    let mut r = [0u64; N];
+                    for i in 0..N {
+                        r[i] = !x[i];
+                    }
+                    wmask_top(&mut r, *w);
+                    wregs[*d as usize] = r;
                 }
-                TsInsn::WRange { d, s, lo, mask_hi } => {
-                    let x = wregs[*s as usize];
-                    let sh = *lo as u32;
-                    let shifted = if sh == 0 {
-                        x
-                    } else if sh < 64 {
-                        [(x[0] >> sh) | (x[1] << (64 - sh)), x[1] >> sh]
-                    } else {
-                        [x[1] >> (sh - 64), 0]
-                    };
-                    wregs[*d as usize] = [shifted[0], shifted[1] & mask_hi];
+                TsInsn::WRange { d, s, lo, w } => {
+                    let mut r = wshr(wregs[*s as usize], *lo as u32);
+                    wmask_top(&mut r, *w);
+                    wregs[*d as usize] = r;
                 }
                 TsInsn::RangeFromW { d, s, lo, mask } => {
-                    let x = wregs[*s as usize];
-                    let sh = *lo as u32;
-                    let v = if sh == 0 {
-                        x[0]
-                    } else if sh < 64 {
-                        (x[0] >> sh) | (x[1] << (64 - sh))
-                    } else {
-                        x[1] >> (sh - 64)
-                    };
-                    regs[*d as usize] = v & mask;
+                    regs[*d as usize] = wget64(&wregs[*s as usize], *lo as u32) & mask;
                 }
                 TsInsn::BitFromW { d, s, bit } => {
                     let x = wregs[*s as usize];
                     regs[*d as usize] = (x[(*bit >> 6) as usize] >> (*bit & 63)) & 1;
                 }
                 TsInsn::WConcat { d, parts } => {
-                    let mut acc = [0u64; 2];
+                    let mut acc = [0u64; N];
                     for &(r, w, wide) in parts.iter() {
-                        let w = w as u32;
-                        // acc <<= w (128-bit shift)
-                        acc = if w == 0 {
-                            acc
-                        } else if w < 64 {
-                            [acc[0] << w, (acc[1] << w) | (acc[0] >> (64 - w))]
-                        } else if w == 64 {
-                            [0, acc[0]]
+                        acc = wshl(acc, w as u32);
+                        if wide {
+                            let p = wregs[r as usize];
+                            for i in 0..N {
+                                acc[i] |= p[i];
+                            }
                         } else {
-                            [0, acc[0] << (w - 64)]
-                        };
-                        let part = if wide {
-                            wregs[r as usize]
-                        } else {
-                            [regs[r as usize], 0]
-                        };
-                        acc[0] |= part[0];
-                        acc[1] |= part[1];
+                            acc[0] |= regs[r as usize];
+                        }
                     }
                     wregs[*d as usize] = acc;
                 }
-                TsInsn::WMask { d, mask_hi } => {
-                    wregs[*d as usize][1] &= mask_hi;
+                TsInsn::WMask { d, w } => {
+                    wmask_top(&mut wregs[*d as usize], *w);
                 }
                 TsInsn::WFromN { r } => {
-                    wregs[*r as usize] = [regs[*r as usize], 0];
+                    let mut v = [0u64; N];
+                    v[0] = regs[*r as usize];
+                    wregs[*r as usize] = v;
                 }
                 TsInsn::NFromW { r, mask } => {
                     regs[*r as usize] = wregs[*r as usize][0] & mask;
                 }
                 TsInsn::WStore { sig, s } => {
                     let v = wregs[*s as usize];
-                    self.ts_store_wide(*sig as usize, v);
+                    self.ts_store_wide(*sig as usize, &v);
                 }
                 TsInsn::WStoreNba { sig, s, w } => {
                     let v = wregs[*s as usize];
-                    self.ts_store_nba_wide(*sig as usize, v, *w);
+                    self.ts_store_nba_wide(*sig as usize, &v, *w);
                 }
                 TsInsn::WRangeStore { sig, lo, s, w } => {
                     let v = wregs[*s as usize];
-                    self.ts_wide_range_store2(*sig as usize, *lo, v, *w);
+                    self.ts_wide_range_store2(*sig as usize, *lo, &v, *w);
                 }
                 TsInsn::WRangeStoreNba { sig, lo, s, w } => {
                     let v = wregs[*s as usize];
-                    self.ts_wide_range_store2_nba(*sig as usize, *lo, v, *w);
+                    self.ts_wide_range_store2_nba(*sig as usize, *lo, &v, *w);
                 }
             }
             pc += 1;
@@ -39118,7 +39241,25 @@ impl Simulator {
                     eprintln!("[TS-CENSUS] xbail after {:>16} {:>14}", b, c);
                 }
             }
-            for &(n, c) in sv.iter().take(25) {
+            {
+                let mut v: Vec<(usize, u64, u8)> =
+                    self.ts_xbail_by_entry.iter().map(|(&e, &(c, k))| (e, c, k)).collect();
+                v.sort_by_key(|&(_, c, _)| std::cmp::Reverse(c));
+                let n_entries = v.len();
+                let tot: u64 = v.iter().map(|x| x.1).sum();
+                eprintln!("[TS-CENSUS] xbail entries={} total={}", n_entries, tot);
+                for &(e, c, k) in v.iter().take(16) {
+                    let evals = self.prof_entry_counts.get(e).copied().unwrap_or(0);
+                    let label = self
+                        .comb_entries
+                        .get(e)
+                        .map(|en| self.comb_entry_trace_label(e, en))
+                        .unwrap_or_default();
+                    let label: String = label.chars().take(110).collect();
+                    eprintln!("[TS-CENSUS] xbail entry eidx={} kind={} bails={} evals={} {}", e, k, c, evals, label);
+                }
+            }
+            for &(n, c) in sv.iter().take(60) {
                 eprintln!("[TS-CENSUS] op {:>16} {:>14} ({:.1}%)", n, c, 100.0 * c as f64 / total as f64);
             }
             let mut pv: Vec<_> = self.ts_census.iter().map(|(k, c)| (*k, *c)).collect();

@@ -13009,13 +13009,12 @@ pub enum TsInsn {
     CaseMaskJmp { s: u16, mj: Box<TsCaseMaskJmp> },
     /// regs[d] = (regs[s] != 0) — §11.4.9 reduction OR on an X-free operand.
     RedOr { d: u16, s: u16 },
-    /// Wide (65..128-bit) reduction OR: reads the WIDE register file. The
+    /// Wide (65..512-bit) reduction OR: reads the WIDE register file. The
     /// narrow `RedOr` on a wide source read `regs[s]` — a slot the wide load
     /// never wrote, i.e. whatever the PREVIOUS block's evaluation left there.
     WRedOr { d: u16, s: u16 },
-    /// Wide reduction AND: value == all-ones over its width
-    /// (`mask_hi` masks the high word).
-    WRedAnd { d: u16, s: u16, mask_hi: u64 },
+    /// Wide reduction AND: value == all-ones over its width `w`.
+    WRedAnd { d: u16, s: u16, w: u16 },
     /// regs[d] = (regs[s] == mask) — §11.4.9 reduction AND; `mask` is the
     /// source width, so "all ones" is an equality against it.
     RedAnd { d: u16, s: u16, mask: u64 },
@@ -13089,41 +13088,45 @@ pub enum TsInsn {
     /// index comes from a SIGNAL; aborts on out-of-range or X element
     /// (4-state queues an X value there).
     NbaFromElem(Box<TsNbaFromElem>),
-    // ---- WIDE (65..=128-bit) bank: little-endian [u64; 2] registers. ----
-    /// wregs[d] = signal words (prefilter proved the signal X-free).
+    // ---- WIDE (65..=512-bit) bank: little-endian [u64; N] registers, N
+    // = 2 or 8 words per block (`TwoStateBlock::wide_words`); widths give
+    // the executor the top word and its mask. ----
+    /// wregs[d] = signal words; bails when the signal holds X/Z.
     WLoadSig { d: u16, sig: u32 },
-    WConst { d: u16, v: Box<[u64; 2]> },
+    /// Little-endian words of the constant (≤ N of them).
+    WConst { d: u16, v: Box<[u64]> },
     WXor { d: u16, a: u16, b: u16 },
     WAnd { d: u16, a: u16, b: u16 },
     WOr { d: u16, a: u16, b: u16 },
-    /// wregs[d] = !wregs[s] masked to width (mask_hi masks the high word).
-    WNot { d: u16, s: u16, mask_hi: u64 },
-    /// Wide→wide slice: wregs[d] = (wregs[s] >> lo) & mask(w), w in 65..=128.
-    WRange { d: u16, s: u16, lo: u16, mask_hi: u64 },
+    /// wregs[d] = !wregs[s] masked to width `w`.
+    WNot { d: u16, s: u16, w: u16 },
+    /// Wide→wide slice: wregs[d] = (wregs[s] >> lo) & mask(w), w in 65..=512.
+    WRange { d: u16, s: u16, lo: u16, w: u16 },
     /// Narrow (≤64) slice of a wide register.
     RangeFromW { d: u16, s: u16, lo: u16, mask: u64 },
     BitFromW { d: u16, s: u16, bit: u16 },
-    /// MSB-first concat into a wide register; parts may be narrow or wide.
-    WConcat { d: u16, parts: Box<[(u16, u8, bool)]> },
-    /// Resize truncation within the wide bank.
-    WMask { d: u16, mask_hi: u64 },
+    /// MSB-first concat into a wide register; parts (reg, width, is_wide)
+    /// may be narrow or wide.
+    WConcat { d: u16, parts: Box<[(u16, u16, bool)]> },
+    /// Resize truncation within the wide bank to width `w`.
+    WMask { d: u16, w: u16 },
     /// Bank moves for Resize crossings (same register index).
     WFromN { r: u16 },
     NFromW { r: u16, mask: u64 },
-    /// Wide writeback with change-detect + dirty hooks (mask_hi pre-applied
-    /// to the register by construction; stored via Value::set_words128).
+    /// Wide writeback with change-detect + dirty hooks (the register is
+    /// masked to its width by construction; stored via Value::set_words).
     WStore { sig: u32, s: u16 },
     WStoreNba { sig: u32, s: u16, w: u32 },
-    /// `sig[lo+w-1:lo] = wregs[s]` / `<=`: a whole wide (65..=128-bit)
+    /// `sig[lo+w-1:lo] = wregs[s]` / `<=`: a whole wide (65..=512-bit)
     /// register written into a window of a wider destination (the
     /// `bus[127:0] = data` arms of the c906 load/store arbiters).
     WRangeStore { sig: u32, lo: u32, s: u16, w: u32 },
     WRangeStoreNba { sig: u32, lo: u32, s: u16, w: u32 },
     /// Wrapping multiply at max operand width (both operands unsigned).
     Mul { d: u16, a: u16, b: u16, mask: u64 },
-    /// Wide (65..=128-bit) slice of a SIGNAL into the wide bank; the two
-    /// halves are prefiltered as ordinary ≤64 slices.
-    WSigRange { d: u16, sig: u32, lo: u16, w: u16, mask_hi: u64 },
+    /// Wide (65..=512-bit) slice of a SIGNAL into the wide bank; bails
+    /// when any bit of the slice holds X/Z.
+    WSigRange { d: u16, sig: u32, lo: u16, w: u16 },
     /// Logical shifts. `w` is the LEFT operand's width, which is also the
     /// result width (`Value::shift_left`/`shift_right` keep `self.width`);
     /// an amount ≥ w yields 0, matching those helpers exactly. The amount
@@ -13137,8 +13140,8 @@ pub enum TsInsn {
     Shr { d: u16, a: u16, b: u16, w: u32 },
     /// Narrow replicate: dst = {count{src}} with count*w ≤ 64.
     Repl { d: u16, s: u16, w: u8, count: u8 },
-    /// Wide replicate (result 65..=128 bits) of a NARROW part.
-    WRepl { d: u16, s: u16, w: u8, count: u8 },
+    /// Wide replicate (result 65..=512 bits) of a NARROW part.
+    WRepl { d: u16, s: u16, w: u8, count: u16 },
 }
 
 pub struct TwoStateBlock {
@@ -13153,10 +13156,13 @@ pub struct TwoStateBlock {
     /// Any branch/jump present. Straight-line blocks (the overwhelmingly
     /// common comb shape) run a compact loop without the pc bookkeeping.
     pub has_ctrl: bool,
-    /// Any wide (65..=128-bit) op present — routed to the wide executor so
+    /// Any wide (65..=512-bit) op present — routed to the wide executor so
     /// the narrow hot loops keep their code size.
     pub has_wide: bool,
-    /// Wide (>64-bit) signals read WHOLE — X-checked via words128_if_clean.
+    /// Words per wide register for this block: 0 (none), 2 (widths up to
+    /// 128) or 8 (up to 512); selects the wide executor's monomorph.
+    pub wide_words: u8,
+    /// Wide (>64-bit) signals read WHOLE — X-checked via words_if_clean.
     pub reads_wide: Box<[u32]>,
     /// Signals this block WRITES (sorted, deduped). §9.3.1 force filtering
     /// is per DESTINATION — `write_sig!` drops writes to forced signals and
@@ -13667,6 +13673,8 @@ pub fn lower_two_state(
             } else {
                 rw_.push((s32, skip));
             }
+    // Widest register defined in the block: picks the wide bank's word count.
+    let mut max_wide: u32 = 0;
         } else {
             let t = (sig as u32, lo as u16, w as u16);
             if let Some(e) = rs_.iter_mut().find(|(a, b, c, _)| (*a, *b, *c) == t) {
@@ -13688,10 +13696,9 @@ pub fn lower_two_state(
     let sig_ok_wide = |sig: usize| -> bool {
         sig < signal_widths.len()
             && signal_widths[sig] > 64
-            && signal_widths[sig] <= 128
+            && signal_widths[sig] <= 512
             && !signal_real[sig]
     };
-    let wmask_hi = |w: u32| -> u64 { ts_mask(w - 64) };
     // Static array span: (first_id, lo, hi) with elements proven narrow,
     // unsigned, non-real (elements of one array share their declaration;
     // the first element's metadata stands for all).
@@ -13861,6 +13868,9 @@ pub fn lower_two_state(
             if track {
                 TS_GATE_WHY.with(|c| c.set($why));
             }
+            if w > max_wide {
+                max_wide = w;
+            }
             return None;
         }};
     }
@@ -13939,15 +13949,15 @@ pub fn lower_two_state(
             }
             Insn::LoadConst(d, k) => {
                 if k.width > 64 {
-                    if k.width > 128 || k.is_signed {
+                    if k.width > 512 || k.is_signed {
                         return None;
                     }
-                    let mut w2 = [0u64; 2];
-                    if !k.words128_if_clean(&mut w2) {
+                    let mut wv = vec![0u64; (k.width as usize).div_ceil(64)];
+                    if !k.words_if_clean(&mut wv) {
                         return None;
                     }
                     def!(rw, *d, k.width);
-                    out.push(TsInsn::WConst { d: *d as u16, v: Box::new(w2) });
+                    out.push(TsInsn::WConst { d: *d as u16, v: wv.into_boxed_slice() });
                 } else if k.has_xz() {
                     // Fold rather than reject: admitted only while it stays
                     // a constant all the way to a store (see the loop guard).
@@ -13991,19 +14001,22 @@ pub fn lower_two_state(
                 }
                 let w = hi - lo + 1;
                 if w > 64 {
-                    if w > 128 {
+                    if w > 512 {
                         return None;
                     }
-                    // Wide slice of a signal: prefilter the two ≤64 halves.
-                    note_read(sig, lo, 64, false, stored.contains(&(sig as u32)), &mut reads_whole, &mut reads_slice);
-                    note_read(sig, lo + 64, w - 64, false, stored.contains(&(sig as u32)), &mut reads_whole, &mut reads_slice);
+                    // Wide slice of a signal, noted as ≤64-bit chunks.
+                    let mut off = 0;
+                    while off < w {
+                        let cw = (w - off).min(64);
+                        note_read(sig, lo + off, cw, false, stored.contains(&(sig as u32)), &mut reads_whole, &mut reads_slice);
+                        off += 64;
+                    }
                     def!(rw, *d, w);
                     out.push(TsInsn::WSigRange {
                         d: *d as u16,
                         sig: sig as u32,
                         lo: lo as u16,
                         w: w as u16,
-                        mask_hi: wmask_hi(w),
                     });
                     continue;
                 }
@@ -14035,7 +14048,7 @@ pub fn lower_two_state(
             }
             Insn::BitSelectConst(d, s, idx) => {
                 let sw = rw[*s as usize]?;
-                if *idx >= sw || *idx > 127 {
+                if *idx >= sw || *idx > 511 {
                     return None;
                 }
                 def!(rw, *d, 1);
@@ -14048,7 +14061,7 @@ pub fn lower_two_state(
             Insn::RangeSelectConst(d, s, l, r) => {
                 let sw = rw[*s as usize]?;
                 let (hi, lo) = (*l.max(r), *l.min(r));
-                if hi >= sw || hi > 127 {
+                if hi >= sw || hi > 511 {
                     return None;
                 }
                 let w = hi - lo + 1;
@@ -14059,7 +14072,7 @@ pub fn lower_two_state(
                             d: *d as u16,
                             s: *s as u16,
                             lo: lo as u16,
-                            mask_hi: wmask_hi(w),
+                            w: w as u16,
                         }
                     } else {
                         TsInsn::RangeFromW {
@@ -14164,10 +14177,10 @@ pub fn lower_two_state(
                 def!(rw, *d, w);
                 sg[*d as usize] = s_sg;
                 out.push(if w > 64 {
-                    if w > 128 {
+                    if w > 512 {
                         return None;
                     }
-                    TsInsn::WNot { d: *d as u16, s: *s as u16, mask_hi: wmask_hi(w) }
+                    TsInsn::WNot { d: *d as u16, s: *s as u16, w: w as u16 }
                 } else {
                     TsInsn::Not { d: *d as u16, s: *s as u16, mask: ts_mask(w) }
                 });
@@ -14373,19 +14386,19 @@ pub fn lower_two_state(
             Insn::Concat(d, parts) => {
                 let mut total = 0u32;
                 let mut any_wide = false;
-                let mut lowered: Vec<(u16, u8, bool)> = Vec::with_capacity(parts.len());
+                let mut lowered: Vec<(u16, u16, bool)> = Vec::with_capacity(parts.len());
                 for &p in parts.iter() {
                     let w = rw[p as usize]?;
-                    if w > 128 {
+                    if w > 512 {
                         return None;
                     }
                     total += w;
                     if w > 64 {
                         any_wide = true;
                     }
-                    lowered.push((p as u16, w as u8, w > 64));
+                    lowered.push((p as u16, w as u16, w > 64));
                 }
-                if total == 0 || total > 128 {
+                if total == 0 || total > 512 {
                     return None;
                 }
                 def!(rw, *d, total);
@@ -14395,26 +14408,26 @@ pub fn lower_two_state(
                     TsInsn::Concat2 {
                         d: *d as u16,
                         a: lowered[0].0,
-                        wa: lowered[0].1,
+                        wa: lowered[0].1 as u8,
                         b: lowered[1].0,
-                        wb: lowered[1].1,
+                        wb: lowered[1].1 as u8,
                     }
                 } else if lowered.len() == 3 {
                     TsInsn::Concat3 {
                         d: *d as u16,
                         a: lowered[0].0,
-                        wa: lowered[0].1,
+                        wa: lowered[0].1 as u8,
                         b: lowered[1].0,
-                        wb: lowered[1].1,
+                        wb: lowered[1].1 as u8,
                         c: lowered[2].0,
-                        wc: lowered[2].1,
+                        wc: lowered[2].1 as u8,
                     }
                 } else {
                     TsInsn::Concat {
                         d: *d as u16,
                         parts: lowered
                             .into_iter()
-                            .map(|(r, w, _)| (r, w))
+                            .map(|(r, w, _)| (r, w as u8))
                             .collect::<Vec<_>>()
                             .into_boxed_slice(),
                     }
@@ -14422,7 +14435,7 @@ pub fn lower_two_state(
             }
             Insn::Resize(r, w) => {
                 let cur = rw[*r as usize]?;
-                if *w > 128 {
+                if *w > 512 {
                     return None;
                 }
                 if *w > cur && mn!(*r) {
@@ -14432,7 +14445,7 @@ pub fn lower_two_state(
                     if cur <= 64 {
                         out.push(TsInsn::WFromN { r: *r as u16 });
                     } else if *w < cur {
-                        out.push(TsInsn::WMask { d: *r as u16, mask_hi: wmask_hi(*w) });
+                        out.push(TsInsn::WMask { d: *r as u16, w: *w as u16 });
                     }
                     rw[*r as usize] = Some(*w);
                     def_tc[*r as usize] = tcount[cur_i];
@@ -14441,6 +14454,7 @@ pub fn lower_two_state(
                 }
                 if cur > 64 {
                     out.push(TsInsn::NFromW { r: *r as u16, mask: ts_mask(*w) });
+                    // Narrow forms: every part is ≤ 64 bits here.
                     rw[*r as usize] = Some(*w);
                     def_tc[*r as usize] = tcount[cur_i];
                     rc[*r as usize] = None;
@@ -14478,6 +14492,9 @@ pub fn lower_two_state(
                         return None;
                     }
                     let narrow = signal_widths[sig] <= 64;
+                    if *w > max_wide {
+                        max_wide = *w;
+                    }
                     note_read(sig, *bit, 1, narrow, stored.contains(&(sig as u32)), &mut reads_whole, &mut reads_slice);
                 }
                 out.push(TsInsn::BrSigFalse { sig: sig as u32, bit: *bit, t: *t });
@@ -14580,7 +14597,7 @@ pub fn lower_two_state(
                     TsInsn::WRedAnd {
                         d: *d as u16,
                         s: *src as u16,
-                        mask_hi: wmask_hi(sw),
+                        w: sw as u16,
                     }
                 } else {
                     TsInsn::RedAnd {
@@ -14661,7 +14678,7 @@ pub fn lower_two_state(
                 if *w > 64 {
                     // Wide store: register and destination agree exactly (a
                     // Resize precedes otherwise); signed wide targets bail.
-                    if *w > 128 || cw != *w || signal_signed[sig] {
+                    if *w > 512 || cw != *w || signal_signed[sig] {
                         return None;
                     }
                     side_effects = true;
@@ -14731,7 +14748,7 @@ pub fn lower_two_state(
                 };
                 let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
                 let w = high - low + 1;
-                if cw > 64 && cw <= 128 && w == cw && wide_dest && high < signal_widths[sig] {
+                if cw > 64 && cw <= 512 && w == cw && wide_dest && high < signal_widths[sig] {
                     side_effects = true;
                     stored.push(sig as u32);
                     out.push(TsInsn::WRangeStore { sig: sig as u32, lo: low, s: *r as u16, w });
@@ -14789,7 +14806,7 @@ pub fn lower_two_state(
                 if signal_widths[sig] > 64 {
                     // Wide destination: a ≤64-bit window spliced into the
                     // pending value (the id_dp pipeline registers on c906).
-                    if cw > 64 && cw <= 128 && w == cw && high < signal_widths[sig] {
+                    if cw > 64 && cw <= 512 && w == cw && high < signal_widths[sig] {
                         side_effects = true;
                         out.push(TsInsn::WRangeStoreNba { sig: sig as u32, lo: low, s: *r as u16, w });
                         continue;
@@ -14840,7 +14857,7 @@ pub fn lower_two_state(
                 }
                 let cw = rw[*r as usize]?;
                 if *w > 64 {
-                    if *w > 128 || cw != *w || signal_signed[sig] {
+                    if *w > 512 || cw != *w || signal_signed[sig] {
                         return None;
                     }
                     side_effects = true;
@@ -15052,7 +15069,7 @@ pub fn lower_two_state(
                         }
                     }
                 }
-                if n == 0 || sw > 64 || n > 128 {
+                if n == 0 || sw > 64 || n > 512 {
                     return None;
                 }
                 let total = sw.saturating_mul(n);
@@ -15070,7 +15087,7 @@ pub fn lower_two_state(
                     xc_live.push(*d);
                     continue;
                 }
-                if total == 0 || total > 128 {
+                if total == 0 || total > 512 {
                     return None;
                 }
                 def!(rw, *d, total);
@@ -15086,7 +15103,7 @@ pub fn lower_two_state(
                         d: *d as u16,
                         s: *src as u16,
                         w: sw as u8,
-                        count: n as u8,
+                        count: n as u16,
                     }
                 });
             }
@@ -15227,6 +15244,16 @@ pub fn lower_two_state(
         .map(|(a, b, c, _)| (a, b, c))
         .collect();
     let reads_wide: Vec<u32> = reads_wide
+    // 512-bit wide class, opt-in (XEZIM_TS_WIDE512=1): admitting the c906
+    // vector-unit buses measured +5.4% instructions at it=300 — 200k x-read
+    // bails per 100 iterations from entries that never demote, and only 2.3M
+    // interpreter instructions moved. Off, blocks whose widest register
+    // exceeds 128 bits stay on the interpreter as before.
+    static WIDE512: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let wide512 = *WIDE512.get_or_init(|| std::env::var("XEZIM_TS_WIDE512").ok().as_deref() == Some("1"));
+    if max_wide > 128 && !wide512 {
+        return None;
+    }
         .into_iter()
         .filter(|&(_, sk)| !(apply_skip && sk))
         .map(|(x, _)| x)
@@ -15304,3 +15331,10 @@ pub(crate) fn system_function_result(name: &str) -> Option<(u32, bool)> {
 pub(crate) fn system_function_carries_arg(name: &str) -> bool {
     matches!(name, "$signed" | "$unsigned" | "$past" | "$sampled")
 }
+        wide_words: if !has_wide {
+            0
+        } else if max_wide > 128 {
+            8
+        } else {
+            2
+        },
