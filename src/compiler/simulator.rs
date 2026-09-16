@@ -28098,17 +28098,29 @@ impl Simulator {
                         pc += 1;
                         continue;
                     };
-                    let (hi, lo) = (hi as u32, lo as u32);
-                    let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
-                    let w = high - low + 1;
-                    let val = self.vm_regs[*val_reg as usize].resize(w);
-                    let id = *sig_id;
-                    let sig_w = self.signal_widths[id];
-                    let high_eff = high.min(sig_w.saturating_sub(1));
-                    if oob_write_discard(high as i64, low as i64, sig_w) {
+                    // §11.5.1 with a negative base (`x[i +: 6]`, i = -1):
+                    // labels below bit 0 are outside the vector, so the
+                    // value's low bits are dropped and only the in-range
+                    // window is written. Converting the bounds to u32 first
+                    // wrapped -1 to 4294967295 and dropped the whole write.
+                    let (low_i, high_i) = (hi.min(lo), hi.max(lo));
+                    if oob_write_discard(high_i, low_i, self.signal_widths[*sig_id]) || high_i < 0 {
                         pc += 1;
                         continue;
                     }
+                    let below = (-low_i).max(0) as u32;
+                    let (low, high) = (low_i.max(0) as u32, high_i.min(u32::MAX as i64) as u32);
+                    let w = high - low + 1;
+                    let val = if below > 0 {
+                        self.vm_regs[*val_reg as usize]
+                            .shift_right(&Value::from_u64(below as u64, 32))
+                            .resize(w)
+                    } else {
+                        self.vm_regs[*val_reg as usize].resize(w)
+                    };
+                    let id = *sig_id;
+                    let sig_w = self.signal_widths[id];
+                    let high_eff = high.min(sig_w.saturating_sub(1));
                     let copy_count = high_eff.saturating_add(1).saturating_sub(low) as usize;
 
                     if low == 0 && high_eff + 1 >= sig_w {
@@ -28152,6 +28164,15 @@ impl Simulator {
                                     signal_id: id,
                                     value: new_val,
                                 });
+                    // §11.5.1: labels above the MSB are outside the vector;
+                    // only the in-range window is composed (the blocking arm
+                    // clamps the same way — unclamped, `x[4:-1] <= v` put a
+                    // fifth bit into a 4-bit signal).
+                    let high = high.min(self.signal_widths[*sig_id].saturating_sub(1));
+                    if low > high {
+                        pc += 1;
+                        continue;
+                    }
                             }
                         }
                     } else {
@@ -28442,17 +28463,29 @@ impl Simulator {
                         pc += 1;
                         continue;
                     };
-                    let (hi, lo) = (hi as u32, lo as u32);
-                    let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
-                    let w = high - low + 1;
-                    let val = self.vm_regs[*val_reg as usize].resize(w);
-                    let id = *sig_id;
-                    let sig_w = self.signal_widths[id];
-                    let high_eff = high.min(sig_w.saturating_sub(1));
-                    if oob_write_discard(high as i64, low as i64, sig_w) {
+                    // §11.5.1 with a negative base (`x[i +: 6]`, i = -1):
+                    // labels below bit 0 are outside the vector, so the
+                    // value's low bits are dropped and only the in-range
+                    // window is written. Converting the bounds to u32 first
+                    // wrapped -1 to 4294967295 and dropped the whole write.
+                    let (low_i, high_i) = (hi.min(lo), hi.max(lo));
+                    if oob_write_discard(high_i, low_i, self.signal_widths[*sig_id]) || high_i < 0 {
                         pc += 1;
                         continue;
                     }
+                    let below = (-low_i).max(0) as u32;
+                    let (low, high) = (low_i.max(0) as u32, high_i.min(u32::MAX as i64) as u32);
+                    let w = high - low + 1;
+                    let val = if below > 0 {
+                        self.vm_regs[*val_reg as usize]
+                            .shift_right(&Value::from_u64(below as u64, 32))
+                            .resize(w)
+                    } else {
+                        self.vm_regs[*val_reg as usize].resize(w)
+                    };
+                    let id = *sig_id;
+                    let sig_w = self.signal_widths[id];
+                    let high_eff = high.min(sig_w.saturating_sub(1));
                     let copy_count = high_eff.saturating_add(1).saturating_sub(low) as usize;
 
                     if low == 0 && high_eff + 1 >= sig_w {

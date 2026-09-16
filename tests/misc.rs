@@ -139,6 +139,8 @@ mod packed_mem_range_store;
 mod nba_array_read_x_index;
 #[path = "misc/part_select_constant_bounds.rs"]
 mod part_select_constant_bounds;
+#[path = "misc/part_select_negative_bound_compiled.rs"]
+mod part_select_negative_bound_compiled;
 #[path = "misc/select_semantics_11_5_1.rs"]
 mod select_semantics_11_5_1;
 #[path = "misc/obj_assocd_event_disable_fork.rs"]

@@ -7798,7 +7798,7 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     let base = self.compile_expr(expr, 0)?;
                     if let (Some(l), Some(r)) =
-                        (self.eval_const_expr(left), self.eval_const_expr(right))
+                        (self.eval_const_bound(left), self.eval_const_bound(right))
                     {
                         // §7.4.1: on a packed MULTI-D base (`logic [1:0][63:0]`
                         // or a packed array of a struct typedef), a constant
@@ -8057,9 +8057,9 @@ impl<'a> BytecodeCompiler<'a> {
                             right,
                             kind: RangeKind::Constant,
                             ..
-                        } => match (self.eval_const_expr(left), self.eval_const_expr(right)) {
-                            (Some(hi), Some(lo)) if hi >= lo => hi - lo + 1,
-                            (Some(hi), Some(lo)) => lo - hi + 1,
+                        } => match (self.eval_const_bound(left), self.eval_const_bound(right)) {
+                            (Some(hi), Some(lo)) if hi >= lo => (hi - lo + 1) as u32,
+                            (Some(hi), Some(lo)) => (lo - hi + 1) as u32,
                             _ => 0,
                         },
                         _ => 0,
@@ -8762,7 +8762,7 @@ impl<'a> BytecodeCompiler<'a> {
                         match kind {
                             RangeKind::Constant => {
                                 if let (Some(hi), Some(lo)) =
-                                    (self.eval_const_expr(left), self.eval_const_expr(right))
+                                    (self.eval_const_bound(left), self.eval_const_bound(right))
                                 {
                                     // §11.5.1: labels below the declared low
                                     // bound are outside the vector; only the
@@ -8832,8 +8832,14 @@ impl<'a> BytecodeCompiler<'a> {
                     match kind {
                         RangeKind::Constant => {
                             if let (Some(hi), Some(lo)) =
-                                (self.eval_const_expr(left), self.eval_const_expr(right))
+                                (self.eval_const_bound(left), self.eval_const_bound(right))
                             {
+                                // Flattened element targets: a negative label is left to the interpreter.
+                                if hi < 0 || lo < 0 {
+                                    self.bail("range_target_negative_bound");
+                                    return false;
+                                }
+                                let (hi, lo) = (hi as u32, lo as u32);
                                 self.emit(Insn::NbaAssignRange(as_sig_id(id), hi, lo, val_reg));
                                 return true;
                             }
@@ -9371,7 +9377,7 @@ impl<'a> BytecodeCompiler<'a> {
                         match kind {
                             RangeKind::Constant => {
                                 if let (Some(hi), Some(lo)) =
-                                    (self.eval_const_expr(left), self.eval_const_expr(right))
+                                    (self.eval_const_bound(left), self.eval_const_bound(right))
                                 {
                                     // §11.5.1: see the NBA arm — labels below
                                     // the low bound are dropped, the value is
@@ -9482,8 +9488,14 @@ impl<'a> BytecodeCompiler<'a> {
                     match kind {
                         RangeKind::Constant => {
                             if let (Some(hi), Some(lo)) =
-                                (self.eval_const_expr(left), self.eval_const_expr(right))
+                                (self.eval_const_bound(left), self.eval_const_bound(right))
                             {
+                                // Flattened element targets: a negative label is left to the interpreter.
+                                if hi < 0 || lo < 0 {
+                                    self.bail("range_target_negative_bound");
+                                    return false;
+                                }
+                                let (hi, lo) = (hi as u32, lo as u32);
                                 let (low, high) = if hi >= lo { (lo, hi) } else { (hi, lo) };
                                 if let Some(range_w) =
                                     high.checked_sub(low).and_then(|w| w.checked_add(1))
@@ -9783,20 +9795,57 @@ impl<'a> BytecodeCompiler<'a> {
                         self.eval_const_expr(right).unwrap_or(32)
                     }
                     RangeKind::Constant => {
-                    if let (Some(l), Some(r)) =
-                        (self.eval_const_expr(left), self.eval_const_expr(right))
-                    {
+                        if let (Some(l), Some(r)) =
+                            (self.eval_const_bound(left), self.eval_const_bound(right))
+                        {
+                            // Signed bounds: `x[4:-1]` is 6 bits wide, not the
+                            // u32-wrapped 4294967292 that clamped to the cap.
                             let (hi, lo) = if l >= r { (l, r) } else { (r, l) };
-                        hi.checked_sub(lo)
-                            .and_then(|w| w.checked_add(1))
-                            .unwrap_or(32)
-                    } else {
-                        32
-                }
-            }
+                            (hi - lo + 1).clamp(1, u32::MAX as i64) as u32
+                        } else {
+                            32
+                        }
+                    }
             },
             ExprKind::Concatenation(parts) => parts.iter().map(|p| self.infer_lhs_width(p)).sum(),
             _ => 32,
+        }
+    }
+
+    /// Signed constant for a part-select bound. `eval_const_expr` folds in
+    /// u32, so a literal `-1`, `LO-1` or a negative parameter wrapped to
+    /// 4294967295 and a write like `x[4:-1] = v` was dropped with a width
+    /// of -4 (§11.5.1 keeps the in-range bits).
+    fn eval_const_bound(&self, e: &Expression) -> Option<i64> {
+        match &e.kind {
+            ExprKind::Paren(inner) => self.eval_const_bound(inner),
+            ExprKind::Unary { op: UnaryOp::Minus, operand } => {
+                Some(self.eval_const_bound(operand)?.wrapping_neg())
+            }
+            ExprKind::Unary { op: UnaryOp::Plus, operand } => self.eval_const_bound(operand),
+            ExprKind::Binary { op, left, right }
+                if matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul) =>
+            {
+                let l = self.eval_const_bound(left)?;
+                let r = self.eval_const_bound(right)?;
+                Some(match op {
+                    BinaryOp::Add => l.wrapping_add(r),
+                    BinaryOp::Sub => l.wrapping_sub(r),
+                    _ => l.wrapping_mul(r),
+                })
+            }
+            ExprKind::Ident(hier) if hier.path.len() == 1 && hier.path[0].selects.is_empty() => {
+                if let Some(&v) = self.const_var_binds.get(hier.path[0].name.name.as_str()) {
+                    return Some(v as i64);
+                }
+                let pv = self.lookup_param_value(hier)?;
+                if pv.is_signed {
+                    pv.to_i64()
+                } else {
+                    pv.to_u64().map(|u| u as i64)
+                }
+            }
+            _ => self.eval_const_expr(e).map(|v| v as i64),
         }
     }
 
@@ -10420,7 +10469,7 @@ impl<'a> BytecodeCompiler<'a> {
                 match kind {
                     RangeKind::Constant => {
                         if let (Some(l), Some(r)) =
-                            (self.eval_const_expr(left), self.eval_const_expr(right))
+                            (self.eval_const_bound(left), self.eval_const_bound(right))
                         {
                             ((l as i64 - r as i64).unsigned_abs() as u32) + 1
                         } else {
