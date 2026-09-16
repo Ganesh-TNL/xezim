@@ -5523,6 +5523,10 @@ pub struct Simulator {
     /// unit / instance / construct). Implies per-entry and per-edge-block
     /// nanosecond attribution.
     profile_report: bool,
+    /// XEZIM_PROC_FSM: 1 = every compilable initial body is a process FSM,
+    /// 0 = none, unset (2) = the plain-stimulus shape only. Read per
+    /// simulator so a test can opt out before it builds one.
+    proc_fsm_mode: u8,
     comb_dep_entries: Vec<u32>,
     /// Bitvec: dirty_signals[signal_id] = true if signal changed since last settle.
     dirty_signals: Vec<bool>,
@@ -9039,6 +9043,11 @@ impl Simulator {
             comb_plan_abortn: Vec::new(),
             profile_report: std::env::var("XEZIM_PROFILE_REPORT").ok().as_deref() == Some("1"),
             ts_xbail_by_entry: HashMap::default(),
+            proc_fsm_mode: match std::env::var("XEZIM_PROC_FSM").as_deref() {
+                Ok("1") => 1,
+                Ok("0") => 0,
+                _ => 2,
+            },
             comb_dep_entries: Vec::new(),
             dirty_signals: vec![false; num_signals],
             dirty_list: Vec::new(),
@@ -14283,14 +14292,31 @@ impl Simulator {
             // count runs first so memory-init megablocks skip without the
             // SeqBlock rebuild.
             {
-                use std::sync::OnceLock;
-                static FSM_ON: OnceLock<bool> = OnceLock::new();
-                let fsm_on = *FSM_ON.get_or_init(|| {
-                    std::env::var("XEZIM_PROC_FSM").as_deref() == Ok("1")
-                });
-                if fsm_on
-                    && stmts.iter().map(Self::count_timing_controls).sum::<usize>() >= 1
-                {
+                // 1 = every compilable initial body; 0 = none; unset = the
+                // plain-stimulus shape below (a testbench's clocked stimulus
+                // loop ran 8.6x slower on the AST path than as an FSM).
+                let fsm_mode = self.proc_fsm_mode;
+                let timing = stmts.iter().map(Self::count_timing_controls).sum::<usize>();
+                let admit = timing >= 1
+                    && match fsm_mode {
+                        1 => true,
+                        0 => false,
+                        _ => {
+                            // Clock-driven only: a body with at least one `@`
+                            // wait is the hot stimulus loop; delay-only
+                            // sequences (reset scripts, UDP/stall probes,
+                            // ordering tests) stay on the AST path, whose
+                            // per-statement waiter and UDP evaluation order
+                            // their pinned traces rely on. A labeled block is
+                            // a hierarchical scope (`disable lbl`, `lbl.v`)
+                            // the FSM does not model.
+                            std::env::var_os("XEZIM_VALUE_TRACE").is_none()
+                                && block_label.is_none()
+                                && stmts.iter().any(Self::stmt_contains_event_control)
+                                && stmts.iter().all(|st| self.stmt_is_plain_stimulus(st))
+                        }
+                    };
+                if admit {
                     let wrapped = Statement::new(
                         StatementKind::SeqBlock {
                             name: None,
@@ -17993,6 +18019,81 @@ impl Simulator {
             | StatementKind::Foreach { body, .. } => Self::stmt_contains_event_control(body),
             _ => false,
         }
+    }
+
+    /// Shape admitted to the process FSM by default: the plain stimulus
+    /// loop of a testbench — blocking/non-blocking assignments, if/case,
+    /// counted loops, `#` and `@` timing, system tasks — and nothing the
+    /// FSM does not model exactly: fork/join, disable, wait, named events,
+    /// named blocks, clocking cycle delays, assertions, force/release,
+    /// virtual-interface handles.
+    fn stmt_is_plain_stimulus(&self, stmt: &Statement) -> bool {
+        use crate::ast::stmt::{EventControl, TimingControl};
+        match &stmt.kind {
+            StatementKind::Null | StatementKind::Break | StatementKind::Continue => true,
+            StatementKind::Expr(e) => {
+                // Postponed-region observers keep the AST path: its
+                // per-statement propagation is what their pinned traces
+                // (UDP edge tables with two inputs changing) rely on.
+                if let ExprKind::SystemCall { name, .. } = &e.kind {
+                    if matches!(name.as_str(), "$monitor" | "$strobe" | "$monitoron" | "$monitoroff") {
+                        return false;
+                    }
+                }
+                !self.expr_touches_viface(e)
+            }
+            StatementKind::BlockingAssign { lvalue, rvalue } => {
+                !self.expr_touches_viface(lvalue) && !self.expr_touches_viface(rvalue)
+            }
+            StatementKind::NonblockingAssign { lvalue, delay, rvalue } => {
+                delay.is_none()
+                    && !self.expr_touches_viface(lvalue)
+                    && !self.expr_touches_viface(rvalue)
+            }
+            StatementKind::If { condition, then_stmt, else_stmt, .. } => {
+                !self.expr_touches_viface(condition)
+                    && self.stmt_is_plain_stimulus(then_stmt)
+                    && else_stmt.as_ref().is_none_or(|e| self.stmt_is_plain_stimulus(e))
+            }
+            StatementKind::Case { expr, items, .. } => {
+                !self.expr_touches_viface(expr)
+                    && items.iter().all(|it| self.stmt_is_plain_stimulus(&it.stmt))
+            }
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body } => self.stmt_is_plain_stimulus(body),
+            StatementKind::SeqBlock { name, stmts } => {
+                name.is_none() && stmts.iter().all(|st| self.stmt_is_plain_stimulus(st))
+            }
+            StatementKind::TimingControl { control, stmt } => {
+                let ok = match control {
+                    TimingControl::Delay(e) => !self.expr_touches_viface(e),
+                    TimingControl::Event(EventControl::Identifier(id)) => !id.name.starts_with("__xz_"),
+                    TimingControl::Event(_) => true,
+                    _ => false,
+                };
+                ok && self.stmt_is_plain_stimulus(stmt)
+            }
+            StatementKind::VarDecl { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// True when an identifier in `e` is a `virtual <iface>` variable: the
+    /// compiled path stores through it as a plain signal, while §25.9 makes
+    /// the assignment a name alias the interpreter tracks.
+    fn expr_touches_viface(&self, e: &Expression) -> bool {
+        let mut names: HashSet<String> = HashSet::default();
+        Self::collect_expr_reads(e, &self.module, &mut names);
+        names.iter().any(|n| {
+            let base = n.split('.').next().unwrap_or(n);
+            self.module
+                .var_decl_types
+                .get(base)
+                .is_some_and(|dt| self.is_virtual_iface_type(dt))
+        })
     }
 
     fn count_timing_controls(stmt: &Statement) -> usize {
@@ -41418,6 +41519,20 @@ impl Simulator {
             *self.name_resolve_hint.borrow_mut() = Some(hint);
         } else {
             *self.name_resolve_hint.borrow_mut() = saved_hint.clone();
+        // Same per-process zero-delay guard as `run_process_stmts` /
+        // `run_fast_delay_always`: a `#0` wait parks the FSM on the inactive
+        // queue, which the scheduler drains inside one delta, so the outer
+        // loop's stall counter never sees `initial forever begin #0; ... end`
+        // spin — the run_proc_fsm path hung the stall-report test.
+        if self.stall_limit > 0 {
+            let hits = self.stall_pid_hits.entry(pid).or_insert(0);
+            if *hits >= self.stall_limit {
+                self.event_queue.schedule(self.time, pid, Vec::new().into());
+                self.zero_delay_defer_pending = true;
+                return;
+            }
+            *hits += 1;
+        }
         }
         let pd = *f.precision_diff.get_or_insert_with(|| {
             let (_, prec_exp) = {

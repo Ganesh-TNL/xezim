@@ -159,6 +159,11 @@ fn baseline() {
 
 #[test]
 fn packed_loop_fast_paths_are_exercised_and_preserve_four_state_values() {
+    // These count the AST interpreter's packed-loop fast paths; keep the
+    // initial block off the process FSM (env is read per simulator).
+    // SAFETY: test-only; the variable is set before the simulator is built.
+    unsafe { std::env::set_var("XEZIM_PROC_FSM", "0") };
+
     let text = run_profiled_design(
         r#"
 module top;
@@ -206,6 +211,11 @@ endmodule
 
 #[test]
 fn unsafe_packed_loop_shapes_decline_both_fast_paths() {
+    // These count the AST interpreter's packed-loop fast paths; keep the
+    // initial block off the process FSM (env is read per simulator).
+    // SAFETY: test-only; the variable is set before the simulator is built.
+    unsafe { std::env::set_var("XEZIM_PROC_FSM", "0") };
+
     let text = run_profiled_design(
         r#"
 module top;
