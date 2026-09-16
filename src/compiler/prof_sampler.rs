@@ -18,6 +18,8 @@ pub const KIND_OTHER: u64 = 0;
 pub const KIND_COMB: u64 = 1 << 32;
 /// An edge block: `KIND_EDGE | block index`.
 pub const KIND_EDGE: u64 = 2 << 32;
+/// A compiled process FSM: `KIND_PROC | pid`.
+pub const KIND_PROC: u64 = 3 << 32;
 
 /// Interval between samples. The kernel's timer slack stretches this to
 /// roughly 60–100 µs, so a run collects about 10k samples a second.
@@ -29,6 +31,8 @@ pub struct SampleTally {
     pub comb: Vec<u64>,
     /// Samples per edge-block index.
     pub edge: Vec<u64>,
+    /// Samples per compiled process FSM (by pid).
+    pub proc: Vec<u64>,
     /// Samples that fell outside comb entries and edge blocks.
     pub other: u64,
     /// Every sample taken.
@@ -43,7 +47,7 @@ pub struct ProfSampler {
     /// Slot the simulation thread publishes into.
     pub cur: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<(Vec<u64>, Vec<u64>, u64, u64)>>,
+    handle: Option<JoinHandle<(Vec<u64>, Vec<u64>, Vec<u64>, u64, u64)>>,
     started: Instant,
 }
 
@@ -62,7 +66,7 @@ impl ProfSampler {
         let handle = std::thread::Builder::new()
             .name("xezim-prof".into())
             .spawn(move || {
-                let (mut comb, mut edge) = (Vec::new(), Vec::new());
+                let (mut comb, mut edge, mut proc) = (Vec::new(), Vec::new(), Vec::new());
                 let (mut other, mut total) = (0u64, 0u64);
                 while !stop_t.load(Ordering::Acquire) {
                     let v = cur_t.load(Ordering::Relaxed);
@@ -70,12 +74,13 @@ impl ProfSampler {
                     match v >> 32 {
                         1 => bump(&mut comb, idx),
                         2 => bump(&mut edge, idx),
+                        3 => bump(&mut proc, idx),
                         _ => other += 1,
                     }
                     total += 1;
                     std::thread::sleep(INTERVAL);
                 }
-                (comb, edge, other, total)
+                (comb, edge, proc, other, total)
             })
             .ok();
         Self { cur, stop, handle, started: Instant::now() }
@@ -85,12 +90,12 @@ impl ProfSampler {
     pub fn finish(mut self) -> SampleTally {
         self.stop.store(true, Ordering::Release);
         let elapsed_ns = self.started.elapsed().as_nanos() as u64;
-        let (comb, edge, other, total) = match self.handle.take().map(|h| h.join()) {
+        let (comb, edge, proc, other, total) = match self.handle.take().map(|h| h.join()) {
             Some(Ok(t)) => t,
-            _ => (Vec::new(), Vec::new(), 0, 0),
+            _ => (Vec::new(), Vec::new(), Vec::new(), 0, 0),
         };
         let ns_per_sample = elapsed_ns as f64 / total.max(1) as f64;
-        SampleTally { comb, edge, other, total, elapsed_ns, ns_per_sample }
+        SampleTally { comb, edge, proc, other, total, elapsed_ns, ns_per_sample }
     }
 }
 

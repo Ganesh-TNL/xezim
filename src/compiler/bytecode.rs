@@ -13673,6 +13673,8 @@ pub fn lower_two_state(
     // (possible for loop-var slots, which are mutable) bails: stream-order
     // width tracking can't represent it.
     let mut rw: Vec<Option<u32>> = vec![None; cb.num_regs as usize];
+    // Widest register defined in the block: picks the wide bank's word count.
+    let mut max_wide: u32 = 0;
     // Constant value per register (from LoadConst), for folding const-index
     // array writes into static element stores. Cleared on any redefinition.
     let mut rc: Vec<Option<u64>> = vec![None; cb.num_regs as usize];
@@ -13722,8 +13724,6 @@ pub fn lower_two_state(
             } else {
                 rw_.push((s32, skip));
             }
-    // Widest register defined in the block: picks the wide bank's word count.
-    let mut max_wide: u32 = 0;
         } else {
             let t = (sig as u32, lo as u16, w as u16);
             if let Some(e) = rs_.iter_mut().find(|(a, b, c, _)| (*a, *b, *c) == t) {
@@ -13868,6 +13868,9 @@ pub fn lower_two_state(
         ($rw:ident, $r:expr, $w:expr) => {{
             let r = $r as usize;
             let w = $w;
+            if w > max_wide {
+                max_wide = w;
+            }
             sg[r] = false;
             wfill[r] = None;
             match $rw[r] {
@@ -13916,9 +13919,6 @@ pub fn lower_two_state(
         ($why:expr) => {{
             if track {
                 TS_GATE_WHY.with(|c| c.set($why));
-            }
-            if w > max_wide {
-                max_wide = w;
             }
             return None;
         }};
@@ -14454,6 +14454,7 @@ pub fn lower_two_state(
                 out.push(if total > 64 || any_wide {
                     TsInsn::WConcat { d: *d as u16, parts: lowered.into_boxed_slice() }
                 } else if lowered.len() == 2 {
+                    // Narrow forms: every part is ≤ 64 bits here.
                     TsInsn::Concat2 {
                         d: *d as u16,
                         a: lowered[0].0,
@@ -14491,6 +14492,9 @@ pub fn lower_two_state(
                     gate!("signed widening (resize)");
                 }
                 if *w > 64 {
+                    if *w > max_wide {
+                        max_wide = *w;
+                    }
                     if cur <= 64 {
                         out.push(TsInsn::WFromN { r: *r as u16 });
                     } else if *w < cur {
@@ -14503,7 +14507,6 @@ pub fn lower_two_state(
                 }
                 if cur > 64 {
                     out.push(TsInsn::NFromW { r: *r as u16, mask: ts_mask(*w) });
-                    // Narrow forms: every part is ≤ 64 bits here.
                     rw[*r as usize] = Some(*w);
                     def_tc[*r as usize] = tcount[cur_i];
                     rc[*r as usize] = None;
@@ -14541,9 +14544,6 @@ pub fn lower_two_state(
                         return None;
                     }
                     let narrow = signal_widths[sig] <= 64;
-                    if *w > max_wide {
-                        max_wide = *w;
-                    }
                     note_read(sig, *bit, 1, narrow, stored.contains(&(sig as u32)), &mut reads_whole, &mut reads_slice);
                 }
                 out.push(TsInsn::BrSigFalse { sig: sig as u32, bit: *bit, t: *t });
@@ -15145,14 +15145,14 @@ pub fn lower_two_state(
                         d: *d as u16,
                         s: *src as u16,
                         w: sw as u8,
-                        count: n as u8,
+                        count: n as u16,
                     }
                 } else {
                     TsInsn::Repl {
                         d: *d as u16,
                         s: *src as u16,
                         w: sw as u8,
-                        count: n as u16,
+                        count: n as u8,
                     }
                 });
             }
@@ -15244,6 +15244,16 @@ pub fn lower_two_state(
     {
         return None;
     }
+    // 512-bit wide class, opt-in (XEZIM_TS_WIDE512=1): admitting the c906
+    // vector-unit buses measured +5.4% instructions at it=300 — 200k x-read
+    // bails per 100 iterations from entries that never demote, and only 2.3M
+    // interpreter instructions moved. Off, blocks whose widest register
+    // exceeds 128 bits stay on the interpreter as before.
+    static WIDE512: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let wide512 = *WIDE512.get_or_init(|| std::env::var("XEZIM_TS_WIDE512").ok().as_deref() == Some("1"));
+    if max_wide > 128 && !wide512 {
+        return None;
+    }
     let has_wide = out.iter().any(|i| {
         matches!(
             i,
@@ -15293,16 +15303,6 @@ pub fn lower_two_state(
         .map(|(a, b, c, _)| (a, b, c))
         .collect();
     let reads_wide: Vec<u32> = reads_wide
-    // 512-bit wide class, opt-in (XEZIM_TS_WIDE512=1): admitting the c906
-    // vector-unit buses measured +5.4% instructions at it=300 — 200k x-read
-    // bails per 100 iterations from entries that never demote, and only 2.3M
-    // interpreter instructions moved. Off, blocks whose widest register
-    // exceeds 128 bits stay on the interpreter as before.
-    static WIDE512: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let wide512 = *WIDE512.get_or_init(|| std::env::var("XEZIM_TS_WIDE512").ok().as_deref() == Some("1"));
-    if max_wide > 128 && !wide512 {
-        return None;
-    }
         .into_iter()
         .filter(|&(_, sk)| !(apply_skip && sk))
         .map(|(x, _)| x)
@@ -15346,6 +15346,13 @@ pub fn lower_two_state(
         reads_slice: reads_slice.into_boxed_slice(),
         has_ctrl,
         has_wide,
+        wide_words: if !has_wide {
+            0
+        } else if max_wide > 128 {
+            8
+        } else {
+            2
+        },
         reads_wide: reads_wide.into_boxed_slice(),
         writes: writes.into_boxed_slice(),
         writes_span: writes_span.into_boxed_slice(),
@@ -15380,10 +15387,3 @@ pub(crate) fn system_function_result(name: &str) -> Option<(u32, bool)> {
 pub(crate) fn system_function_carries_arg(name: &str) -> bool {
     matches!(name, "$signed" | "$unsigned" | "$past" | "$sampled")
 }
-        wide_words: if !has_wide {
-            0
-        } else if max_wide > 128 {
-            8
-        } else {
-            2
-        },

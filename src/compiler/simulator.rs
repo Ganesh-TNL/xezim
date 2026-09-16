@@ -9030,19 +9030,19 @@ impl Simulator {
             ts_edge: Vec::new(),
             ts_regs: Vec::new(),
             ts_wregs: Vec::new(),
+            ts_wregs8: Vec::new(),
             prof_ts_evals: 0,
             prof_ts_bail_warnx: 0,
             prof_ts_bail_forced: 0,
             prof_ts_bail_xread: 0,
-            ts_wregs8: Vec::new(),
             prof_ts_bail_abort: 0,
             ts_exec_aborted: false,
             ts_xread_bail: false,
+            ts_xbail_by_entry: HashMap::default(),
             ts_edge_abortn: Vec::new(),
             ts_comb_abortn: Vec::new(),
             comb_plan_abortn: Vec::new(),
             profile_report: std::env::var("XEZIM_PROFILE_REPORT").ok().as_deref() == Some("1"),
-            ts_xbail_by_entry: HashMap::default(),
             proc_fsm_mode: match std::env::var("XEZIM_PROC_FSM").as_deref() {
                 Ok("1") => 1,
                 Ok("0") => 0,
@@ -19381,10 +19381,23 @@ impl Simulator {
                 ),
             ));
         }
+        // Samples that landed outside comb entries and edge blocks: AST
+        // interpreted processes, waiter wake-ups, scheduling. Printed as its
+        // own line so a run dominated by an interpreted testbench loop is
+        // not reported as 90% attributed to the little that was sampled.
+        let unattributed = tally
+            .map(|t| (t.other as f64 * t.ns_per_sample) as u64)
+            .unwrap_or(0)
+            .saturating_sub(t_nba + t_process + t_sched);
+        let proc_fsm = tally
+            .map(|t| (t.proc.iter().sum::<u64>() as f64 * t.ns_per_sample) as u64)
+            .unwrap_or(0);
         let other = [
             ("nba apply", t_nba),
             ("processes", t_process),
             ("scheduling", t_sched),
+            ("compiled process FSMs (sampled)", proc_fsm),
+            ("interpreted processes, waiters (sampled remainder)", unattributed),
         ];
         let other_total: u64 = other.iter().map(|&(_, n)| n).sum();
         let total = attributed + other_total;
@@ -21264,6 +21277,12 @@ impl Simulator {
         if !self.exec_two_state_parts(insns, h.num_regs as u32, h.kind()) {
             if std::mem::take(&mut self.ts_xread_bail) {
                 self.prof_ts_bail_xread += 1;
+                #[cfg(feature = "opcode-census")]
+                {
+                    let e = self.ts_xbail_by_entry.entry(eidx).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 = h.kind();
+                }
                 return false;
             }
             self.prof_ts_bail_abort += 1;
@@ -21389,12 +21408,6 @@ impl Simulator {
         }
         let wregs: &mut [[u64; N]] = unsafe {
             std::slice::from_raw_parts_mut(bank.as_mut_ptr() as *mut [u64; N], bank.len() / N)
-                #[cfg(feature = "opcode-census")]
-                {
-                    let e = self.ts_xbail_by_entry.entry(eidx).or_insert((0, 0));
-                    e.0 += 1;
-                    e.1 = h.kind();
-                }
         };
         let insns_ptr = insns.as_ptr();
         let insns_len = insns.len();
@@ -28139,6 +28152,15 @@ impl Simulator {
                         pc += 1;
                         continue;
                     }
+                    // §11.5.1: labels above the MSB are outside the vector;
+                    // only the in-range window is composed (the blocking arm
+                    // clamps the same way — unclamped, `x[4:-1] <= v` put a
+                    // fifth bit into a 4-bit signal).
+                    let high = high.min(self.signal_widths[*sig_id].saturating_sub(1));
+                    if low > high {
+                        pc += 1;
+                        continue;
+                    }
                     let w = high - low + 1;
                     let val = self.vm_regs[*val_reg as usize].resize(w);
                     let id = *sig_id;
@@ -28265,15 +28287,6 @@ impl Simulator {
                                     signal_id: id,
                                     value: new_val,
                                 });
-                    // §11.5.1: labels above the MSB are outside the vector;
-                    // only the in-range window is composed (the blocking arm
-                    // clamps the same way — unclamped, `x[4:-1] <= v` put a
-                    // fifth bit into a 4-bit signal).
-                    let high = high.min(self.signal_widths[*sig_id].saturating_sub(1));
-                    if low > high {
-                        pc += 1;
-                        continue;
-                    }
                             }
                         }
                     } else {
@@ -41506,19 +41519,6 @@ impl Simulator {
 
     fn run_proc_fsm_inner(&mut self, pid: usize) {
         self.current_pid = pid;
-        let Some(mut f) = self.proc_fsm.remove(&pid) else {
-            return;
-        };
-        if f.regs.len() < f.compiled.num_regs as usize {
-            f.regs.resize(f.compiled.num_regs as usize, Value::zero(1));
-        }
-        std::mem::swap(&mut self.vm_regs, &mut f.regs);
-        let saved_hint = self.name_resolve_hint.borrow_mut().take();
-        if !f.scope.is_empty() {
-            let hint = Self::pooled_string(&mut self.hint_string_pool, &f.scope);
-            *self.name_resolve_hint.borrow_mut() = Some(hint);
-        } else {
-            *self.name_resolve_hint.borrow_mut() = saved_hint.clone();
         // Same per-process zero-delay guard as `run_process_stmts` /
         // `run_fast_delay_always`: a `#0` wait parks the FSM on the inactive
         // queue, which the scheduler drains inside one delta, so the outer
@@ -41533,6 +41533,19 @@ impl Simulator {
             }
             *hits += 1;
         }
+        let Some(mut f) = self.proc_fsm.remove(&pid) else {
+            return;
+        };
+        if f.regs.len() < f.compiled.num_regs as usize {
+            f.regs.resize(f.compiled.num_regs as usize, Value::zero(1));
+        }
+        std::mem::swap(&mut self.vm_regs, &mut f.regs);
+        let saved_hint = self.name_resolve_hint.borrow_mut().take();
+        if !f.scope.is_empty() {
+            let hint = Self::pooled_string(&mut self.hint_string_pool, &f.scope);
+            *self.name_resolve_hint.borrow_mut() = Some(hint);
+        } else {
+            *self.name_resolve_hint.borrow_mut() = saved_hint.clone();
         }
         let pd = *f.precision_diff.get_or_insert_with(|| {
             let (_, prec_exp) = {
@@ -41625,7 +41638,17 @@ impl Simulator {
         loop {
             self.fsm_start_pc = f.pc;
             self.fsm_suspend = None;
+            if self.profile_report {
+                self.prof_cur.store(
+                    crate::compiler::prof_sampler::KIND_PROC | pid as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
             self.exec_insns(&f.compiled.instructions);
+            if self.profile_report {
+                self.prof_cur
+                    .store(crate::compiler::prof_sampler::KIND_OTHER, std::sync::atomic::Ordering::Relaxed);
+            }
             if let Some((npc, kind)) = self.fsm_suspend.take() {
                 f.pc = npc;
                 match kind {

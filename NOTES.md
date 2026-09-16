@@ -9,6 +9,10 @@ and the development workflow are in [README.md](README.md).
 
 **Correctness**
 
+* A constant part-select write with a negative label (`x[4:-1] = v`,
+  `x[0:-1] <= v`) in a clocked block or compiled process keeps its in-range
+  bits (IEEE 1800 §11.5.1); the compiled path folded the bounds unsigned,
+  dropped the write, and the non-blocking form stored a bit past the MSB.
 * A non-blocking read of an array element through an index that holds x or
   z (`q <= mem[idx]`) queues an all-x element instead of element 0, in the
   two-state and four-state engines alike.
@@ -91,6 +95,20 @@ and the development workflow are in [README.md](README.md).
 
 **Performance** (instruction counts, output identical)
 
+* Experimental, opt-in: `XEZIM_TS_WIDE512=1` lets the two-state path carry
+  registers up to 512 bits (the c906 vector-unit buses) instead of 128. It
+  is off by default because on c906 it costs 5% more instructions: the
+  admitted blocks read x-holding buses and fall back every evaluation.
+* A testbench's stimulus loop in an `initial` block — clocked waits,
+  blocking or non-blocking assignments, `if`/`case`, counted loops and
+  system tasks — now runs as a compiled process by default instead of on
+  the AST interpreter. A 100k-cycle self-checking testbench went from
+  2.8 s to 0.37 s. `XEZIM_PROC_FSM=0` restores the interpreter for every
+  initial block; `XEZIM_PROC_FSM=1` still compiles every body that can be.
+* The `--profile` report prints the time that fell outside combinational
+  entries and clocked blocks (interpreted processes, waiters) as its own
+  line, so a run dominated by an interpreted testbench loop no longer
+  reports 90% attributed to the little that was sampled.
 * `--profile` no longer slows the run it measures: construct times come
   from a 10 kHz sampler thread instead of two clock reads around every
   evaluation. On a 16k-cell gate-level DRAM the profiled simulation phase
