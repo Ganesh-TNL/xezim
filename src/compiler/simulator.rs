@@ -21886,8 +21886,9 @@ impl Simulator {
                 TsInsn::Fallback(st) => {
                     let st = st.clone();
                     self.prof_fallback_insns += 1;
-                    self.ts_fallback_scope();
+                    let saved = self.ts_fallback_enter();
                     self.exec_statement(&st);
+                    self.ts_fallback_exit(saved);
                 }
                 TsInsn::SaveSig { sig } => {
                     let (v, x) = self.signal_table[*sig as usize].raw_bits();
@@ -22736,8 +22737,9 @@ impl Simulator {
                 TsInsn::Fallback(st) => {
                     let st = st.clone();
                     self.prof_fallback_insns += 1;
-                    self.ts_fallback_scope();
+                    let saved = self.ts_fallback_enter();
                     self.exec_statement(&st);
+                    self.ts_fallback_exit(saved);
                 }
                 TsInsn::SaveSig { sig } => {
                     let (v, x) = self.signal_table[*sig as usize].raw_bits();
@@ -23779,8 +23781,9 @@ impl Simulator {
                 TsInsn::Fallback(st) => {
                     let st = st.clone();
                     self.prof_fallback_insns += 1;
-                    self.ts_fallback_scope();
+                    let saved = self.ts_fallback_enter();
                     self.exec_statement(&st);
+                    self.ts_fallback_exit(saved);
                 }
                 TsInsn::SaveSig { sig } => {
                     let (v, x) = self.signal_table[*sig as usize].raw_bits();
@@ -27086,10 +27089,10 @@ impl Simulator {
     /// comb path sets before evaluating the entry (`%m`, bare-name hint).
     #[cold]
     #[inline(never)]
-    fn ts_fallback_scope(&mut self) {
+    fn ts_fallback_enter(&mut self) -> Option<(Option<String>, Option<String>)> {
         let e = self.ts_cur_eidx as usize;
         if e == u32::MAX as usize {
-            return;
+            return None;
         }
         let (p, n) = self.settle_entries_view;
         let hint = if !p.is_null() && e < n {
@@ -27099,8 +27102,25 @@ impl Simulator {
         } else {
             self.comb_entries.get(e).and_then(|en| en.cold.scope_hint.clone())
         };
+        let prev_hint = self.name_resolve_hint.borrow().clone();
+        let prev_ts = self.timescale_scope_override.take();
         self.set_m_block_scope(hint.as_deref());
-        *self.name_resolve_hint.borrow_mut() = hint;
+        if hint.is_some() {
+            *self.name_resolve_hint.borrow_mut() = hint.clone();
+        }
+        // `$time`/`%t` in the fallback scale to the entry's module timescale,
+        // as the four-state arm arranges.
+        self.timescale_scope_override = hint;
+        Some((prev_hint, prev_ts))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn ts_fallback_exit(&mut self, saved: Option<(Option<String>, Option<String>)>) {
+        if let Some((prev_hint, prev_ts)) = saved {
+            *self.name_resolve_hint.borrow_mut() = prev_hint;
+            self.timescale_scope_override = prev_ts;
+        }
     }
 
     fn exec_bytecode(&mut self, block_idx: usize) -> bool {
@@ -40229,7 +40249,7 @@ impl Simulator {
 
         let mut op_vec: Vec<_> = opcode_counts.into_iter().collect();
         op_vec.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
-        eprintln!("[EDGE_STATS] top opcodes by dynamic count:");
+        eprintln!("[EDGE_STATS] top opcodes by static estimate (block insns × fires; branches not followed):");
         for (name, count) in op_vec.into_iter().take(24) {
             eprintln!("[EDGE_STATS]   {:>24}: {}", name, count);
         }
@@ -52246,7 +52266,29 @@ if self.profile_report {
                                     compiled.instructions.len(),
                                 )
                             };
+                            // A fallback in an `assign` (an expression the
+                            // compiler declined) re-enters the interpreter:
+                            // `%m`, bare names and `$time` must see THIS
+                            // entry's instance, as the always-block arm below
+                            // arranges. Pure-bytecode entries pay one bool.
+                            let saved = if compiled.has_fallback {
+                                let prev_hint = self.name_resolve_hint.borrow().clone();
+                                let prev_ts = self.timescale_scope_override.take();
+                                let sc = entries[eidx].cold.scope_hint.clone();
+                                self.set_m_block_scope(sc.as_deref());
+                                if sc.is_some() {
+                                    *self.name_resolve_hint.borrow_mut() = sc.clone();
+                                }
+                                self.timescale_scope_override = sc;
+                                Some((prev_hint, prev_ts))
+                            } else {
+                                None
+                            };
                             self.exec_insns(insns);
+                            if let Some((prev_hint, prev_ts)) = saved {
+                                *self.name_resolve_hint.borrow_mut() = prev_hint;
+                                self.timescale_scope_override = prev_ts;
+                            }
                         }
                         // Counted in a register and folded into
                         // `prof_settle_dc_count` after the loop, so the
@@ -55057,7 +55099,63 @@ if self.profile_report {
         false
     }
 
+    /// `pkg::x`, `pkg::arr[i]`, `pkg::v[h:l]` as an assignment TARGET: package
+    /// variables live in the table under their bare name (the read side
+    /// strips the package prefix and re-enters, see `eval_expr_ctx`), but a
+    /// write under a task/function frame went through the dotted-name path
+    /// as `pkg.x` and vanished. Returns the target with the prefix stripped.
+    fn strip_package_lvalue(&self, lhs: &Expression) -> Option<Expression> {
+        let is_pkg = |name: &str| {
+            self.module.packages.contains(name)
+                && !self.signal_name_to_id.contains_key(name)
+                && !self.signals.contains_key(name)
+                && !self.module.classes.contains_key(name)
+        };
+        match &lhs.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                if let ExprKind::Ident(h) = &expr.kind {
+                    if h.path.len() == 1 && h.path[0].selects.is_empty() && is_pkg(&h.path[0].name.name) {
+                        let mut ident = h.clone();
+                        ident.path[0].name = member.clone();
+                        return Some(Expression::new(ExprKind::Ident(ident), lhs.span));
+                    }
+                }
+                None
+            }
+            ExprKind::Ident(h) if h.path.len() >= 2 && h.path[0].selects.is_empty() && is_pkg(&h.path[0].name.name) => {
+                let mut ident = h.clone();
+                ident.path.remove(0);
+                Some(Expression::new(ExprKind::Ident(ident), lhs.span))
+            }
+            ExprKind::Index { expr, index } => {
+                let base = self.strip_package_lvalue(expr)?;
+                Some(Expression::new(
+                    ExprKind::Index { expr: Box::new(base), index: index.clone() },
+                    lhs.span,
+                ))
+            }
+            ExprKind::RangeSelect { expr, kind, left, right } => {
+                let base = self.strip_package_lvalue(expr)?;
+                Some(Expression::new(
+                    ExprKind::RangeSelect {
+                        expr: Box::new(base),
+                        kind: *kind,
+                        left: left.clone(),
+                        right: right.clone(),
+                    },
+                    lhs.span,
+                ))
+            }
+            _ => None,
+        }
+    }
+
     fn assign_value_inner(&mut self, lhs: &Expression, val: &Value) -> bool {
+        if !self.module.packages.is_empty() {
+            if let Some(stripped) = self.strip_package_lvalue(lhs) {
+                return self.assign_value_inner(&stripped, val);
+            }
+        }
         // §25.9: a just-returned vif (recorded by the Return arm) binds to
         // the FIRST assignment target after the call — `value = r.read(c)`
         // in uvm_config_db::get (issue #113). One-shot; also cleared at the
@@ -61050,6 +61148,19 @@ if self.profile_report {
     /// Evaluate expression with a context width hint (for proper shift sizing).
     /// When ctx_width > 0, shift operators widen their left operand to ctx_width.
     pub fn eval_expr_ctx(&mut self, expr: &Expression, ctx_width: u32) -> Value {
+        // `pkg::arr[i]` / `pkg::v[h:l]` as an rvalue: the indexed arms resolve
+        // their base by name and only for a plain identifier, so under a
+        // task/function frame a package-qualified base read 0. Strip the
+        // prefix and re-enter, as the identifier spelling does below. Scalar
+        // `pkg::x` reads keep their own arm (parameters of two packages must
+        // not collide through the bare name).
+        if !self.module.packages.is_empty()
+            && matches!(expr.kind, ExprKind::Index { .. } | ExprKind::RangeSelect { .. })
+        {
+            if let Some(stripped) = self.strip_package_lvalue(expr) {
+                return self.eval_expr_ctx(&stripped, ctx_width);
+            }
+        }
         // §13.5.2: an indexed / part-selected read through a `ref` formal
         // reads the caller's actual (see `ref_formal_redirect_hier`).
         if matches!(expr.kind, ExprKind::Index { .. } | ExprKind::RangeSelect { .. })

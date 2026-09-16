@@ -9,6 +9,13 @@ and the development workflow are in [README.md](README.md).
 
 **Correctness**
 
+* Package-qualified variables inside tasks and functions: a write such as
+  `store_pkg::scalar = d;`, `pkg::arr[i] = v;` or `pkg::v[3:0] = x;` in a
+  subroutine body was silently dropped, and a read of `pkg::arr[i]` or
+  `pkg::v[h:l]` there returned 0; both worked from an initial block.
+* `%m` inside a continuous assignment whose expression falls back to the
+  interpreter names the assignment's instance, and `$time` there scales to
+  that instance's timescale, as always-block fallbacks already did.
 * A constant part-select write with a negative label (`x[4:-1] = v`,
   `x[0:-1] <= v`) in a clocked block or compiled process keeps its in-range
   bits (IEEE 1800 §11.5.1); the compiled path folded the bounds unsigned,
