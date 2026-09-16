@@ -95,6 +95,14 @@ and the development workflow are in [README.md](README.md).
 
 **Performance** (instruction counts, output identical)
 
+* A clocked block whose only uncompilable statement is a `$display`-style
+  call on a cold branch (a check macro's failing arm) now runs on the
+  two-state fast path; the interpreter is called for that one statement
+  only when it is reached. Blocks that read a signal they later overwrite
+  (`failures++`) are admitted too, with those signals restored on a bail
+  so the four-state re-run stays exact, and `'0`/`'1` fill literals lower.
+  A 100k-cycle self-checking testbench: 2.50G to 2.28G instructions;
+  c906 neutral.
 * Small clocked testbenches run about 15% fewer instructions: the per-tick
   scratch vectors of the waiter drain, the clock generators and the
   in-process combinational snapshot are reused instead of reallocated,

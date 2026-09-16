@@ -5524,6 +5524,18 @@ pub struct Simulator {
     /// Set by a two-state executor that read an x/z bit; the guard reports
     /// it as an x-read bail (no demotion), not as an abort.
     ts_xread_bail: bool,
+    /// `TsInsn::SaveSig` records (signal, value bits, x bits) for the
+    /// evaluation in progress; restored on a bail, truncated on success.
+    ts_save_list: Vec<(u32, u64, u64)>,
+    /// Comb entry whose two-state stream is executing (u32::MAX for an
+    /// edge block, whose runner sets the scope itself): a `TsInsn::Fallback`
+    /// sets the `%m` buffer and the resolve hint from its scope, as the
+    /// four-state comb path does before evaluating an entry.
+    ts_cur_eidx: u32,
+    /// The settle takes `comb_entries` out of `self` for its duration; this
+    /// is a view of the taken vector so `ts_fallback_scope` can still read
+    /// an entry's scope hint. Null outside the settle.
+    settle_entries_view: (*const CombEntry, usize),
     /// Census: x-read bails per comb entry (count, executor kind).
     ts_xbail_by_entry: HashMap<usize, (u64, u8)>,
     /// Per-slot mid-exec abort counts; at `TS_ABORT_DEMOTE` the slot flips
@@ -9055,6 +9067,9 @@ impl Simulator {
             prof_ts_bail_abort: 0,
             ts_exec_aborted: false,
             ts_xread_bail: false,
+            ts_save_list: Vec::new(),
+            ts_cur_eidx: u32::MAX,
+            settle_entries_view: (std::ptr::null(), 0),
             ts_xbail_by_entry: HashMap::default(),
             ts_edge_abortn: Vec::new(),
             ts_comb_abortn: Vec::new(),
@@ -20808,6 +20823,7 @@ impl Simulator {
                 // returns. The pointee is heap-stable under any Vec resize.
                 let ts_ptr: *const super::bytecode::TwoStateBlock =
                     std::sync::Arc::as_ptr(ts);
+                self.ts_cur_eidx = eidx as u32;
                 if self.ts_guard_and_exec(unsafe { &*ts_ptr }) {
                     if self.trace_comb_paths {
                         self.note_comb_path(eidx, 0);
@@ -21155,6 +21171,7 @@ impl Simulator {
             return false;
         };
         let ts = ts.clone();
+        self.ts_cur_eidx = if edge { u32::MAX } else { eidx as u32 };
         let ok = self.ts_guard_and_exec(&ts);
         if !ok && self.ts_exec_aborted {
             let counts = if edge { &mut self.ts_edge_abortn } else { &mut self.ts_comb_abortn };
@@ -21195,7 +21212,9 @@ impl Simulator {
         // was 11 % of a c906 run while 97 % of evaluations passed it. A
         // store made before an x read used only clean inputs, so the
         // four-state re-run writes the same value back.
+        let save_base = self.ts_save_list.len();
         if !self.exec_two_state(ts) {
+            self.ts_restore_saved(save_base);
             if std::mem::take(&mut self.ts_xread_bail) {
                 self.prof_ts_bail_xread += 1;
                 return false;
@@ -21204,6 +21223,7 @@ impl Simulator {
             self.ts_exec_aborted = true;
             return false;
         }
+        self.ts_save_list.truncate(save_base);
         self.prof_ts_evals += 1;
         true
     }
@@ -21294,7 +21314,10 @@ impl Simulator {
         let insns: &[super::bytecode::TsInsn] = unsafe {
             std::slice::from_raw_parts(self.ts_arena.as_ptr().add(h.off as usize), h.len())
         };
+        let save_base = self.ts_save_list.len();
+        self.ts_cur_eidx = eidx as u32;
         if !self.exec_two_state_parts(insns, h.num_regs as u32, h.kind()) {
+            self.ts_restore_saved(save_base);
             if std::mem::take(&mut self.ts_xread_bail) {
                 self.prof_ts_bail_xread += 1;
                 #[cfg(feature = "opcode-census")]
@@ -21309,6 +21332,7 @@ impl Simulator {
             self.ts_exec_aborted = true;
             return false;
         }
+        self.ts_save_list.truncate(save_base);
         self.prof_ts_evals += 1;
         true
     }
@@ -21858,6 +21882,16 @@ impl Simulator {
                 }
                 TsInsn::RedAnd { d, s, mask } => {
                     regs[*d as usize] = (regs[*s as usize] == *mask) as u64;
+                }
+                TsInsn::Fallback(st) => {
+                    let st = st.clone();
+                    self.prof_fallback_insns += 1;
+                    self.ts_fallback_scope();
+                    self.exec_statement(&st);
+                }
+                TsInsn::SaveSig { sig } => {
+                    let (v, x) = self.signal_table[*sig as usize].raw_bits();
+                    self.ts_save_list.push((*sig, v, x));
                 }
                 TsInsn::WRedOr { d, s } => {
                     let w = wregs[*s as usize];
@@ -22699,6 +22733,16 @@ impl Simulator {
                 TsInsn::RedAnd { d, s, mask } => {
                     r!(*d) = (r!(*s) == *mask) as u64;
                 }
+                TsInsn::Fallback(st) => {
+                    let st = st.clone();
+                    self.prof_fallback_insns += 1;
+                    self.ts_fallback_scope();
+                    self.exec_statement(&st);
+                }
+                TsInsn::SaveSig { sig } => {
+                    let (v, x) = self.signal_table[*sig as usize].raw_bits();
+                    self.ts_save_list.push((*sig, v, x));
+                }
                 TsInsn::WRedOr { .. } | TsInsn::WRedAnd { .. } => {
                     unreachable!("wide insn outside the wide executor")
                 }
@@ -23050,6 +23094,37 @@ impl Simulator {
     // table Value's `is_signed` as it was: every write path stamps it from
     // `signal_signed` (write_sig!), so re-stamping here only cost a random
     // load from a 35M-entry table per store.
+    /// Undo the two-state stores to the block's read-after-write signals
+    /// (`TsInsn::SaveSig`), oldest value last, so the four-state re-run after
+    /// a bail starts from what the block saw.
+    fn ts_restore_saved(&mut self, base: usize) {
+        while self.ts_save_list.len() > base {
+            let Some((sig, v, x)) = self.ts_save_list.pop() else { break };
+            let id = sig as usize;
+            let entry: &mut Value = &mut self.signal_table[id];
+            if entry.raw_bits() == (v, x) {
+                continue;
+            }
+            if !entry.set_inline_bits(v, x) {
+                let mut val = Value::from_inline(v, x, self.signal_widths[id].max(1));
+                val.is_signed = self.signal_signed[id];
+                self.signal_table[id] = val;
+            }
+            self.sync_mirror(id);
+            if self.ts_direct_writes {
+                if self.dirty_list.last() != Some(&id) {
+                    self.dirty_list.push(id);
+                }
+            } else if !self.dirty_signals[id] {
+                self.dirty_signals[id] = true;
+                self.dirty_list.push(id);
+                self.dirty_any = true;
+            }
+            self.table_modified = true;
+            self.after_signal_write(id);
+        }
+    }
+
     pub(crate) fn ts_store(&mut self, id: usize, v: u64, mask: u64) {
         debug_assert!(id < self.signal_table.len());
         let entry: &mut Value = unsafe { self.signal_table.get_unchecked_mut(id) };
@@ -23700,6 +23775,16 @@ impl Simulator {
                 }
                 TsInsn::RedAnd { d, s, mask } => {
                     (*rp.add(*d as usize)) = ((*rp.add(*s as usize)) == *mask) as u64;
+                }
+                TsInsn::Fallback(st) => {
+                    let st = st.clone();
+                    self.prof_fallback_insns += 1;
+                    self.ts_fallback_scope();
+                    self.exec_statement(&st);
+                }
+                TsInsn::SaveSig { sig } => {
+                    let (v, x) = self.signal_table[*sig as usize].raw_bits();
+                    self.ts_save_list.push((*sig, v, x));
                 }
                 TsInsn::WRedOr { .. } | TsInsn::WRedAnd { .. } => {
                     unreachable!("wide insn outside the wide executor")
@@ -26997,6 +27082,27 @@ impl Simulator {
         }
     }
 
+    /// Scope for a `TsInsn::Fallback` of a comb entry: what the four-state
+    /// comb path sets before evaluating the entry (`%m`, bare-name hint).
+    #[cold]
+    #[inline(never)]
+    fn ts_fallback_scope(&mut self) {
+        let e = self.ts_cur_eidx as usize;
+        if e == u32::MAX as usize {
+            return;
+        }
+        let (p, n) = self.settle_entries_view;
+        let hint = if !p.is_null() && e < n {
+            // SAFETY: the settle published the taken vector's buffer, which is
+            // heap-stable and outlives this call (restored before returning).
+            unsafe { (*p.add(e)).cold.scope_hint.clone() }
+        } else {
+            self.comb_entries.get(e).and_then(|en| en.cold.scope_hint.clone())
+        };
+        self.set_m_block_scope(hint.as_deref());
+        *self.name_resolve_hint.borrow_mut() = hint;
+    }
+
     fn exec_bytecode(&mut self, block_idx: usize) -> bool {
         if self.trace_always.is_some() {
             self.exec_bytecode_trace(block_idx);
@@ -27102,6 +27208,7 @@ impl Simulator {
         // through after_signal_write. The resolved slot is checked FIRST so
         // non-lowerable blocks pay one enum test; only the initial lowering
         // takes the block out (borrow) and puts it back.
+        self.ts_cur_eidx = u32::MAX;
         match self.ts_edge.get(block_idx) {
             Some(TsSlot::No) => {}
             Some(TsSlot::Yes(ts)) => {
@@ -51263,6 +51370,7 @@ impl Simulator {
             }
         }
         let entries = std::mem::take(&mut self.comb_entries);
+        self.settle_entries_view = (entries.as_ptr(), entries.len());
         let dep_offsets = std::mem::take(&mut self.comb_dep_offsets);
         let dep_entries = std::mem::take(&mut self.comb_dep_entries);
         let tree_sig = std::mem::take(&mut self.is_clock_tree_signal);
@@ -51393,6 +51501,7 @@ impl Simulator {
         }
 
         if next_list.is_empty() {
+            self.settle_entries_view = (std::ptr::null(), 0);
             self.comb_entries = entries;
             self.comb_dep_offsets = dep_offsets;
             self.comb_dep_entries = dep_entries;
@@ -51957,6 +52066,7 @@ if self.profile_report {
                     } else if let Some(CombPlan::Ts(ts)) = self.comb_plan.get(eidx) {
                         let tp: *const super::bytecode::TwoStateBlock = std::sync::Arc::as_ptr(ts);
                         self.ts_direct_writes = true;
+                        self.ts_cur_eidx = eidx as u32;
                         let ok = self.ts_guard_and_exec(unsafe { &*tp });
                         self.ts_direct_writes = false;
                         if ok {
@@ -52471,6 +52581,7 @@ if self.profile_report {
         self.prof_settle_repass_evals += n_repass;
         self.prof_settle_writes += n_writes;
         self.prof_settle_dep_edges += n_dep_edges;
+        self.settle_entries_view = (std::ptr::null(), 0);
         self.comb_entries = entries;
         self.comb_dep_offsets = dep_offsets;
         self.comb_dep_entries = dep_entries;

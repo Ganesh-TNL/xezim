@@ -13191,6 +13191,16 @@ pub enum TsInsn {
     Repl { d: u16, s: u16, w: u8, count: u8 },
     /// Wide replicate (result 65..=512 bits) of a NARROW part.
     WRepl { d: u16, s: u16, w: u8, count: u16 },
+    /// One statement the bytecode compiler could not compile (a `$display`
+    /// in a check's failing branch, typically), run by the AST interpreter
+    /// in place. Before this, any such statement kept the WHOLE block on the
+    /// four-state VM at ~150 host instructions per bytecode instruction,
+    /// even when the fallback sat on a branch that never executes.
+    Fallback(Arc<Statement>),
+    /// Save the signal's current bits; the executor restores every saved
+    /// signal when the block bails, so the four-state re-run is exact for
+    /// a block that reads a signal it later overwrites.
+    SaveSig { sig: u32 },
 }
 
 pub struct TwoStateBlock {
@@ -13274,7 +13284,10 @@ pub fn ts_last_gate() -> &'static str {
 /// over predecessors) protects a read; a read of an unprotected signal is
 /// recorded (union), and a later blocking store of a recorded signal is the
 /// hazard. Non-blocking assignments queue and never touch the table.
-fn ts_raw_hazard(insns: &[Insn], array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>) -> bool {
+/// Returns the signals whose read-after-write makes a re-run inexact
+/// (`Ok(empty)` = none), or `Err` when a hazard sits on an array or the
+/// dataflow did not converge — those blocks cannot be saved and restored.
+fn ts_raw_hazard(insns: &[Insn], array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>) -> Result<Vec<u32>, ()> {
     #[derive(PartialEq, Clone)]
     enum Base {
         Sig(u32),
@@ -13356,11 +13369,11 @@ fn ts_raw_hazard(insns: &[Insn], array_first_id: &HashMap<Arc<str>, (usize, i64,
         }
     }
     if stores.is_empty() || loads.is_empty() {
-        return false;
+        return Ok(Vec::new());
     }
     let (nl, ns) = (loads.len(), stores.len());
     if nl > 4096 || ns > 4096 {
-        return true;
+        return Err(());
     }
     // covers[L]: store classes whose static range contains load class L.
     // overlaps[S]: load classes whose range meets store class S.
@@ -13408,13 +13421,14 @@ fn ts_raw_hazard(insns: &[Insn], array_first_id: &HashMap<Arc<str>, (usize, i64,
     let mut unprot_in: Vec<Vec<u64>> = vec![vec![0; lw]; n + 1];
     let mut must_out: Vec<Vec<u64>> = vec![vec![u64::MAX; sw]; n];
     let mut unprot_out: Vec<Vec<u64>> = vec![vec![0; lw]; n];
+    let mut hazards: Vec<u32> = Vec::new();
     let mut changed = true;
     let mut sweeps = 0;
     while changed {
         changed = false;
         sweeps += 1;
         if sweeps > 64 {
-            return true;
+            return Err(());
         }
         for i in 0..n {
             let mut mo = must_in[i].clone();
@@ -13427,7 +13441,14 @@ fn ts_raw_hazard(insns: &[Insn], array_first_id: &HashMap<Arc<str>, (usize, i64,
             }
             if let Some(sidx) = writes[i] {
                 if overlaps[sidx].iter().any(|&l| bit(&unprot_in[i], l)) {
-                    return true;
+                    match stores[sidx].base {
+                        Base::Sig(sg) => {
+                            if !hazards.contains(&sg) {
+                                hazards.push(sg);
+                            }
+                        }
+                        _ => return Err(()),
+                    }
                 }
                 mo[sidx >> 6] |= 1u64 << (sidx & 63);
             }
@@ -13461,7 +13482,7 @@ fn ts_raw_hazard(insns: &[Insn], array_first_id: &HashMap<Arc<str>, (usize, i64,
             }
         }
     }
-    false
+    Ok(hazards)
 }
 
 /// Peephole over a lowered stream: the eight adjacent opcode pairs that a
@@ -13842,11 +13863,28 @@ pub fn lower_two_state(
     // See `ts_raw_hazard`: a block that reads a signal it later overwrites
     // cannot be re-run by the interpreter after a partial two-state run, and
     // every bail is such a re-run.
-    if ts_raw_hazard(&cb.instructions, array_first_id) {
-        if std::env::var_os("XEZIM_TS_DBG").is_some() {
-            TS_BAIL_AT.with(|c| c.set((usize::MAX, "RawHazard")));
+    // A hazardous ≤64-bit signal is saved at the top of the stream and
+    // restored by the executor on a bail, so the re-run starts from the
+    // values the block saw (`failures++` in a check's failing branch, with
+    // an x read later in the block, counted twice before this).
+    let hazards = match ts_raw_hazard(&cb.instructions, array_first_id) {
+        Ok(h) => h,
+        Err(()) => {
+            if std::env::var_os("XEZIM_TS_DBG").is_some() {
+                TS_BAIL_AT.with(|c| c.set((usize::MAX, "RawHazard")));
+            }
+            return None;
         }
-        return None;
+    };
+    for &sig in &hazards {
+        let sg = sig as usize;
+        if sg >= signal_widths.len() || signal_widths[sg] > 64 || signal_widths[sg] == 0 || signal_real[sg] {
+            if std::env::var_os("XEZIM_TS_DBG").is_some() {
+                TS_BAIL_AT.with(|c| c.set((usize::MAX, "RawHazard")));
+            }
+            return None;
+        }
+        out.push(TsInsn::SaveSig { sig });
     }
     let mut wconf: Vec<bool> = vec![false; cb.num_regs as usize];
     let mut wconf_list: Vec<RegId> = Vec::new();
@@ -14007,6 +14045,14 @@ pub fn lower_two_state(
                     }
                     def!(rw, *d, k.width);
                     out.push(TsInsn::WConst { d: *d as u16, v: wv.into_boxed_slice() });
+                } else if k.is_fill && !k.has_xz() {
+                    // `'0` / `'1`: a fill takes the width of its consumer, so
+                    // it rides the same fill-register path as `{N{bit}}` —
+                    // the stores emit a range fill, and any other use bails.
+                    let (v, _) = k.raw_bits();
+                    def!(rw, *d, 1);
+                    rw[*d as usize] = None;
+                    wfill[*d as usize] = Some((v & 1) as u8);
                 } else if k.has_xz() {
                     // Fold rather than reject: admitted only while it stays
                     // a constant all the way to a store (see the loop guard).
@@ -15155,6 +15201,13 @@ pub fn lower_two_state(
                         count: n as u8,
                     }
                 });
+            }
+            Insn::StmtFallback(payload) => {
+                // Run by the interpreter in place; its reads and writes go
+                // through the four-state paths, so nothing here needs the
+                // register model to know about it.
+                side_effects = true;
+                out.push(TsInsn::Fallback(payload.0.clone()));
             }
             _ => return None,
         }
