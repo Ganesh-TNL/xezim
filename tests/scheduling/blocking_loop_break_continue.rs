@@ -199,3 +199,187 @@ endmodule
         "break must skip a following call to a blocking task\n{out}"
     );
 }
+
+// PR #174 review (aionhw): the fix above keyed its "flag consumer" exemption
+// on the STATEMENT KIND (While/For/Repeat/Foreach/DoWhile), but a `break`/
+// `continue`'s own loop re-entry tail is the SAME kind as a completely fresh
+// nested loop that simply happens to follow the jump in source. Both look
+// identical to a kind-only check, so a fresh nested loop was let through as
+// if it were the outer loop's own re-entry: it "consumed" the outer flag and
+// ran anyway (`continue`), or ate the flag before the outer loop's real
+// re-entry ever saw it (`break`, which then never stopped the outer loop).
+//
+// Fixed by tracking WHICH exact statement position in a process continuation
+// is a genuine synthesized re-entry (`ProcCont::loop_tail_at`), rather than
+// matching on kind alone. These three cases are the reviewer's own probe.
+//
+// Reference (Verilator 5.052 + commercial): inner_runs=8 (continue skips
+// even i, so the nested `for` runs its 2 iterations for the 4 odd i only);
+// outer_iters=3 (break at i==2 stops the outer loop after i=0,1,2); r_runs=1
+// (continue skips every i but 1, so the nested `repeat` runs exactly once).
+
+#[test]
+fn blocking_for_continue_skips_nested_for_with_blocking_call() {
+    let src = r#"module top;
+  int inner_runs = 0;
+  task automatic work(int unsigned i);
+    #10;
+  endtask
+  task automatic run();
+    for (int unsigned i = 0; i < 8; i++) begin
+      if ((i % 2) == 0) continue;         // skip even i
+      for (int unsigned j = 0; j < 2; j++) begin  // <-- fresh nested loop
+        inner_runs++;
+        work(i);
+      end
+    end
+  endtask
+  initial begin
+    run();
+    if (inner_runs == 8) $display("RESULT PASS");
+    else                 $display("RESULT FAIL inner_runs=%0d", inner_runs);
+    $finish;
+  end
+endmodule
+"#;
+    let out = run(src, "for_continue_nested_for");
+    assert!(
+        out.contains("RESULT PASS"),
+        "continue must skip a following FRESH nested for-loop, not be consumed by it\n{out}"
+    );
+}
+
+#[test]
+fn blocking_for_break_not_consumed_by_nested_foreach_with_blocking_call() {
+    let src = r#"module top;
+  int hits[8] = '{2,2,2,2,2,2,2,2};
+  int outer_iters = 0;
+  task automatic work(int unsigned i);
+    #10;
+  endtask
+  task automatic run();
+    for (int unsigned i = 0; i < 8; i++) begin
+      outer_iters++;
+      if (i >= 2) break;
+      foreach (hits[k]) if (k == 0) work(i);   // <-- fresh nested loop
+    end
+  endtask
+  initial begin
+    run();
+    if (outer_iters == 3) $display("RESULT PASS");
+    else                  $display("RESULT FAIL outer_iters=%0d", outer_iters);
+    $finish;
+  end
+endmodule
+"#;
+    let out = run(src, "for_break_nested_foreach");
+    assert!(
+        out.contains("RESULT PASS"),
+        "a following FRESH nested foreach must not swallow the outer break\n{out}"
+    );
+}
+
+#[test]
+fn blocking_for_continue_skips_nested_repeat_with_blocking_call() {
+    let src = r#"module top;
+  int r_runs = 0;
+  task automatic work(int unsigned i);
+    #10;
+  endtask
+  task automatic run();
+    for (int unsigned i = 0; i < 4; i++) begin
+      if (i != 1) continue;
+      repeat (1) begin           // <-- fresh nested loop, same kind as a tail
+        work(i);
+        r_runs++;
+      end
+    end
+  endtask
+  initial begin
+    run();
+    if (r_runs == 1) $display("RESULT PASS");
+    else             $display("RESULT FAIL r_runs=%0d", r_runs);
+    $finish;
+  end
+endmodule
+"#;
+    let out = run(src, "for_continue_nested_repeat");
+    assert!(
+        out.contains("RESULT PASS"),
+        "continue must skip a following FRESH nested repeat, not be consumed by it\n{out}"
+    );
+}
+
+// The review also names `while` after `continue` as failing the same way,
+// and `do…while` as already correct. Both lower to a `While` re-entry tail
+// (a `for` does too), so pin both: the nested `while` is the fresh-vs-tail
+// ambiguity in its rawest form, and the `do…while` case guards the
+// body-first unroll (`body; while (cond) body`) against a regression.
+// Reference: w_runs=2, dw_runs=2 (continue skips every i but 1; the nested
+// loop then runs its 2 iterations exactly once).
+
+#[test]
+fn blocking_for_continue_skips_nested_while_with_blocking_call() {
+    let src = r#"module top;
+  int w_runs = 0;
+  task automatic work(int unsigned i);
+    #10;
+  endtask
+  task automatic run();
+    for (int unsigned i = 0; i < 4; i++) begin
+      int unsigned j = 0;
+      if (i != 1) continue;
+      while (j < 2) begin          // <-- fresh nested loop, same kind as a tail
+        work(i);
+        w_runs++;
+        j++;
+      end
+    end
+  endtask
+  initial begin
+    run();
+    if (w_runs == 2) $display("RESULT PASS");
+    else             $display("RESULT FAIL w_runs=%0d", w_runs);
+    $finish;
+  end
+endmodule
+"#;
+    let out = run(src, "for_continue_nested_while");
+    assert!(
+        out.contains("RESULT PASS"),
+        "continue must skip a following FRESH nested while, not be consumed by it\n{out}"
+    );
+}
+
+#[test]
+fn blocking_for_continue_skips_nested_do_while_with_blocking_call() {
+    let src = r#"module top;
+  int dw_runs = 0;
+  task automatic work(int unsigned i);
+    #10;
+  endtask
+  task automatic run();
+    for (int unsigned i = 0; i < 4; i++) begin
+      int unsigned j = 0;
+      if (i != 1) continue;
+      do begin                     // <-- fresh nested loop (body-first unroll)
+        work(i);
+        dw_runs++;
+        j++;
+      end while (j < 2);
+    end
+  endtask
+  initial begin
+    run();
+    if (dw_runs == 2) $display("RESULT PASS");
+    else              $display("RESULT FAIL dw_runs=%0d", dw_runs);
+    $finish;
+  end
+endmodule
+"#;
+    let out = run(src, "for_continue_nested_do_while");
+    assert!(
+        out.contains("RESULT PASS"),
+        "continue must skip a following FRESH nested do-while\n{out}"
+    );
+}
