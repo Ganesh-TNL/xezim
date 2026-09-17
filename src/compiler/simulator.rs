@@ -5185,6 +5185,9 @@ pub struct Simulator {
     deferred_comb_pool: Vec<Vec<(usize, Value)>>,
     /// Write set of the process FSM currently executing (see `ProcFsm::writes`).
     cur_fsm_writes: Option<Arc<[u32]>>,
+    /// Per comb entry: (identity of the FSM write set last checked, verdict
+    /// = the FSM can clobber this entry). The same pair recurs every cycle.
+    fsm_clobber_cache: Vec<(usize, bool)>,
     /// VCD dump state
     /// `--wave`: waveform dumping was requested for this run. Latched from the
     /// global at construction so the model is built consistently — an active
@@ -8966,6 +8969,7 @@ impl Simulator {
             cg_tree_roots_buf: Vec::new(),
             deferred_comb_pool: Vec::new(),
             cur_fsm_writes: None,
+            fsm_clobber_cache: Vec::new(),
             wave: wave_enabled(),
             vcd_file: None,
             vcd_writer: None,
@@ -21170,9 +21174,11 @@ impl Simulator {
         let TsSlot::Yes(ts) = &slots[eidx] else {
             return false;
         };
-        let ts = ts.clone();
+        // Raw view, no refcount traffic per evaluation: the slot is not
+        // replaced while its block runs (demotion below happens after).
+        let tp: *const super::bytecode::TwoStateBlock = std::sync::Arc::as_ptr(ts);
         self.ts_cur_eidx = if edge { u32::MAX } else { eidx as u32 };
-        let ok = self.ts_guard_and_exec(&ts);
+        let ok = self.ts_guard_and_exec(unsafe { &*tp });
         if !ok && self.ts_exec_aborted {
             let counts = if edge { &mut self.ts_edge_abortn } else { &mut self.ts_comb_abortn };
             if eidx >= counts.len() {
@@ -41193,12 +41199,22 @@ impl Simulator {
         // A process can only clobber what it writes: an FSM with a known
         // write set that misses every output of this entry needs no snapshot.
         if let Some(w) = &self.cur_fsm_writes {
-            if !entry
-                .cold
-                .write_signal_ids
-                .iter()
-                .any(|id| w.binary_search(&(*id as u32)).is_ok())
-            {
+            let key = w.as_ptr() as usize;
+            if self.fsm_clobber_cache.len() <= eidx {
+                self.fsm_clobber_cache.resize(eidx + 1, (0, true));
+            }
+            let can_clobber = if self.fsm_clobber_cache[eidx].0 == key {
+                self.fsm_clobber_cache[eidx].1
+            } else {
+                let v = entry
+                    .cold
+                    .write_signal_ids
+                    .iter()
+                    .any(|id| w.binary_search(&(*id as u32)).is_ok());
+                self.fsm_clobber_cache[eidx] = (key, v);
+                v
+            };
+            if !can_clobber {
                 return;
             }
         }

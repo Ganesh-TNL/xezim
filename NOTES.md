@@ -102,6 +102,11 @@ and the development workflow are in [README.md](README.md).
 
 **Performance** (instruction counts, output identical)
 
+* Two more per-tick trims for small testbenches: the check of whether a
+  compiled stimulus process can clobber a combinational entry's outputs is
+  cached per entry, and a compiled block's two-state stream is no longer
+  reference-counted on every evaluation. The 100k-cycle self-checking
+  testbench: 2.29G to 2.20G instructions; c906 neutral.
 * A clocked block whose only uncompilable statement is a `$display`-style
   call on a cold branch (a check macro's failing arm) now runs on the
   two-state fast path; the interpreter is called for that one statement
