@@ -1929,15 +1929,21 @@ mod enabled {
             BlockingAssignRangeDyn(sig_id, hi_reg, lo_reg, val_reg) => {
                 let (v, x) = ld2(builder, pointer_type, regs, xz, *val_reg);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
-                let hi = builder
-                    .ins()
-                    .stack_load(pointer_type, types::I64, regs[*hi_reg as usize], 0);
-                let lo = builder
-                    .ins()
-                    .stack_load(pointer_type, types::I64, regs[*lo_reg as usize], 0);
+                let (hi, hx) = ld2(builder, pointer_type, regs, xz, *hi_reg);
+                let (lo, lx) = ld2(builder, pointer_type, regs, xz, *lo_reg);
+                // §11.5.1: a bound with an x/z bit modifies nothing.
+                let bxz = builder.ins().bor(hx, lx);
+                let zero_i = builder.ins().iconst(types::I64, 0);
+                let bclean = builder.ins().icmp(IntCC::Equal, bxz, zero_i);
+                let store_b = builder.create_block();
+                let join_b = builder.create_block();
+                builder.ins().brif(bclean, store_b, &[], join_b, &[]);
+                builder.switch_to_block(store_b);
                 builder
                     .ins()
                     .call(blk_range_ref, &[sim_ptr, id, hi, lo, v, x]);
+                builder.ins().jump(join_b, &[]);
+                builder.switch_to_block(join_b);
             }
             // Constant-bounds forms of the same stores: materialize the
             // bounds and share the dynamic bridges.
@@ -2001,7 +2007,11 @@ mod enabled {
                 let hi_c = builder.ins().iconst(types::I64, *hi);
                 let ge = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, eff, lo_c);
                 let le = builder.ins().icmp(IntCC::SignedLessThanOrEqual, eff, hi_c);
-                let inb = builder.ins().band(ge, le);
+                let inb0 = builder.ins().band(ge, le);
+                // An index with an x/z bit modifies nothing (§7.4.6).
+                let zero_i = builder.ins().iconst(types::I64, 0);
+                let iclean = builder.ins().icmp(IntCC::Equal, ix, zero_i);
+                let inb = builder.ins().band(inb0, iclean);
                 let store_b = builder.create_block();
                 let join_b = builder.create_block();
                 builder.ins().brif(inb, store_b, &[], join_b, &[]);
@@ -2019,8 +2029,8 @@ mod enabled {
             }
             // Fused `rdata <= mem[addr]` (LoadSignal + LoadArrayElem +
             // NbaAssign): index comes straight from a signal, the element
-            // value goes straight to the NBA queue. Out-of-range reads
-            // schedule a 1-bit X, exactly like the interpreter composition.
+            // value goes straight to the NBA queue. Out-of-range and x/z
+            // indices schedule an all-x element, like the interpreter.
             NbaAssignArrayRead(dst_sig, arr, idx_sig, width) => {
                 let crate::compiler::bytecode::ArrayOperand::Dense {
                     first_id, lo, hi, ..
@@ -2045,7 +2055,11 @@ mod enabled {
                 let hi_c = builder.ins().iconst(types::I64, *hi);
                 let ge = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, eff, lo_c);
                 let le = builder.ins().icmp(IntCC::SignedLessThanOrEqual, eff, hi_c);
-                let inb = builder.ins().band(ge, le);
+                let inb0 = builder.ins().band(ge, le);
+                // An index with an x/z bit reads x (§7.4.6).
+                let zero_i = builder.ins().iconst(types::I64, 0);
+                let iclean = builder.ins().icmp(IntCC::Equal, ix, zero_i);
+                let inb = builder.ins().band(inb0, iclean);
                 let off = builder.ins().isub(eff, lo_c);
                 let first_c = builder.ins().iconst(types::I64, *first_id as i64);
                 let eid = builder.ins().iadd(first_c, off);
@@ -2063,11 +2077,12 @@ mod enabled {
                     }
                 };
                 let zero = builder.ins().iconst(types::I64, 0);
-                let one = builder.ins().iconst(types::I64, 1);
                 let minus1 = builder.ins().iconst(types::I64, -1);
                 let inb_mask = builder.ins().select(inb, minus1, zero);
                 let v = builder.ins().band(ev, inb_mask);
-                let x = builder.ins().select(inb, ex, one);
+                // Miss: every bit of the element width is x.
+                let xall = builder.ins().iconst(types::I64, width_mask_i64(*width));
+                let x = builder.ins().select(inb, ex, xall);
                 let dc = builder.ins().iconst(types::I32, *dst_sig as i64);
                 let wc = builder.ins().iconst(types::I32, *width as i64);
                 builder.ins().call(nba_4s_ref, &[sim_ptr, dc, v, x, wc]);
@@ -2084,15 +2099,21 @@ mod enabled {
             NbaAssignRangeDyn(sig_id, hi_reg, lo_reg, val_reg) => {
                 let (v, x) = ld2(builder, pointer_type, regs, xz, *val_reg);
                 let id = builder.ins().iconst(types::I32, *sig_id as i64);
-                let hi = builder
-                    .ins()
-                    .stack_load(pointer_type, types::I64, regs[*hi_reg as usize], 0);
-                let lo = builder
-                    .ins()
-                    .stack_load(pointer_type, types::I64, regs[*lo_reg as usize], 0);
+                let (hi, hx) = ld2(builder, pointer_type, regs, xz, *hi_reg);
+                let (lo, lx) = ld2(builder, pointer_type, regs, xz, *lo_reg);
+                // §11.5.1: a bound with an x/z bit modifies nothing.
+                let bxz = builder.ins().bor(hx, lx);
+                let zero_i = builder.ins().iconst(types::I64, 0);
+                let bclean = builder.ins().icmp(IntCC::Equal, bxz, zero_i);
+                let store_b = builder.create_block();
+                let join_b = builder.create_block();
+                builder.ins().brif(bclean, store_b, &[], join_b, &[]);
+                builder.switch_to_block(store_b);
                 builder
                     .ins()
                     .call(nba_range_ref, &[sim_ptr, id, hi, lo, v, x]);
+                builder.ins().jump(join_b, &[]);
+                builder.switch_to_block(join_b);
             }
             NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
                 let (v, x) = ld2(builder, pointer_type, regs, xz, *val_reg);
@@ -2300,13 +2321,16 @@ mod enabled {
                     return Err(());
                 }
                 let (bv, bx) = ld2(builder, pointer_type, regs, xz, *base);
-                let i = builder.ins().stack_load(pointer_type, types::I64, regs[*idx as usize], 0);
+                let (i, ix) = ld2(builder, pointer_type, regs, xz, *idx);
                 // One UNSIGNED compare covers both ends: a negative index
-                // wraps to a huge u64 and fails `idx < w`.
+                // wraps to a huge u64 and fails `idx < w`. An index with an
+                // x/z bit reads x as well (§11.5.1).
                 let wv = builder.ins().iconst(types::I64, w as i64);
-                let inr = builder.ins().icmp(IntCC::UnsignedLessThan, i, wv);
                 let one = builder.ins().iconst(types::I64, 1);
                 let zero = builder.ins().iconst(types::I64, 0);
+                let inr0 = builder.ins().icmp(IntCC::UnsignedLessThan, i, wv);
+                let iclean = builder.ins().icmp(IntCC::Equal, ix, zero);
+                let inr = builder.ins().band(inr0, iclean);
                 let vs = builder.ins().ushr(bv, i);
                 let vb = builder.ins().band(vs, one);
                 let xs = builder.ins().ushr(bx, i);
@@ -2341,12 +2365,12 @@ mod enabled {
                     return Err(());
                 }
                 let (bv, bx) = ld2(builder, pointer_type, regs, xz, *base);
-                let mut l = builder
-                    .ins()
-                    .stack_load(pointer_type, types::I64, regs[*left_r as usize], 0);
-                let mut r = builder
-                    .ins()
-                    .stack_load(pointer_type, types::I64, regs[*right_r as usize], 0);
+                let (l0, lx) = ld2(builder, pointer_type, regs, xz, *left_r);
+                let (r0, rx) = ld2(builder, pointer_type, regs, xz, *right_r);
+                let mut l = l0;
+                let mut r = r0;
+                // §11.5.1: a bound with an x/z bit makes the whole select x.
+                let bxz = builder.ins().bor(lx, rx);
                 // Match the interpreter exactly: bounds are 32-bit index
                 // arithmetic, truncated to u32 and REINTERPRETED as i32
                 // unconditionally (`[1 -: 4]`'s low bound arrives as
@@ -2409,9 +2433,14 @@ mod enabled {
                 let oor = builder.ins().bor(xmask_lo, xmask_hi);
                 let noor = builder.ins().bnot(oor);
                 let vkeep = builder.ins().band(v2, noor);
-                let out_v = builder.ins().band(vkeep, resm);
+                let out_v0 = builder.ins().band(vkeep, resm);
                 let xall = builder.ins().bor(x2, oor);
-                let out_x = builder.ins().band(xall, resm);
+                let out_x0 = builder.ins().band(xall, resm);
+                let bclean = builder.ins().icmp(IntCC::Equal, bxz, zero);
+                let dw = reg_w.get(*dest as usize).copied().unwrap_or(0);
+                let xfull = builder.ins().iconst(types::I64, width_mask_i64(dw));
+                let out_v = builder.ins().select(bclean, out_v0, zero);
+                let out_x = builder.ins().select(bclean, out_x0, xfull);
                 st2(builder, pointer_type, regs, xz, *dest, out_v, out_x);
             }
             RangeSelectConst(dest, base, l_imm, r_imm) => {
@@ -2464,16 +2493,17 @@ mod enabled {
                 };
                 let (iv, ix) = ld2(builder, pointer_type, regs, xz, *idx_reg);
                 let zero = builder.ins().iconst(types::I64, 0);
-                // Interpreter parity: `to_u64()` zeroes X/Z bits PER BIT
-                // (idx 4'bx01x reads element 2), it does not collapse the
-                // whole index to zero.
+                // Interpreter parity: an index with an x/z bit reads x
+                // (§7.4.6), exactly like one out of range.
                 let nix = builder.ins().bnot(ix);
                 let eff = builder.ins().band(iv, nix);
                 let lo_c = builder.ins().iconst(types::I64, *lo);
                 let hi_c = builder.ins().iconst(types::I64, *hi);
                 let ge = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, eff, lo_c);
                 let le = builder.ins().icmp(IntCC::SignedLessThanOrEqual, eff, hi_c);
-                let inb = builder.ins().band(ge, le);
+                let inb0 = builder.ins().band(ge, le);
+                let iclean = builder.ins().icmp(IntCC::Equal, ix, zero);
+                let inb = builder.ins().band(inb0, iclean);
                 let off = builder.ins().isub(eff, lo_c);
                 let first_c = builder.ins().iconst(types::I64, *first_id as i64);
                 let eid = builder.ins().iadd(first_c, off);
@@ -2493,8 +2523,10 @@ mod enabled {
                 let minus1 = builder.ins().iconst(types::I64, -1);
                 let inb_mask = builder.ins().select(inb, minus1, zero);
                 let v = builder.ins().band(val, inb_mask);
-                let one = builder.ins().iconst(types::I64, 1);
-                let x = builder.ins().select(inb, xzv, one);
+                // Miss: every bit of the element width is x.
+                let dw = reg_w.get(*d as usize).copied().unwrap_or(0);
+                let xall = builder.ins().iconst(types::I64, width_mask_i64(dw));
+                let x = builder.ins().select(inb, xzv, xall);
                 st2(builder, pointer_type, regs, xz, *d, v, x);
             }
             // Dense-array blocking element store. Same index rules as the
@@ -2508,14 +2540,18 @@ mod enabled {
                 };
                 let (iv, ix) = ld2(builder, pointer_type, regs, xz, *idx_reg);
                 let (vv, vx) = ld2(builder, pointer_type, regs, xz, *val_reg);
-                // Same per-bit X/Z zeroing as the load (to_u64 parity).
+                // Same index rules as the load.
                 let nix = builder.ins().bnot(ix);
                 let eff = builder.ins().band(iv, nix);
                 let lo_c = builder.ins().iconst(types::I64, *lo);
                 let hi_c = builder.ins().iconst(types::I64, *hi);
                 let ge = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, eff, lo_c);
                 let le = builder.ins().icmp(IntCC::SignedLessThanOrEqual, eff, hi_c);
-                let inb = builder.ins().band(ge, le);
+                let inb0 = builder.ins().band(ge, le);
+                // An index with an x/z bit modifies nothing (§7.4.6).
+                let zero_i = builder.ins().iconst(types::I64, 0);
+                let iclean = builder.ins().icmp(IntCC::Equal, ix, zero_i);
+                let inb = builder.ins().band(inb0, iclean);
                 let store_b = builder.create_block();
                 let join_b = builder.create_block();
                 builder.ins().brif(inb, store_b, &[], join_b, &[]);
@@ -2910,6 +2946,12 @@ mod enabled {
     /// nothing" fall out of the path that is already there. The x plane never
     /// reached the bridge, and the value plane has x bits masked to zero, so
     /// an unknown index arrived as a perfectly ordinary bit 0.
+    /// x-plane mask covering `w` bits (all 64 when the width is unknown
+    /// or wider than a register).
+    fn width_mask_i64(w: u32) -> i64 {
+        if w == 0 || w >= 64 { -1 } else { ((1u64 << w) - 1) as i64 }
+    }
+
     fn dyn_bit_index_or_oob(
         builder: &mut FunctionBuilder,
         pointer_type: Type,

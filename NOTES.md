@@ -21,6 +21,12 @@ and the development workflow are in [README.md](README.md).
   block's own instance: `%m` names the instance, bare names resolve there,
   and `$realtime`/`%t` use its timescale. Previously such statements ran
   under the top scope.
+* With the native compiler on, a bit-select, part-select or array element
+  read whose index or bound carries x/z now yields x across the full
+  width, and an element or part-select write with such an index modifies
+  nothing, matching the interpreter and IEEE 1800 7.4.6 / 11.5.1. The
+  native code previously zeroed the unknown bits and used the result as
+  the index.
 * A constant part-select write with a negative label (`x[4:-1] = v`,
   `x[0:-1] <= v`) in a clocked block or compiled process keeps its in-range
   bits (IEEE 1800 §11.5.1); the compiled path folded the bounds unsigned,
