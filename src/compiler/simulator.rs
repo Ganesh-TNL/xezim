@@ -2600,6 +2600,10 @@ struct SvaClockedSite {
     /// Resolved signal name for the clock; we re-resolve to value
     /// each tick rather than caching an id (small site count).
     clock_signal: String,
+    /// Clock edge: 0 posedge, 1 negedge, 2 any edge (§16.5).
+    edge: u8,
+    /// `@(posedge clk iff g)`: the tick counts only while `g` holds.
+    iff: Option<Expression>,
     /// Property body as written (after named-sequence expansion); kept for
     /// the `$past` argument walk.
     body: Expression,
@@ -2632,27 +2636,91 @@ struct SvaClockedSite {
     sampled_ids: Vec<usize>,
 }
 
-/// One step of a flattened sequence (§16.9): `cond` must hold `min..=max`
-/// clock ticks after the previous step matched (`max == u32::MAX` is
-/// unbounded, `##[1:$]`). The first step's delay counts from the attempt's
-/// start tick.
+/// A sequence (§16.9) as parsed, before it is turned into an automaton.
 #[derive(Debug, Clone)]
-struct SvaStep {
-    min: u32,
-    max: u32,
-    cond: Expression,
+enum SvaSeq {
+    /// A boolean: holds at one cycle.
+    Bool(Expression),
+    /// `##[min:max]` (`max == u32::MAX` unbounded).
+    Delay(u32, u32),
+    Concat(Vec<SvaSeq>),
+    Or(Box<SvaSeq>, Box<SvaSeq>),
+    And(Box<SvaSeq>, Box<SvaSeq>),
+    Intersect(Box<SvaSeq>, Box<SvaSeq>),
+    Throughout(Expression, Box<SvaSeq>),
+    Within(Box<SvaSeq>, Box<SvaSeq>),
+    FirstMatch(Box<SvaSeq>),
+    /// `s[*min:max]`.
+    Rep { seq: Box<SvaSeq>, min: u32, max: u32 },
+    /// `b[->min:max]`.
+    Goto { cond: Expression, min: u32, max: u32 },
+    /// `b[=min:max]`.
+    NonCon { cond: Expression, min: u32, max: u32 },
+}
+
+/// Sequence automaton: a cycle advances over `Tick` edges; every other edge
+/// is followed within the cycle. The accept state is reached at the cycle a
+/// match ends.
+#[derive(Debug, Clone)]
+struct SvaNfa {
+    states: Vec<Vec<SvaEdge>>,
+    start: usize,
+    accept: usize,
+}
+
+#[derive(Debug, Clone)]
+enum SvaEdge {
+    Eps(usize),
+    /// Follow when the boolean holds at this cycle.
+    Check(Expression, usize),
+    /// Follow at the next cycle.
+    Tick(usize),
+    /// A compound sub-sequence: followed at every cycle it reports a match.
+    Sub(Box<SvaCompound>, usize),
+}
+
+#[derive(Debug, Clone)]
+enum SvaCompound {
+    /// Both match; ends when the later one ends (§16.9.5).
+    And(SvaNfa, SvaNfa),
+    /// Both match and end at the same cycle (§16.9.6).
+    Intersect(SvaNfa, SvaNfa),
+    /// The boolean holds at every cycle of the sequence (§16.9.9).
+    Throughout(Expression, SvaNfa),
+    /// Only the earliest match (§16.9.7).
+    FirstMatch(SvaNfa),
+}
+
+/// A sequence in flight: `pcs` are the states waiting for the next cycle,
+/// `subs` the compound edges being followed.
+#[derive(Debug, Clone, Default)]
+struct SvaRun {
+    started: bool,
+    pcs: Vec<usize>,
+    subs: Vec<SvaSubRun>,
+}
+
+#[derive(Debug, Clone)]
+struct SvaSubRun {
+    /// `(state, edge)` of the `Sub` edge in the enclosing automaton.
+    at: (usize, usize),
+    target: usize,
+    runs: Vec<SvaRun>,
+    /// Which operand of an `and` has matched so far.
+    ever: [bool; 2],
 }
 
 /// A property body compiled for evaluation (§16.12).
 #[derive(Debug, Clone)]
 enum SvaNode {
-    /// A sequence used as a property: holds iff it has a match.
-    Seq(Vec<SvaStep>),
+    /// A sequence used as a property: holds iff it has a match. `strong`
+    /// (§16.12.2): an attempt still in flight at the end of simulation fails.
+    Seq(SvaNfa, bool),
     /// `not p`.
     Not(Box<SvaNode>),
     /// `ante |-> cons` (overlap) / `ante |=> cons`: every match of the
     /// antecedent starts one evaluation of the consequent.
-    Impl { ante: Vec<SvaStep>, overlap: bool, cons: Box<SvaNode> },
+    Impl { ante: SvaNfa, overlap: bool, cons: Box<SvaNode> },
     And(Box<SvaNode>, Box<SvaNode>),
     Or(Box<SvaNode>, Box<SvaNode>),
     /// §16.12.6 `s_eventually e`: holds once `e` samples true.
@@ -2673,12 +2741,10 @@ enum SvaOutcome {
 /// Per-attempt evaluation state mirroring `SvaNode`.
 #[derive(Debug, Clone)]
 enum SvaState {
-    /// Threads `(next step, ticks since the previous step matched)`; a
-    /// sequence is nondeterministic (`##[1:2]`), so several may be alive.
-    Seq { threads: Vec<(usize, u32)>, started: bool },
+    Seq(SvaRun),
     Not(Box<SvaState>),
     Impl {
-        ante: Box<SvaState>,
+        ante: SvaRun,
         ante_alive: bool,
         matched_any: bool,
         /// Consequent evaluations `(ticks until they start, state)`.
@@ -2687,6 +2753,213 @@ enum SvaState {
     And { a: Box<SvaState>, b: Box<SvaState>, ra: Option<SvaOutcome>, rb: Option<SvaOutcome> },
     Or { a: Box<SvaState>, b: Box<SvaState>, ra: Option<SvaOutcome>, rb: Option<SvaOutcome> },
     Leaf,
+}
+
+/// Thompson-style construction of `SvaNfa` fragments.
+struct SvaNfaBuilder {
+    states: Vec<Vec<SvaEdge>>,
+}
+
+enum SvaRepUnit<'a> {
+    Seq(&'a SvaSeq),
+    Goto(&'a Expression),
+}
+
+impl SvaNfaBuilder {
+    fn state(&mut self) -> usize {
+        self.states.push(Vec::new());
+        self.states.len() - 1
+    }
+
+    fn add(&mut self, from: usize, edge: SvaEdge) {
+        self.states[from].push(edge);
+    }
+
+    fn build(seq: &SvaSeq) -> SvaNfa {
+        let mut b = SvaNfaBuilder { states: Vec::new() };
+        let (start, accept) = b.frag(seq);
+        SvaNfa { states: b.states, start, accept }
+    }
+
+    fn not_of(e: &Expression) -> Expression {
+        Expression::new(
+            ExprKind::Unary {
+                op: crate::ast::expr::UnaryOp::LogNot,
+                operand: Box::new(e.clone()),
+            },
+            e.span,
+        )
+    }
+
+    fn true_lit(span: crate::ast::Span) -> Expression {
+        Expression::new(
+            ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                size: None,
+                signed: false,
+                base: crate::ast::expr::NumberBase::Decimal,
+                value: "1".to_string(),
+                cached_val: std::cell::Cell::new(None),
+            }),
+            span,
+        )
+    }
+
+    /// One unit of a repetition: the repeated sequence, or one `b[->1]`
+    /// occurrence (`!b` cycles then a `b` cycle).
+    fn unit(&mut self, u: &SvaRepUnit<'_>) -> (usize, usize) {
+        match u {
+            SvaRepUnit::Seq(s) => self.frag(s),
+            SvaRepUnit::Goto(cond) => {
+                let s = self.state();
+                let x = self.state();
+                let e = self.state();
+                self.add(s, SvaEdge::Check(Self::not_of(cond), x));
+                self.add(x, SvaEdge::Tick(s));
+                self.add(s, SvaEdge::Check((*cond).clone(), e));
+                (s, e)
+            }
+        }
+    }
+
+    /// `unit[*min:max]`: consecutive copies one cycle apart.
+    fn rep(&mut self, u: &SvaRepUnit<'_>, min: u32, max: u32) -> (usize, usize) {
+        const UNROLL_CAP: u32 = 256;
+        let min = min.min(UNROLL_CAP);
+        let s = self.state();
+        let t = self.state();
+        if min == 0 {
+            self.add(s, SvaEdge::Eps(t));
+        }
+        let mut prev_end: Option<usize> = None;
+        for _ in 0..min {
+            let (cs, ce) = self.unit(u);
+            match prev_end {
+                None => self.add(s, SvaEdge::Eps(cs)),
+                Some(pe) => self.add(pe, SvaEdge::Tick(cs)),
+            }
+            prev_end = Some(ce);
+        }
+        if let Some(pe) = prev_end {
+            self.add(pe, SvaEdge::Eps(t));
+        }
+        if max == u32::MAX {
+            let (cs, ce) = self.unit(u);
+            match prev_end {
+                None => self.add(s, SvaEdge::Eps(cs)),
+                Some(pe) => self.add(pe, SvaEdge::Tick(cs)),
+            }
+            self.add(ce, SvaEdge::Eps(t));
+            self.add(ce, SvaEdge::Tick(cs));
+        } else {
+            let max = max.min(UNROLL_CAP).max(min);
+            for _ in min..max {
+                let (cs, ce) = self.unit(u);
+                match prev_end {
+                    None => self.add(s, SvaEdge::Eps(cs)),
+                    Some(pe) => self.add(pe, SvaEdge::Tick(cs)),
+                }
+                self.add(ce, SvaEdge::Eps(t));
+                prev_end = Some(ce);
+            }
+        }
+        (s, t)
+    }
+
+    fn frag(&mut self, seq: &SvaSeq) -> (usize, usize) {
+        match seq {
+            SvaSeq::Bool(e) => {
+                let s = self.state();
+                let t = self.state();
+                self.add(s, SvaEdge::Check(e.clone(), t));
+                (s, t)
+            }
+            SvaSeq::Delay(min, max) => {
+                let s = self.state();
+                let mut cur = s;
+                for _ in 0..(*min).min(4096) {
+                    let n = self.state();
+                    self.add(cur, SvaEdge::Tick(n));
+                    cur = n;
+                }
+                if *max == u32::MAX {
+                    self.add(cur, SvaEdge::Tick(cur));
+                    (s, cur)
+                } else {
+                    let t = self.state();
+                    self.add(cur, SvaEdge::Eps(t));
+                    for _ in *min..(*max).min(4096).max(*min) {
+                        let n = self.state();
+                        self.add(cur, SvaEdge::Tick(n));
+                        self.add(n, SvaEdge::Eps(t));
+                        cur = n;
+                    }
+                    (s, t)
+                }
+            }
+            SvaSeq::Concat(items) => {
+                if items.is_empty() {
+                    let s = self.state();
+                    return (s, s);
+                }
+                let (s0, mut prev_end) = self.frag(&items[0]);
+                for it in &items[1..] {
+                    let (si, ei) = self.frag(it);
+                    self.add(prev_end, SvaEdge::Eps(si));
+                    prev_end = ei;
+                }
+                (s0, prev_end)
+            }
+            SvaSeq::Or(a, b) => {
+                let s = self.state();
+                let t = self.state();
+                let (sa, ea) = self.frag(a);
+                let (sb, eb) = self.frag(b);
+                self.add(s, SvaEdge::Eps(sa));
+                self.add(s, SvaEdge::Eps(sb));
+                self.add(ea, SvaEdge::Eps(t));
+                self.add(eb, SvaEdge::Eps(t));
+                (s, t)
+            }
+            SvaSeq::And(a, b) => self.sub(SvaCompound::And(Self::build(a), Self::build(b))),
+            SvaSeq::Intersect(a, b) => {
+                self.sub(SvaCompound::Intersect(Self::build(a), Self::build(b)))
+            }
+            SvaSeq::Throughout(e, a) => {
+                self.sub(SvaCompound::Throughout(e.clone(), Self::build(a)))
+            }
+            SvaSeq::Within(a, b) => {
+                // §16.9.10: `(1[*0:$] ##1 a ##1 1[*0:$]) intersect b`.
+                let span = crate::ast::Span::dummy();
+                let padded = SvaSeq::Concat(vec![
+                    SvaSeq::Delay(0, u32::MAX),
+                    (**a).clone(),
+                    SvaSeq::Delay(0, u32::MAX),
+                    SvaSeq::Bool(Self::true_lit(span)),
+                ]);
+                self.sub(SvaCompound::Intersect(Self::build(&padded), Self::build(b)))
+            }
+            SvaSeq::FirstMatch(a) => self.sub(SvaCompound::FirstMatch(Self::build(a))),
+            SvaSeq::Rep { seq, min, max } => self.rep(&SvaRepUnit::Seq(seq), *min, *max),
+            SvaSeq::Goto { cond, min, max } => self.rep(&SvaRepUnit::Goto(cond), *min, *max),
+            SvaSeq::NonCon { cond, min, max } => {
+                // §16.9.2: `b[->min:max] ##1 !b[*0:$]`.
+                let (s, e) = self.rep(&SvaRepUnit::Goto(cond), *min, *max);
+                let t = self.state();
+                let f = self.state();
+                self.add(e, SvaEdge::Eps(t));
+                self.add(e, SvaEdge::Tick(f));
+                self.add(f, SvaEdge::Check(Self::not_of(cond), e));
+                (s, t)
+            }
+        }
+    }
+
+    fn sub(&mut self, c: SvaCompound) -> (usize, usize) {
+        let s = self.state();
+        let t = self.state();
+        self.add(s, SvaEdge::Sub(Box::new(c), t));
+        (s, t)
+    }
 }
 
 /// Covergroup handles live above this tag; class handles are plain heap indices.
@@ -40157,6 +40430,9 @@ impl Simulator {
             );
 
         }
+        // §16.12.2: strong properties still pending fail at the end of
+        // simulation, before the summary counts them.
+        self.sva_end_of_sim();
         // Assertion + coverage summary (always when any data was recorded;
         // dump the JSON database iff XEZIM_COV_DB=<path> is set, else default
         // path xezim_cov.json when at least one stat exists).
@@ -72007,13 +72283,32 @@ if self.profile_report {
                     // the per-iteration observed-probe path. Dedup by
                     // span_key so re-execution (e.g. inside an always
                     // block) doesn't grow the site list unbounded.
-                    if let ExprKind::SvaClocked { clock, body } = &resolved_expr.kind {
+                    // A clockless `assert property` samples on the default
+                    // clocking (§14.12).
+                    let clocked: Option<(String, u8, Option<Expression>, Expression)> =
+                        match &resolved_expr.kind {
+                            ExprKind::SvaClocked { clock, edge, iff, body } => {
+                                let clock_signal = match &clock.kind {
+                                    ExprKind::Ident(h) => self.resolve_hier_name(h).into_owned(),
+                                    _ => String::new(),
+                                };
+                                Some((clock_signal, *edge, iff.as_deref().cloned(), (**body).clone()))
+                            }
+                            _ => match self.clocking_meta.get("__xz_default_clocking") {
+                                Some((clk, _)) => {
+                                    let clk = clk.clone();
+                                    let edge = match self.clocking_edge.get("__xz_default_clocking") {
+                                        Some(EdgeKind::Negedge) => 1u8,
+                                        _ => 0u8,
+                                    };
+                                    Some((clk, edge, None, resolved_expr.clone()))
+                                }
+                                None => None,
+                            },
+                        };
+                    if let Some((clock_signal, edge, iff, body)) = clocked {
                         let span_key = a.span.start;
                         if !self.sva_sites.iter().any(|s| s.span_key == span_key) {
-                            let clock_signal = match &clock.kind {
-                                ExprKind::Ident(h) => self.resolve_hier_name(h).into_owned(),
-                                _ => String::new(),
-                            };
                             // LRM §16.5.1: collect the ids of every signal
                             // referenced in the property body so their
                             // Preponed (slot-entry) values can be sampled
@@ -72025,7 +72320,7 @@ if self.profile_report {
                             };
                             // Named sequence / property instances INSIDE the
                             // body (`a |=> s`) expand here, once.
-                            let body_expanded = self.sva_expand_named(body, 0);
+                            let body_expanded = self.sva_expand_named(&body, 0);
                             let mut sampled_ids = Vec::new();
                             self.collect_sva_signal_ids(&body_expanded, &mut sampled_ids);
                             sampled_ids.sort_unstable();
@@ -72035,6 +72330,8 @@ if self.profile_report {
                                 span_key,
                                 kind,
                                 clock_signal,
+                                edge,
+                                iff,
                                 body: body_expanded,
                                 node: std::sync::Arc::new(node),
                                 disable,
@@ -75966,6 +76263,14 @@ if self.profile_report {
     /// must NOT run the pass action, so callers pass `passed=false`/skip there.
     /// §16.8: expand named sequence / property instances (no formals)
     /// nested anywhere in an SVA body, so `a |=> s` sees `s`'s body.
+    /// A named sequence/property body without its `@(clk)` wrapper.
+    fn sva_unclocked(e: &Expression) -> Expression {
+        match &e.kind {
+            ExprKind::SvaClocked { body, .. } => (**body).clone(),
+            _ => e.clone(),
+        }
+    }
+
     fn sva_expand_named(&self, e: &Expression, depth: u32) -> Expression {
         if depth > 16 {
             return e.clone();
@@ -75977,11 +76282,56 @@ if self.profile_report {
                     && self.module.property_params.get(name).map_or(true, |p| p.is_empty())
                 {
                     if let Some(body) = self.module.property_decls.get(name) {
-                        return self.sva_expand_named(body, depth + 1);
+                        let inner = Self::sva_unclocked(body);
+                        return self.sva_expand_named(&inner, depth + 1);
                     }
                 }
                 e.clone()
             }
+            // `s(x, y)`: a named sequence / property with formals — the
+            // body with the actuals substituted.
+            ExprKind::Call { func, args } => {
+                let name = match &func.kind {
+                    ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                        Some(h.path[0].name.name.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    if let Some(body) = self.module.property_decls.get(&name).cloned() {
+                        let formals = self.module.property_params.get(&name).cloned().unwrap_or_default();
+                        let mut map: HashMap<String, Expression> = HashMap::default();
+                        for (i, f) in formals.iter().enumerate() {
+                            if let Some(actual) = args.get(i) {
+                                map.insert(f.clone(), actual.clone());
+                            }
+                        }
+                        let body = super::elaborate::rewrite_expr(
+                            &body,
+                            "",
+                            &map,
+                            &std::collections::HashSet::new(),
+                            &HashMap::default(),
+                        );
+                        let inner = Self::sva_unclocked(&body);
+                        return self.sva_expand_named(&inner, depth + 1);
+                    }
+                }
+                Expression::new(
+                    ExprKind::Call {
+                        func: func.clone(),
+                        args: args.iter().map(|a| self.sva_expand_named(a, depth)).collect(),
+                    },
+                    e.span,
+                )
+            }
+            ExprKind::SystemCall { name, args } => Expression::new(
+                ExprKind::SystemCall {
+                    name: name.clone(),
+                    args: args.iter().map(|a| self.sva_expand_named(a, depth)).collect(),
+                },
+                e.span,
+            ),
             ExprKind::Binary { op, left, right } => Expression::new(
                 ExprKind::Binary {
                     op: op.clone(),
@@ -76005,15 +76355,7 @@ if self.profile_report {
     /// §16.9.2 delay bounds of a `##` count: `N`, `[m:n]`, `[m:$]`.
     fn sva_delay_bounds(&mut self, d: &Expression) -> (u32, u32) {
         match &d.kind {
-            ExprKind::Range(lo, hi) => {
-                let l = self.eval_expr(lo).to_u64().unwrap_or(0).min(u32::MAX as u64) as u32;
-                let h = if matches!(hi.kind, ExprKind::Dollar) {
-                    u32::MAX
-                } else {
-                    self.eval_expr(hi).to_u64().unwrap_or(l as u64).min(u32::MAX as u64) as u32
-                };
-                (l, h.max(l))
-            }
+            ExprKind::Range(lo, hi) => self.sva_bounds_pair(lo, hi),
             ExprKind::Dollar => (0, u32::MAX),
             ExprKind::Paren(inner) => self.sva_delay_bounds(inner),
             _ => {
@@ -76023,52 +76365,109 @@ if self.profile_report {
         }
     }
 
-    /// A sequence expression as cycle steps: `a ##1 b ##[2:3] c` (parsed
-    /// `SeqAnd(SeqAnd(a, ##1 b), ##[2:3] c)`) becomes
-    /// `[(0..0,a),(1..1,b),(2..3,c)]`; a plain boolean is one delay-0 step.
-    fn sva_flatten_steps(&mut self, e: &Expression, out: &mut Vec<SvaStep>) {
+    fn sva_bounds_pair(&mut self, lo: &Expression, hi: &Expression) -> (u32, u32) {
+        let l = self.eval_expr(lo).to_u64().unwrap_or(0).min(u32::MAX as u64) as u32;
+        let h = if matches!(hi.kind, ExprKind::Dollar) {
+            u32::MAX
+        } else {
+            self.eval_expr(hi).to_u64().unwrap_or(l as u64).min(u32::MAX as u64) as u32
+        };
+        (l, h.max(l))
+    }
+
+    fn sva_concat(a: SvaSeq, b: SvaSeq) -> SvaSeq {
+        let mut items = match a {
+            SvaSeq::Concat(v) => v,
+            other => vec![other],
+        };
+        match b {
+            SvaSeq::Concat(v) => items.extend(v),
+            other => items.push(other),
+        }
+        SvaSeq::Concat(items)
+    }
+
+    /// A sequence expression (§16.9) as an `SvaSeq`: `a ##1 b ##[2:3] c`
+    /// (parsed `SeqAnd(SeqAnd(a, ##1 b), ##[2:3] c)`) becomes
+    /// `Concat[a, Delay(1,1), b, Delay(2,3), c]`.
+    fn sva_seq_from_expr(&mut self, e: &Expression) -> SvaSeq {
+        use crate::ast::expr::{BinaryOp, UnaryOp};
         match &e.kind {
-            ExprKind::Binary { op, left, right }
-                if matches!(op, crate::ast::expr::BinaryOp::SeqAnd) =>
-            {
-                self.sva_flatten_steps(left, out);
-                self.sva_flatten_steps(right, out);
+            ExprKind::Paren(inner) => self.sva_seq_from_expr(inner),
+            ExprKind::Binary { op, left, right } => match op {
+                BinaryOp::SeqAnd => {
+                    let l = self.sva_seq_from_expr(left);
+                    let r = self.sva_seq_from_expr(right);
+                    Self::sva_concat(l, r)
+                }
+                BinaryOp::HashHash => {
+                    let (mn, mx) = self.sva_delay_bounds(left);
+                    let r = self.sva_seq_from_expr(right);
+                    Self::sva_concat(SvaSeq::Delay(mn, mx), r)
+                }
+                BinaryOp::SeqOr => SvaSeq::Or(
+                    Box::new(self.sva_seq_from_expr(left)),
+                    Box::new(self.sva_seq_from_expr(right)),
+                ),
+                BinaryOp::SvaAnd => SvaSeq::And(
+                    Box::new(self.sva_seq_from_expr(left)),
+                    Box::new(self.sva_seq_from_expr(right)),
+                ),
+                BinaryOp::Intersect => SvaSeq::Intersect(
+                    Box::new(self.sva_seq_from_expr(left)),
+                    Box::new(self.sva_seq_from_expr(right)),
+                ),
+                BinaryOp::Throughout => {
+                    SvaSeq::Throughout((**left).clone(), Box::new(self.sva_seq_from_expr(right)))
+                }
+                BinaryOp::Within => SvaSeq::Within(
+                    Box::new(self.sva_seq_from_expr(left)),
+                    Box::new(self.sva_seq_from_expr(right)),
+                ),
+                _ => SvaSeq::Bool(e.clone()),
+            },
+            // A trailing bare `##N`: a delay with nothing to check.
+            ExprKind::Unary { op, operand } if matches!(op, UnaryOp::HashHash) => {
+                let (mn, mx) = self.sva_delay_bounds(operand);
+                Self::sva_concat(
+                    SvaSeq::Delay(mn, mx),
+                    SvaSeq::Bool(SvaNfaBuilder::true_lit(e.span)),
+                )
             }
-            ExprKind::Binary { op, left, right }
-                if matches!(op, crate::ast::expr::BinaryOp::HashHash) =>
-            {
-                let (mn, mx) = self.sva_delay_bounds(left);
-                let start = out.len();
-                self.sva_flatten_steps(right, out);
-                if let Some(first) = out.get_mut(start) {
-                    first.min = first.min.saturating_add(mn);
-                    first.max = if first.max == u32::MAX || mx == u32::MAX {
-                        u32::MAX
-                    } else {
-                        first.max.saturating_add(mx)
-                    };
+            ExprKind::SystemCall { name, args } if name.starts_with("$sva_") => {
+                let bounds = |this: &mut Self| -> (u32, u32) {
+                    match (args.get(1), args.get(2)) {
+                        (Some(lo), Some(hi)) => this.sva_bounds_pair(lo, hi),
+                        _ => (1, 1),
+                    }
+                };
+                match (name.as_str(), args.first()) {
+                    ("$sva_rep_consec", Some(s)) => {
+                        let (min, max) = bounds(self);
+                        SvaSeq::Rep { seq: Box::new(self.sva_seq_from_expr(s)), min, max }
+                    }
+                    ("$sva_rep_goto", Some(s)) => {
+                        let (min, max) = bounds(self);
+                        SvaSeq::Goto { cond: s.clone(), min, max }
+                    }
+                    ("$sva_rep_noncon", Some(s)) => {
+                        let (min, max) = bounds(self);
+                        SvaSeq::NonCon { cond: s.clone(), min, max }
+                    }
+                    ("$sva_first_match", Some(s)) => {
+                        SvaSeq::FirstMatch(Box::new(self.sva_seq_from_expr(s)))
+                    }
+                    ("$sva_strong", Some(s)) | ("$sva_weak", Some(s)) => self.sva_seq_from_expr(s),
+                    _ => SvaSeq::Bool(e.clone()),
                 }
             }
-            // A trailing bare `##N`: a delay with nothing to check.
-            ExprKind::Unary { op, operand }
-                if matches!(op, crate::ast::expr::UnaryOp::HashHash) =>
-            {
-                let (mn, mx) = self.sva_delay_bounds(operand);
-                let one = Expression::new(
-                    ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
-                        size: None,
-                        signed: false,
-                        base: crate::ast::expr::NumberBase::Decimal,
-                        value: "1".to_string(),
-                        cached_val: std::cell::Cell::new(None),
-                    }),
-                    e.span,
-                );
-                out.push(SvaStep { min: mn, max: mx, cond: one });
-            }
-            ExprKind::Paren(inner) => self.sva_flatten_steps(inner, out),
-            _ => out.push(SvaStep { min: 0, max: 0, cond: e.clone() }),
+            _ => SvaSeq::Bool(e.clone()),
         }
+    }
+
+    fn sva_build_seq(&mut self, e: &Expression) -> SvaNfa {
+        let seq = self.sva_seq_from_expr(e);
+        SvaNfaBuilder::build(&seq)
     }
 
     /// Does the expression use a sequence/property operator (so a `not` in
@@ -76084,6 +76483,9 @@ if self.profile_report {
                         | BinaryOp::SeqAnd
                         | BinaryOp::SvaAnd
                         | BinaryOp::SeqOr
+                        | BinaryOp::Intersect
+                        | BinaryOp::Throughout
+                        | BinaryOp::Within
                         | BinaryOp::OrMinusArrow
                         | BinaryOp::OrFatArrow
                 ) || Self::sva_is_temporal(left)
@@ -76093,6 +76495,7 @@ if self.profile_report {
                 matches!(op, UnaryOp::HashHash | UnaryOp::SEventually | UnaryOp::SAlways)
                     || Self::sva_is_temporal(operand)
             }
+            ExprKind::SystemCall { name, .. } => name.starts_with("$sva_"),
             _ => false,
         }
     }
@@ -76105,21 +76508,26 @@ if self.profile_report {
             ExprKind::Binary { op, left, right }
                 if matches!(op, BinaryOp::OrMinusArrow | BinaryOp::OrFatArrow) =>
             {
-                let mut ante = Vec::new();
-                self.sva_flatten_steps(left, &mut ante);
+                let ante = self.sva_build_seq(left);
                 SvaNode::Impl {
                     ante,
                     overlap: matches!(op, BinaryOp::OrMinusArrow),
                     cons: Box::new(self.sva_compile_node(right)),
                 }
             }
-            ExprKind::Binary { op, left, right } if matches!(op, BinaryOp::SvaAnd) => {
+            ExprKind::Binary { op, left, right }
+                if matches!(op, BinaryOp::SvaAnd)
+                    && (Self::sva_has_property_op(left) || Self::sva_has_property_op(right)) =>
+            {
                 SvaNode::And(
                     Box::new(self.sva_compile_node(left)),
                     Box::new(self.sva_compile_node(right)),
                 )
             }
-            ExprKind::Binary { op, left, right } if matches!(op, BinaryOp::SeqOr) => {
+            ExprKind::Binary { op, left, right }
+                if matches!(op, BinaryOp::SeqOr)
+                    && (Self::sva_has_property_op(left) || Self::sva_has_property_op(right)) =>
+            {
                 SvaNode::Or(
                     Box::new(self.sva_compile_node(left)),
                     Box::new(self.sva_compile_node(right)),
@@ -76136,11 +76544,76 @@ if self.profile_report {
             ExprKind::Unary { op, operand } if matches!(op, UnaryOp::SAlways) => {
                 SvaNode::Always((**operand).clone())
             }
-            _ => {
-                let mut steps = Vec::new();
-                self.sva_flatten_steps(e, &mut steps);
-                SvaNode::Seq(steps)
+            // §16.12.2 `strong(seq)` / `weak(seq)` as a property.
+            ExprKind::SystemCall { name, args }
+                if matches!(name.as_str(), "$sva_strong" | "$sva_weak") && args.len() == 1 =>
+            {
+                let nfa = self.sva_build_seq(&args[0]);
+                SvaNode::Seq(nfa, name == "$sva_strong")
             }
+            _ => SvaNode::Seq(self.sva_build_seq(e), false),
+        }
+    }
+
+    /// Does an attempt still carry a strong obligation (§16.12.2) — a
+    /// `strong(seq)` or `s_eventually` that has not been met?
+    fn sva_strong_pending(node: &SvaNode, st: &SvaState) -> bool {
+        match (node, st) {
+            (SvaNode::Seq(_, strong), SvaState::Seq(_)) => *strong,
+            (SvaNode::Eventually(_), SvaState::Leaf) => true,
+            (SvaNode::Impl { cons: cn, .. }, SvaState::Impl { cons, .. }) => {
+                cons.iter().any(|(_, cs)| Self::sva_strong_pending(cn, cs))
+            }
+            (SvaNode::And(na, nb), SvaState::And { a, b, ra, rb })
+            | (SvaNode::Or(na, nb), SvaState::Or { a, b, ra, rb }) => {
+                (ra.is_none() && Self::sva_strong_pending(na, a))
+                    || (rb.is_none() && Self::sva_strong_pending(nb, b))
+            }
+            _ => false,
+        }
+    }
+
+    /// End of simulation (§16.12.2): every attempt still waiting on a strong
+    /// obligation fails now.
+    fn sva_end_of_sim(&mut self) {
+        for i in 0..self.sva_sites.len() {
+            let node = self.sva_sites[i].node.clone();
+            let span_key = self.sva_sites[i].span_key;
+            let attempts = std::mem::take(&mut self.sva_sites[i].attempts);
+            let n_fail = attempts
+                .iter()
+                .filter(|st| Self::sva_strong_pending(&node, st))
+                .count();
+            let prev_active = self.active_sva_site.replace(i);
+            // The fail action runs after `$finish`: lift the flag for it,
+            // as `final` blocks do.
+            let was_finished = self.finished;
+            self.finished = false;
+            for _ in 0..n_fail {
+                self.sva_tally(i, span_key, false);
+            }
+            self.finished = was_finished;
+            self.active_sva_site = prev_active;
+        }
+    }
+
+    /// Does the expression contain a property-only operator (implication,
+    /// `not` of a sequence, `s_eventually`, ...)? Decides whether an
+    /// `and`/`or` joins properties or sequences.
+    fn sva_has_property_op(e: &Expression) -> bool {
+        use crate::ast::expr::{BinaryOp, UnaryOp};
+        match &e.kind {
+            ExprKind::Paren(inner) => Self::sva_has_property_op(inner),
+            ExprKind::Binary { op, left, right } => {
+                matches!(op, BinaryOp::OrMinusArrow | BinaryOp::OrFatArrow)
+                    || (matches!(op, BinaryOp::SvaAnd | BinaryOp::SeqOr)
+                        && (Self::sva_has_property_op(left) || Self::sva_has_property_op(right)))
+            }
+            ExprKind::Unary { op, operand } => {
+                matches!(op, UnaryOp::SEventually | UnaryOp::SAlways)
+                    || (matches!(op, UnaryOp::LogNot) && Self::sva_is_temporal(operand))
+            }
+            _ => false,
         }
     }
 
@@ -76161,10 +76634,10 @@ if self.profile_report {
 
     fn sva_new_state(node: &SvaNode) -> SvaState {
         match node {
-            SvaNode::Seq(_) => SvaState::Seq { threads: Vec::new(), started: false },
+            SvaNode::Seq(..) => SvaState::Seq(SvaRun::default()),
             SvaNode::Not(inner) => SvaState::Not(Box::new(Self::sva_new_state(inner))),
             SvaNode::Impl { .. } => SvaState::Impl {
-                ante: Box::new(SvaState::Seq { threads: Vec::new(), started: false }),
+                ante: SvaRun::default(),
                 ante_alive: true,
                 matched_any: false,
                 cons: Vec::new(),
@@ -76185,62 +76658,130 @@ if self.profile_report {
         }
     }
 
-    /// Advance a sequence by one clock tick (the first call is the start
-    /// tick). Returns `(matched at this tick, threads still alive)`. With
-    /// `first_match` the sequence stops at its first match.
-    fn sva_advance_seq(
-        &mut self,
-        steps: &[SvaStep],
-        st: &mut SvaState,
-        first_match: bool,
-    ) -> (bool, bool) {
-        let SvaState::Seq { threads, started } = st else {
-            return (false, false);
-        };
-        if !*started {
-            *started = true;
-            threads.push((0, 0));
+    /// Advance a sequence automaton by one clock tick (the first call is the
+    /// start tick). Returns `(matched at this tick, still alive)`. With
+    /// `first_match` the run stops at its first match.
+    fn sva_run_advance(&mut self, nfa: &SvaNfa, run: &mut SvaRun, first_match: bool) -> (bool, bool) {
+        let mut work: Vec<usize> = Vec::new();
+        let mut subs: Vec<SvaSubRun> = Vec::new();
+        if !run.started {
+            run.started = true;
+            work.push(nfa.start);
         } else {
-            for t in threads.iter_mut() {
-                t.1 = t.1.saturating_add(1);
+            for &pc in &run.pcs {
+                for e in &nfa.states[pc] {
+                    if let SvaEdge::Tick(t) = e {
+                        work.push(*t);
+                    }
+                }
+            }
+            for mut sub in run.subs.drain(..) {
+                let (m, alive) = self.sva_sub_advance(nfa, &mut sub);
+                if m {
+                    work.push(sub.target);
+                }
+                if alive {
+                    subs.push(sub);
+                }
             }
         }
-        let mut work: Vec<(usize, u32)> = std::mem::take(threads);
-        let mut keep: Vec<(usize, u32)> = Vec::new();
+        let mut visited = vec![false; nfa.states.len()];
+        let mut tick_pcs: Vec<usize> = Vec::new();
         let mut matched = false;
-        while let Some((k, w)) = work.pop() {
-            if k >= steps.len() {
+        while let Some(pc) = work.pop() {
+            if visited[pc] {
+                continue;
+            }
+            visited[pc] = true;
+            if pc == nfa.accept {
                 matched = true;
                 if first_match {
-                    keep.clear();
                     break;
                 }
-                continue;
             }
-            let step = &steps[k];
-            if w < step.min {
-                keep.push((k, w));
-                continue;
-            }
-            if w > step.max {
-                continue;
-            }
-            if self.eval_expr(&step.cond).is_true() {
-                work.push((k + 1, 0));
-            }
-            if w < step.max {
-                keep.push((k, w));
+            for ei in 0..nfa.states[pc].len() {
+                match &nfa.states[pc][ei] {
+                    SvaEdge::Eps(t) => work.push(*t),
+                    SvaEdge::Check(c, t) => {
+                        if self.eval_expr(c).is_true() {
+                            work.push(*t);
+                        }
+                    }
+                    SvaEdge::Tick(_) => {
+                        if !tick_pcs.contains(&pc) {
+                            tick_pcs.push(pc);
+                        }
+                    }
+                    SvaEdge::Sub(comp, t) => {
+                        let n = match &**comp {
+                            SvaCompound::And(..) | SvaCompound::Intersect(..) => 2,
+                            _ => 1,
+                        };
+                        let mut sub = SvaSubRun {
+                            at: (pc, ei),
+                            target: *t,
+                            runs: vec![SvaRun::default(); n],
+                            ever: [false, false],
+                        };
+                        let (m, alive) = self.sva_sub_advance(nfa, &mut sub);
+                        if m {
+                            work.push(*t);
+                        }
+                        if alive {
+                            subs.push(sub);
+                        }
+                    }
+                }
             }
         }
-        *threads = keep;
-        (matched, !threads.is_empty())
+        if matched && first_match {
+            run.pcs.clear();
+            run.subs.clear();
+            return (true, false);
+        }
+        run.pcs = tick_pcs;
+        run.subs = subs;
+        (matched, !run.pcs.is_empty() || !run.subs.is_empty())
+    }
+
+    /// Advance one compound edge; `(matched at this tick, still alive)`.
+    fn sva_sub_advance(&mut self, nfa: &SvaNfa, sub: &mut SvaSubRun) -> (bool, bool) {
+        let SvaEdge::Sub(comp, _) = &nfa.states[sub.at.0][sub.at.1] else {
+            return (false, false);
+        };
+        match &**comp {
+            SvaCompound::FirstMatch(inner) => {
+                let (m, alive) = self.sva_run_advance(inner, &mut sub.runs[0], true);
+                if m { (true, false) } else { (false, alive) }
+            }
+            SvaCompound::Throughout(e, inner) => {
+                if !self.eval_expr(e).is_true() {
+                    return (false, false);
+                }
+                self.sva_run_advance(inner, &mut sub.runs[0], false)
+            }
+            SvaCompound::And(n1, n2) => {
+                let (m1, a1) = self.sva_run_advance(n1, &mut sub.runs[0], false);
+                let (m2, a2) = self.sva_run_advance(n2, &mut sub.runs[1], false);
+                let matched = (m1 && (m2 || sub.ever[1])) || (m2 && sub.ever[0]);
+                sub.ever[0] |= m1;
+                sub.ever[1] |= m2;
+                let dead = (!a1 && !sub.ever[0]) || (!a2 && !sub.ever[1]) || (!a1 && !a2);
+                (matched, !dead)
+            }
+            SvaCompound::Intersect(n1, n2) => {
+                let (m1, a1) = self.sva_run_advance(n1, &mut sub.runs[0], false);
+                let (m2, a2) = self.sva_run_advance(n2, &mut sub.runs[1], false);
+                (m1 && m2, a1 && a2)
+            }
+        }
     }
 
     /// Advance one attempt by one clock tick; `Some` when it is decided.
     fn sva_advance(&mut self, node: &SvaNode, st: &mut SvaState) -> Option<SvaOutcome> {
         match (node, st) {
-            (SvaNode::Seq(steps), st @ SvaState::Seq { .. }) => {
-                let (m, alive) = self.sva_advance_seq(steps, st, true);
+            (SvaNode::Seq(nfa, _), SvaState::Seq(run)) => {
+                let (m, alive) = self.sva_run_advance(nfa, run, true);
                 if m {
                     Some(SvaOutcome::Pass)
                 } else if !alive {
@@ -76256,11 +76797,11 @@ if self.profile_report {
             },
             (
                 SvaNode::Impl { ante, overlap, cons: cons_node },
-                SvaState::Impl { ante: ast, ante_alive, matched_any, cons },
+                SvaState::Impl { ante: arun, ante_alive, matched_any, cons },
             ) => {
                 let mut fresh: Option<SvaState> = None;
                 if *ante_alive {
-                    let (m, alive) = self.sva_advance_seq(ante, ast, false);
+                    let (m, alive) = self.sva_run_advance(ante, arun, false);
                     *ante_alive = alive;
                     if m {
                         *matched_any = true;
@@ -76588,10 +77129,19 @@ if self.profile_report {
             // Update prev_clock for next iteration *before* edge logic
             // so a posedge fires exactly once per 0→1 transition.
             self.sva_sites[i].prev_clock = cur_clk_bit;
-            // Posedge only for now (most common SVA form). Edge detect:
-            // prev = 0, cur = 1.
-            if !(prev == 0 && cur_clk_bit == 1) {
+            let fired = match self.sva_sites[i].edge {
+                1 => prev == 1 && cur_clk_bit == 0,
+                2 => prev != cur_clk_bit && prev != 2 && cur_clk_bit != 2,
+                _ => prev == 0 && cur_clk_bit == 1,
+            };
+            if !fired {
                 continue;
+            }
+            // `@(posedge clk iff g)`: no tick while the guard is false.
+            if let Some(g) = self.sva_sites[i].iff.clone() {
+                if !self.eval_expr(&g).is_true() {
+                    continue;
+                }
             }
             let span_key = self.sva_sites[i].span_key;
             let site_kind = self.sva_sites[i].kind;

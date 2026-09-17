@@ -17,6 +17,14 @@ and the development workflow are in [README.md](README.md).
   default before enough history exists; `disable iff` cancels attempts in
   flight; property `and`/`or` parse and evaluate; and `(##2 (b))` means the
   same as `##2 b`.
+* Sequence operators that used to be accepted and ignored now evaluate:
+  repetition `s[*n]`, `s[*m:n]`, `b[->n]`, `b[=n]`; `throughout`, `within`,
+  `intersect`, sequence `and`/`or` (also inside an antecedent);
+  `first_match`; `strong(...)`/`weak(...)`, with a strong property still
+  pending at the end of simulation reported as a failure; `@(negedge clk)`
+  and `@(posedge clk iff en)` clocking events; a clockless `assert property`
+  under `default clocking`; and named sequences and properties with formal
+  arguments used inside a property body.
 * Package-qualified variables inside tasks and functions: a write such as
   `store_pkg::scalar = d;`, `pkg::arr[i] = v;` or `pkg::v[3:0] = x;` in a
   subroutine body was silently dropped, and a read of `pkg::arr[i]` or
