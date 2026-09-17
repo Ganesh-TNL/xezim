@@ -13201,6 +13201,14 @@ pub enum TsInsn {
     /// signal when the block bails, so the four-state re-run is exact for
     /// a block that reads a signal it later overwrites.
     SaveSig { sig: u32 },
+    /// Process-FSM wait points (only in FSM streams, run by the control
+    /// executor from a start index). `resume` is the four-state pc after
+    /// the wait, which the runner keeps as the process's pc; `vm_to_ts`
+    /// maps it back to a stream index on the next resume.
+    WaitEdge { ix: u32, resume: u32 },
+    /// A folded constant delay: `raw` is the f64 bit pattern of the tick
+    /// count before quantization (`fsm_delay_ticks` applies it at run time).
+    WaitDelayRaw { raw: u64, resume: u32 },
 }
 
 pub struct TwoStateBlock {
@@ -13221,6 +13229,13 @@ pub struct TwoStateBlock {
     /// Words per wide register for this block: 0 (none), 2 (widths up to
     /// 128) or 8 (up to 512); selects the wide executor's monomorph.
     pub wide_words: u8,
+    /// Process-FSM streams only: the stream holds wait opcodes; `vm_to_ts`
+    /// maps each four-state pc to its stream index; `wait_regs` lists, per
+    /// resume pc, the registers the stream defines there as (reg, width,
+    /// signed) — the set a VM re-run converts from and to.
+    pub has_wait: bool,
+    pub vm_to_ts: Box<[u32]>,
+    pub wait_regs: Box<[(u32, Box<[(u16, u32, bool)]>)]>,
     /// Wide (>64-bit) signals read WHOLE — X-checked via words_if_clean.
     pub reads_wide: Box<[u32]>,
     /// Signals this block WRITES (sorted, deduped). §9.3.1 force filtering
@@ -13696,6 +13711,13 @@ pub fn lower_two_state(
     let mut rw: Vec<Option<u32>> = vec![None; cb.num_regs as usize];
     // Widest register defined in the block: picks the wide bank's word count.
     let mut max_wide: u32 = 0;
+    // Process-FSM wait bookkeeping (see `TwoStateBlock::has_wait`).
+    let mut has_wait = false;
+    let mut wait_regs: Vec<(u32, Box<[(u16, u32, bool)]>)> = Vec::new();
+    let mut skip_next = false;
+    // Resume points are moved back onto the hazard saves that follow the
+    // wait (a branch landing there runs the saves too, which is harmless).
+    let mut wait_resume_fix: Vec<(u32, u32)> = Vec::new();
     // Constant value per register (from LoadConst), for folding const-index
     // array writes into static element stores. Cleared on any redefinition.
     let mut rc: Vec<Option<u64>> = vec![None; cb.num_regs as usize];
@@ -14000,8 +14022,33 @@ pub fn lower_two_state(
             gate!("x-const consumed");
         }
         idx_map.push(out.len() as u32);
+        if skip_next {
+            // The `WaitDelayReg` consumed by the constant fold below.
+            skip_next = false;
+            continue;
+        }
         match insn {
             Insn::Nop => {}
+            Insn::WaitEdge(ix) => {
+                has_wait = true;
+                let resume = ins_i as u32 + 1;
+                out.push(TsInsn::WaitEdge { ix: *ix, resume });
+                wait_resume_fix.push((resume, out.len() as u32));
+                let snap: Vec<(u16, u32, bool)> = rw
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(r, w)| w.map(|w| (r as u16, w, sg[r])))
+                    .collect();
+                wait_regs.push((resume, snap.into_boxed_slice()));
+                for &sig in &hazards {
+                    out.push(TsInsn::SaveSig { sig });
+                }
+            }
+            Insn::WaitDelayReg(_) => {
+                // Only the constant-folded form (below) lowers; a dynamic
+                // delay keeps the process on the four-state VM.
+                gate!("dynamic delay wait");
+            }
             // No-op here: every lowered register is unsigned by construction
             // (signed sources bail below).
             Insn::ClearSigned(r) => sg[*r as usize] = false,
@@ -14035,6 +14082,31 @@ pub fn lower_two_state(
                 }
             }
             Insn::LoadConst(d, k) => {
+                if k.is_real {
+                    // `LoadConst(real ticks); WaitDelayReg(d)` — the
+                    // registration's constant-delay fold — lowers to one
+                    // wait; any other real constant bails.
+                    if let Some(Insn::WaitDelayReg(r)) = cb.instructions.get(ins_i + 1) {
+                        if r == d {
+                            has_wait = true;
+                            let resume = ins_i as u32 + 2;
+                            out.push(TsInsn::WaitDelayRaw { raw: k.to_f64().to_bits(), resume });
+                            wait_resume_fix.push((resume, out.len() as u32));
+                            let snap: Vec<(u16, u32, bool)> = rw
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(r, w)| w.map(|w| (r as u16, w, sg[r])))
+                                .collect();
+                            wait_regs.push((resume, snap.into_boxed_slice()));
+                            for &sig in &hazards {
+                                out.push(TsInsn::SaveSig { sig });
+                            }
+                            skip_next = true;
+                            continue;
+                        }
+                    }
+                    gate!("real constant");
+                }
                 if k.width > 64 {
                     if k.width > 512 || k.is_signed {
                         return None;
@@ -15213,6 +15285,11 @@ pub fn lower_two_state(
         }
     }
     idx_map.push(out.len() as u32);
+    for &(pc, ix) in &wait_resume_fix {
+        if (pc as usize) < idx_map.len() {
+            idx_map[pc as usize] = ix;
+        }
+    }
     // Fixup: branch targets were recorded as 4-state indices.
     for insn in out.iter_mut() {
         match insn {
@@ -15391,7 +15468,11 @@ pub fn lower_two_state(
     writes.dedup();
     writes_span.sort_unstable();
     writes_span.dedup();
-    fuse_ts_pairs(&mut out);
+    if !has_wait {
+        // Fusion re-indexes the stream; a wait-bearing stream keeps its
+        // four-state index map exact instead.
+        fuse_ts_pairs(&mut out);
+    }
     Some(TwoStateBlock {
         insns: out,
         num_regs: cb.num_regs,
@@ -15406,6 +15487,9 @@ pub fn lower_two_state(
         } else {
             2
         },
+        has_wait,
+        vm_to_ts: if has_wait { idx_map.clone().into_boxed_slice() } else { Box::new([]) },
+        wait_regs: wait_regs.into_boxed_slice(),
         reads_wide: reads_wide.into_boxed_slice(),
         writes: writes.into_boxed_slice(),
         writes_span: writes_span.into_boxed_slice(),

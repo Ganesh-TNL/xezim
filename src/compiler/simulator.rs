@@ -2696,8 +2696,27 @@ struct AssertionStat {
 /// at `pc` with the frame's registers swapped in, instead of re-walking the
 /// AST continuation chain. Registered only for `always` bodies whose whole
 /// statement tree compiles fallback-free (see `try_register_proc_fsm`).
+/// Two-state form of a process FSM body (see `TwoStateBlock::has_wait`).
+struct ProcFsmTs {
+    block: super::bytecode::TwoStateBlock,
+    /// The FSM's own two-state register file, swapped into `ts_regs` for a
+    /// segment; `valid` says it holds the current values (a VM segment
+    /// makes the VM registers the truth again).
+    regs: Vec<u64>,
+    valid: bool,
+    /// Copy taken at segment start: a bail re-runs the segment on the VM
+    /// from these values.
+    snap: Vec<u64>,
+    /// Back-off after repeated bails (reset-phase x): skip two-state
+    /// attempts until `resumes` reaches `skip_until`.
+    fails: u32,
+    resumes: u32,
+    skip_until: u32,
+}
+
 struct ProcFsm {
     compiled: super::bytecode::CompiledBlock,
+    ts: Option<Box<ProcFsmTs>>,
     /// Signal ids the body can write (sorted), or None when it has array
     /// stores or AST fallbacks; lets `note_comb_ran_in_process` skip the
     /// snapshot of comb outputs this process can never clobber.
@@ -18928,6 +18947,7 @@ impl Simulator {
             pid,
             Box::new(ProcFsm {
                 writes: Self::compiled_block_write_ids(&cb).map(Arc::from),
+                ts: self.lower_proc_fsm_ts(&cb),
                 compiled: cb,
                 waits,
                 pc: 0,
@@ -21889,6 +21909,10 @@ impl Simulator {
                 TsInsn::RedAnd { d, s, mask } => {
                     regs[*d as usize] = (regs[*s as usize] == *mask) as u64;
                 }
+                TsInsn::WaitEdge { .. } | TsInsn::WaitDelayRaw { .. } => {
+                    // FSM streams run on the control executor only.
+                    bail!();
+                }
                 TsInsn::Fallback(st) => {
                     let st = st.clone();
                     self.prof_fallback_insns += 1;
@@ -22740,6 +22764,10 @@ impl Simulator {
                 TsInsn::RedAnd { d, s, mask } => {
                     r!(*d) = (r!(*s) == *mask) as u64;
                 }
+                TsInsn::WaitEdge { .. } | TsInsn::WaitDelayRaw { .. } => {
+                    // FSM streams run on the control executor only.
+                    return false;
+                }
                 TsInsn::Fallback(st) => {
                     let st = st.clone();
                     self.prof_fallback_insns += 1;
@@ -23342,6 +23370,17 @@ impl Simulator {
     }
 
     fn exec_two_state_ctrl(&mut self, insns: &[super::bytecode::TsInsn], num_regs: u32) -> bool {
+        self.exec_two_state_ctrl_from(insns, num_regs, 0)
+    }
+
+    /// Control executor entered at stream index `start` (process FSMs resume
+    /// mid-stream); a wait opcode records the suspend and returns true.
+    fn exec_two_state_ctrl_from(
+        &mut self,
+        insns: &[super::bytecode::TsInsn],
+        num_regs: u32,
+        start: usize,
+    ) -> bool {
         use super::bytecode::TsInsn;
         // Registers live in `self.ts_regs` and are used in place: no callee
         // below touches that vector, and it never reallocates during the
@@ -23371,7 +23410,7 @@ impl Simulator {
         // range-checked against the lowered stream at fixup time.
         let insns_ptr = insns.as_ptr();
         let insns_len = insns.len();
-        let mut pc = 0usize;
+        let mut pc = start;
         #[cfg(feature = "opcode-census")]
         let census_on = self.census_enabled;
         #[cfg(feature = "opcode-census")]
@@ -23783,6 +23822,16 @@ impl Simulator {
                 }
                 TsInsn::RedAnd { d, s, mask } => {
                     (*rp.add(*d as usize)) = ((*rp.add(*s as usize)) == *mask) as u64;
+                }
+                TsInsn::WaitEdge { ix, resume } => {
+                    self.fsm_suspend = Some((*resume, FsmWait::Edge(*ix)));
+                    return true;
+                }
+                TsInsn::WaitDelayRaw { raw, resume } => {
+                    let v = Value::from_f64(f64::from_bits(*raw));
+                    let t = self.fsm_delay_ticks(&v, self.fsm_precision_diff);
+                    self.fsm_suspend = Some((*resume, FsmWait::Delay(t)));
+                    return true;
                 }
                 TsInsn::Fallback(st) => {
                     let st = st.clone();
@@ -41746,6 +41795,116 @@ impl Simulator {
     /// (delay -> timing wheel, edge -> event waiter, both with the empty
     /// payload marker), then settle — the same scheduling boundary
     /// `run_fast_delay_always` maintains.
+    /// Lower an FSM body to a two-state stream with wait opcodes; None keeps
+    /// the body on the four-state VM (wide registers, dynamic delays, any
+    /// opcode the lowering declines).
+    fn lower_proc_fsm_ts(&self, cb: &super::bytecode::CompiledBlock) -> Option<Box<ProcFsmTs>> {
+        if std::env::var("XEZIM_PROC_FSM_TS").as_deref() == Ok("0") {
+            return None;
+        }
+        let block = super::bytecode::lower_two_state(
+            cb,
+            &self.signal_widths,
+            &self.signal_signed,
+            &self.signal_real,
+            &self.array_first_id,
+        )?;
+        if block.has_wide || !block.has_wait {
+            return None;
+        }
+        let n = block.num_regs as usize;
+        Some(Box::new(ProcFsmTs {
+            block,
+            regs: vec![0; n],
+            valid: false,
+            snap: vec![0; n],
+            fails: 0,
+            resumes: 0,
+            skip_until: 0,
+        }))
+    }
+
+    /// Run one wait-to-wait segment of an FSM on the two-state executor.
+    /// Returns false when the segment must run on the VM instead (bail,
+    /// x-holding registers at the resume point, or back-off); the VM
+    /// registers are then the values the segment started from.
+    fn run_proc_fsm_ts_segment(&mut self, f: &mut ProcFsm) -> bool {
+        let Some(ts) = f.ts.as_mut() else { return false };
+        ts.resumes = ts.resumes.wrapping_add(1);
+        if ts.resumes < ts.skip_until {
+            return false;
+        }
+        let vm_pc = f.pc as usize;
+        let start = if vm_pc == 0 {
+            0
+        } else {
+            match ts.block.vm_to_ts.get(vm_pc) {
+                Some(&t) => t as usize,
+                None => return false,
+            }
+        };
+        if !ts.valid {
+            // The VM ran the previous segment: import every register the
+            // stream defines at this resume point; an x or wide value keeps
+            // the segment on the VM.
+            if vm_pc != 0 {
+                let Some((_, regs)) = ts.block.wait_regs.iter().find(|(pc, _)| *pc as usize == vm_pc) else {
+                    return false;
+                };
+                for &(r, w, _) in regs.iter() {
+                    let v = &self.vm_regs[r as usize];
+                    if w > 64 || v.has_xz() || v.is_real {
+                        return false;
+                    }
+                    let m = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                    ts.regs[r as usize] = v.to_u64().unwrap_or(0) & m;
+                }
+            }
+            ts.valid = true;
+        }
+        ts.snap.copy_from_slice(&ts.regs);
+        std::mem::swap(&mut self.ts_regs, &mut ts.regs);
+        let save_base = self.ts_save_list.len();
+        self.ts_cur_eidx = u32::MAX;
+        self.fsm_suspend = None;
+        let insns: *const [super::bytecode::TsInsn] = &ts.block.insns[..];
+        let num_regs = ts.block.num_regs;
+        // SAFETY: the stream lives in `f.ts`, which nothing below touches.
+        let ok = self.exec_two_state_ctrl_from(unsafe { &*insns }, num_regs, start);
+        std::mem::swap(&mut self.ts_regs, &mut ts.regs);
+        if ok {
+            self.ts_save_list.truncate(save_base);
+            ts.fails = 0;
+            self.prof_ts_evals += 1;
+            // The runner armed the VM's start pc for this segment; nothing
+            // consumed it, and `exec_insns` takes it on its next call from
+            // ANY caller, so it must not leak into an edge block.
+            self.fsm_start_pc = 0;
+            return true;
+        }
+        // Bail: undo the segment's hazard stores, hand the segment-start
+        // values to the VM, and back off after repeated failures.
+        self.ts_restore_saved(save_base);
+        self.ts_xread_bail = false;
+        self.ts_exec_aborted = false;
+        self.fsm_suspend = None;
+        if let Some((_, regs)) = ts.block.wait_regs.iter().find(|(pc, _)| *pc as usize == vm_pc) {
+            for &(r, w, sg) in regs.iter() {
+                let m = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                let mut v = Value::from_u64(ts.snap[r as usize] & m, w);
+                v.is_signed = sg;
+                self.vm_regs[r as usize] = v;
+            }
+        }
+        ts.valid = false;
+        ts.fails += 1;
+        if ts.fails >= 4 {
+            let back = 1u32 << (ts.fails.min(14));
+            ts.skip_until = ts.resumes.wrapping_add(back);
+        }
+        false
+    }
+
     fn run_proc_fsm(&mut self, pid: usize) {
         // The FSM gate admits only system-task statement fallbacks
         // (`$display` and friends); they are the design, not a compile
@@ -41884,7 +42043,12 @@ impl Simulator {
                 );
             }
             self.cur_fsm_writes = f.writes.clone();
-            self.exec_insns(&f.compiled.instructions);
+            if !self.run_proc_fsm_ts_segment(&mut f) {
+                self.exec_insns(&f.compiled.instructions);
+                if let Some(ts) = f.ts.as_mut() {
+                    ts.valid = false;
+                }
+            }
             if self.profile_report {
                 self.prof_cur
                     .store(crate::compiler::prof_sampler::KIND_OTHER, std::sync::atomic::Ordering::Relaxed);

@@ -102,6 +102,13 @@ and the development workflow are in [README.md](README.md).
 
 **Performance** (instruction counts, output identical)
 
+* A compiled stimulus process (the default for clocked initial-block loops)
+  now runs its wait-to-wait segments on the two-state executor: waits are
+  opcodes that suspend the executor, the process keeps its own two-state
+  register file, and a segment that reads an unknown value re-runs on the
+  four-state VM from the values it started with, backing off after repeated
+  bails. The 100k-cycle self-checking testbench: 2.20G to 2.08G
+  instructions; c906 neutral. `XEZIM_PROC_FSM_TS=0` keeps the VM.
 * Two more per-tick trims for small testbenches: the check of whether a
   compiled stimulus process can clobber a combinational entry's outputs is
   cached per entry, and a compiled block's two-state stream is no longer

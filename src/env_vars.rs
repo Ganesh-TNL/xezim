@@ -182,6 +182,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_PROBE_SYSCALL", "Probe: log system-call dispatches by name"),
     ("XEZIM_PROC_COND_VERIFY", "Audit: compare compiled process-if conditions against AST evaluation"),
     ("XEZIM_PROC_FSM", "Processes: compile blocking always bodies into bytecode FSMs with wait insns (1 enables)"),
+    ("XEZIM_PROC_FSM_TS", "Processes: 0 keeps compiled process FSMs on the four-state VM instead of the two-state executor"),
     ("XEZIM_PROC_LOOP_STATS", "Log process For-loop bytecode compiles and bail reasons"),
     ("XEZIM_PROFILE_REPORT", "Profiling: print the [PROF] end-of-run report"),
     ("XEZIM_PROFILE_TIMING", "Profiling: collect per-phase nanosecond timers (adds overhead)"),
