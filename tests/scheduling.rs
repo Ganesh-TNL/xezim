@@ -217,6 +217,8 @@ mod nba_wait_for_region_yield;
 mod release_from_level_sensitive_block;
 #[path = "scheduling/sva_instances_and_sequences.rs"]
 mod sva_instances_and_sequences;
+#[path = "scheduling/sva_semantics_reference.rs"]
+mod sva_semantics_reference;
 #[path = "scheduling/always_value_change_after_edge_continuation.rs"]
 mod always_value_change_after_edge_continuation;
 #[path = "scheduling/package_and_unit_delays_scale_by_timescale.rs"]

@@ -2587,7 +2587,8 @@ struct ObservedProbe {
 /// LRM §16.5 SVA clocked property site. Registered once when an
 /// `assert property (@clk body)` statement first executes; thereafter
 /// edge-detect on `clock_signal` drives per-cycle evaluation of `body`.
-/// `pending` queues consequents deferred by `|=>` (1 cycle) or `##N`.
+/// Every clock tick starts one attempt of `node`; `attempts` holds the ones
+/// still in flight (multi-cycle sequences, deferred consequents).
 #[derive(Debug, Clone)]
 struct SvaClockedSite {
     /// Unique identifier (hash of span position) so dedup across
@@ -2599,33 +2600,24 @@ struct SvaClockedSite {
     /// Resolved signal name for the clock; we re-resolve to value
     /// each tick rather than caching an id (small site count).
     clock_signal: String,
-    /// Property body — `Binary{OrFatArrow}` (|=>) and
-    /// `Binary{OrMinusArrow}` (|->) are special-cased; otherwise
-    /// the body is just tallied as a boolean at each clock fire.
+    /// Property body as written (after named-sequence expansion); kept for
+    /// the `$past` argument walk.
     body: Expression,
+    /// The body compiled to an evaluable property tree (see `SvaNode`).
+    node: std::sync::Arc<SvaNode>,
+    /// §16.12 `disable iff (guard)`: while the guard holds, every attempt in
+    /// flight is cancelled and no new one starts. Evaluated with the current
+    /// (unsampled) values, as the LRM's asynchronous reset semantics require.
+    disable: Option<Expression>,
     /// LSB of the most recent observed clock value. Initialised to a
     /// sentinel (2) so the first tick is treated as "no edge".
     prev_clock: u8,
-    /// Deferred consequents keyed by cycles_remaining (decremented at
-    /// every clock fire; evaluate + tally when it hits 0).
-    pending: std::collections::VecDeque<(u32, Expression)>,
-    /// LRM §16.12.6 `s_eventually <expr>` watchers — expressions
-    /// that must become true at some future clock cycle. Each tick,
-    /// each entry is evaluated; if true, it's removed and tallied
-    /// as PASS. (No bound expiry; remaining entries at end-of-sim
-    /// are a separate "weak-eventually-never-held" case.)
-    s_eventually: Vec<Expression>,
-    /// LRM §16.12.6 `s_always <expr>` watchers — expressions that
-    /// must hold at every future clock cycle. Each tick, each entry
-    /// is evaluated; failure tallies a FAIL and removes the watcher
-    /// (one-shot failure), otherwise it persists. End-of-sim with a
-    /// remaining watcher counts as PASS (the weak-always pass case).
-    s_always: Vec<Expression>,
+    /// Attempts still in flight, oldest first.
+    attempts: Vec<SvaState>,
     /// LRM §16.9.3 `$past(<signal>, N)` per-signal value history.
-    /// Each entry is `signal_name → ring of past values (index 0 =
-    /// 1 cycle ago)`. Refreshed at every clock fire from the
-    /// current signal values BEFORE the body evaluation (so the body
-    /// sees the previous-cycle snapshots).
+    /// Each entry is `signal_name → ring of sampled values (index 0 =
+    /// this cycle, index N = N cycles ago)`. Refreshed at every clock fire
+    /// BEFORE any attempt advances.
     past_snapshots: HashMap<String, std::collections::VecDeque<Value>>,
     /// LRM §16.5 pass/fail action blocks (`assert property (...) <pass>
     /// else <fail>;`). Run when the property tallies a non-vacuous
@@ -2638,6 +2630,63 @@ struct SvaClockedSite {
     /// and swapped in while this site's predicate is evaluated, so the
     /// property samples pre-edge values (see `eval_sva_sampled`).
     sampled_ids: Vec<usize>,
+}
+
+/// One step of a flattened sequence (§16.9): `cond` must hold `min..=max`
+/// clock ticks after the previous step matched (`max == u32::MAX` is
+/// unbounded, `##[1:$]`). The first step's delay counts from the attempt's
+/// start tick.
+#[derive(Debug, Clone)]
+struct SvaStep {
+    min: u32,
+    max: u32,
+    cond: Expression,
+}
+
+/// A property body compiled for evaluation (§16.12).
+#[derive(Debug, Clone)]
+enum SvaNode {
+    /// A sequence used as a property: holds iff it has a match.
+    Seq(Vec<SvaStep>),
+    /// `not p`.
+    Not(Box<SvaNode>),
+    /// `ante |-> cons` (overlap) / `ante |=> cons`: every match of the
+    /// antecedent starts one evaluation of the consequent.
+    Impl { ante: Vec<SvaStep>, overlap: bool, cons: Box<SvaNode> },
+    And(Box<SvaNode>, Box<SvaNode>),
+    Or(Box<SvaNode>, Box<SvaNode>),
+    /// §16.12.6 `s_eventually e`: holds once `e` samples true.
+    Eventually(Expression),
+    /// §16.12.6 `s_always e`: fails the first tick `e` samples false.
+    Always(Expression),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SvaOutcome {
+    Pass,
+    /// An implication whose antecedent never matched: holds, but fires no
+    /// pass action (§16.12.1).
+    Vacuous,
+    Fail,
+}
+
+/// Per-attempt evaluation state mirroring `SvaNode`.
+#[derive(Debug, Clone)]
+enum SvaState {
+    /// Threads `(next step, ticks since the previous step matched)`; a
+    /// sequence is nondeterministic (`##[1:2]`), so several may be alive.
+    Seq { threads: Vec<(usize, u32)>, started: bool },
+    Not(Box<SvaState>),
+    Impl {
+        ante: Box<SvaState>,
+        ante_alive: bool,
+        matched_any: bool,
+        /// Consequent evaluations `(ticks until they start, state)`.
+        cons: Vec<(u32, SvaState)>,
+    },
+    And { a: Box<SvaState>, b: Box<SvaState>, ra: Option<SvaOutcome>, rb: Option<SvaOutcome> },
+    Or { a: Box<SvaState>, b: Box<SvaState>, ra: Option<SvaOutcome>, rb: Option<SvaOutcome> },
+    Leaf,
 }
 
 /// Covergroup handles live above this tag; class handles are plain heap indices.
@@ -58249,6 +58298,32 @@ if self.profile_report {
         // inside an SVA clocked body; falls back to current
         // value when no active site (compile-time use).
         "$past" => {
+            // Inside a concurrent assertion the site's per-cycle ring is the
+            // history (index N = N clock ticks ago, sampled values).
+            if let Some(site_idx) = self.active_sva_site {
+                let sig_name = match args.first().map(|a| &a.kind) {
+                    Some(ExprKind::Ident(h)) => self.resolve_hier_name(h).into_owned(),
+                    _ => String::new(),
+                };
+                let n_cycles = args
+                    .get(1)
+                    .filter(|a| !matches!(a.kind, ExprKind::Null))
+                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(1) as usize)
+                    .unwrap_or(1);
+                if let Some(ring) = self
+                    .sva_sites
+                    .get(site_idx)
+                    .and_then(|s| s.past_snapshots.get(sig_name.as_str()))
+                {
+                    if let Some(v) = ring.get(n_cycles) {
+                        return v.clone();
+                    }
+                    // §16.9.3: no such tick yet (before the first clock):
+                    // the expression's default value, not its current one.
+                    let w = args.first().map(|a| self.infer_width(a)).unwrap_or(1);
+                    return Value::new(w.max(1));
+                }
+            }
             // §16.9.3 explicit clocking (4th arg) or default
             // clocking in a procedural context.
             {
@@ -71955,15 +72030,16 @@ if self.profile_report {
                             self.collect_sva_signal_ids(&body_expanded, &mut sampled_ids);
                             sampled_ids.sort_unstable();
                             sampled_ids.dedup();
+                            let (disable, node) = self.sva_compile_site(&body_expanded);
                             self.sva_sites.push(SvaClockedSite {
                                 span_key,
                                 kind,
                                 clock_signal,
                                 body: body_expanded,
+                                node: std::sync::Arc::new(node),
+                                disable,
                                 prev_clock: 2, // sentinel
-                                pending: std::collections::VecDeque::new(),
-                                s_eventually: Vec::new(),
-                                s_always: Vec::new(),
+                                attempts: Vec::new(),
                                 past_snapshots: HashMap::default(),
                                 pass_action: a.action.as_deref().cloned(),
                                 fail_action: a.else_action.as_deref().cloned(),
@@ -75926,105 +76002,365 @@ if self.profile_report {
         }
     }
 
-    /// A sequence expression as cycle steps `(delay, boolean)`: `a ##1 b ##2 c`
-    /// (parsed `SeqAnd(SeqAnd(a, ##1 b), ##2 c)`) becomes
-    /// `[(0,a),(1,b),(2,c)]`; a plain boolean is one delay-0 step.
-    fn sva_flatten_steps(e: &Expression, out: &mut Vec<(u32, Expression)>) {
-        match &e.kind {
-            ExprKind::Binary { op, left, right } if matches!(op, crate::ast::expr::BinaryOp::SeqAnd) => {
-                Self::sva_flatten_steps(left, out);
-                Self::sva_flatten_steps(right, out);
-            }
-            ExprKind::Binary { op, left, right } if matches!(op, crate::ast::expr::BinaryOp::HashHash) => {
-                let n: u32 = match &left.kind {
-                    ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { value, .. }) => {
-                        value.replace('_', "").parse().unwrap_or(1)
-                    }
-                    _ => 1,
+    /// §16.9.2 delay bounds of a `##` count: `N`, `[m:n]`, `[m:$]`.
+    fn sva_delay_bounds(&mut self, d: &Expression) -> (u32, u32) {
+        match &d.kind {
+            ExprKind::Range(lo, hi) => {
+                let l = self.eval_expr(lo).to_u64().unwrap_or(0).min(u32::MAX as u64) as u32;
+                let h = if matches!(hi.kind, ExprKind::Dollar) {
+                    u32::MAX
+                } else {
+                    self.eval_expr(hi).to_u64().unwrap_or(l as u64).min(u32::MAX as u64) as u32
                 };
+                (l, h.max(l))
+            }
+            ExprKind::Dollar => (0, u32::MAX),
+            ExprKind::Paren(inner) => self.sva_delay_bounds(inner),
+            _ => {
+                let n = self.eval_expr(d).to_u64().unwrap_or(1).min(u32::MAX as u64) as u32;
+                (n, n)
+            }
+        }
+    }
+
+    /// A sequence expression as cycle steps: `a ##1 b ##[2:3] c` (parsed
+    /// `SeqAnd(SeqAnd(a, ##1 b), ##[2:3] c)`) becomes
+    /// `[(0..0,a),(1..1,b),(2..3,c)]`; a plain boolean is one delay-0 step.
+    fn sva_flatten_steps(&mut self, e: &Expression, out: &mut Vec<SvaStep>) {
+        match &e.kind {
+            ExprKind::Binary { op, left, right }
+                if matches!(op, crate::ast::expr::BinaryOp::SeqAnd) =>
+            {
+                self.sva_flatten_steps(left, out);
+                self.sva_flatten_steps(right, out);
+            }
+            ExprKind::Binary { op, left, right }
+                if matches!(op, crate::ast::expr::BinaryOp::HashHash) =>
+            {
+                let (mn, mx) = self.sva_delay_bounds(left);
                 let start = out.len();
-                Self::sva_flatten_steps(right, out);
+                self.sva_flatten_steps(right, out);
                 if let Some(first) = out.get_mut(start) {
-                    first.0 += n;
+                    first.min = first.min.saturating_add(mn);
+                    first.max = if first.max == u32::MAX || mx == u32::MAX {
+                        u32::MAX
+                    } else {
+                        first.max.saturating_add(mx)
+                    };
                 }
             }
-            ExprKind::Paren(inner) => Self::sva_flatten_steps(inner, out),
-            _ => out.push((0, e.clone())),
-        }
-    }
-
-    /// Rebuild `steps` (first delay already stripped) as one expression the
-    /// pending queue can carry, shaped so `sva_flatten_steps` recovers
-    /// exactly these steps when it comes due.
-    fn sva_rebuild_steps(steps: &[(u32, Expression)]) -> Expression {
-        let mk_num = |d: u32, span: crate::ast::Span| {
-            Expression::new(
-                ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
-                    size: None,
-                    signed: false,
-                    base: crate::ast::expr::NumberBase::Decimal,
-                    value: d.to_string(),
-                    cached_val: std::cell::Cell::new(None),
-                }),
-                span,
-            )
-        };
-        let mut acc: Option<Expression> = None;
-        for (i, (d, t)) in steps.iter().enumerate() {
-            let span = t.span;
-            let term = if i == 0 || *d == 0 {
-                t.clone()
-            } else {
-                Expression::new(
-                    ExprKind::Binary {
-                        op: crate::ast::expr::BinaryOp::HashHash,
-                        left: Box::new(mk_num(*d, span)),
-                        right: Box::new(t.clone()),
-                    },
-                    span,
-                )
-            };
-            acc = Some(match acc {
-                None => term,
-                Some(prev) => Expression::new(
-                    ExprKind::Binary {
-                        op: crate::ast::expr::BinaryOp::SeqAnd,
-                        left: Box::new(prev),
-                        right: Box::new(term),
-                    },
-                    span,
-                ),
-            });
-        }
-        acc.unwrap_or_else(|| mk_num(1, crate::ast::Span::dummy()))
-    }
-
-    /// Run a sequence from its first step at the CURRENT clock tick: every
-    /// leading delay-0 step is sampled now; the first failure ends the
-    /// attempt (`Some(false)`); an exhausted list is a match (`Some(true)`);
-    /// a remaining delayed step is queued for that many ticks (`None`).
-    fn sva_run_steps(
-        &mut self,
-        site_idx: usize,
-        sampled_ids: &[usize],
-        mut steps: Vec<(u32, Expression)>,
-    ) -> Option<bool> {
-        let mut idx = 0;
-        while idx < steps.len() && steps[idx].0 == 0 {
-            if !self.eval_sva_sampled(sampled_ids, &steps[idx].1) {
-                return Some(false);
+            // A trailing bare `##N`: a delay with nothing to check.
+            ExprKind::Unary { op, operand }
+                if matches!(op, crate::ast::expr::UnaryOp::HashHash) =>
+            {
+                let (mn, mx) = self.sva_delay_bounds(operand);
+                let one = Expression::new(
+                    ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                        size: None,
+                        signed: false,
+                        base: crate::ast::expr::NumberBase::Decimal,
+                        value: "1".to_string(),
+                        cached_val: std::cell::Cell::new(None),
+                    }),
+                    e.span,
+                );
+                out.push(SvaStep { min: mn, max: mx, cond: one });
             }
-            idx += 1;
+            ExprKind::Paren(inner) => self.sva_flatten_steps(inner, out),
+            _ => out.push(SvaStep { min: 0, max: 0, cond: e.clone() }),
         }
-        if idx >= steps.len() {
-            return Some(true);
+    }
+
+    /// Does the expression use a sequence/property operator (so a `not` in
+    /// front of it is property negation rather than a boolean `!`)?
+    fn sva_is_temporal(e: &Expression) -> bool {
+        use crate::ast::expr::{BinaryOp, UnaryOp};
+        match &e.kind {
+            ExprKind::Paren(inner) => Self::sva_is_temporal(inner),
+            ExprKind::Binary { op, left, right } => {
+                matches!(
+                    op,
+                    BinaryOp::HashHash
+                        | BinaryOp::SeqAnd
+                        | BinaryOp::SvaAnd
+                        | BinaryOp::SeqOr
+                        | BinaryOp::OrMinusArrow
+                        | BinaryOp::OrFatArrow
+                ) || Self::sva_is_temporal(left)
+                    || Self::sva_is_temporal(right)
+            }
+            ExprKind::Unary { op, operand } => {
+                matches!(op, UnaryOp::HashHash | UnaryOp::SEventually | UnaryOp::SAlways)
+                    || Self::sva_is_temporal(operand)
+            }
+            _ => false,
         }
-        let mut rest: Vec<(u32, Expression)> = steps.drain(idx..).collect();
-        let delay = rest[0].0;
-        rest[0].0 = 0;
-        let expr = Self::sva_rebuild_steps(&rest);
-        self.sva_sites[site_idx].pending.push_back((delay, expr));
-        None
+    }
+
+    /// Compile a property body (§16.12) into an `SvaNode`.
+    fn sva_compile_node(&mut self, e: &Expression) -> SvaNode {
+        use crate::ast::expr::{BinaryOp, UnaryOp};
+        match &e.kind {
+            ExprKind::Paren(inner) => self.sva_compile_node(inner),
+            ExprKind::Binary { op, left, right }
+                if matches!(op, BinaryOp::OrMinusArrow | BinaryOp::OrFatArrow) =>
+            {
+                let mut ante = Vec::new();
+                self.sva_flatten_steps(left, &mut ante);
+                SvaNode::Impl {
+                    ante,
+                    overlap: matches!(op, BinaryOp::OrMinusArrow),
+                    cons: Box::new(self.sva_compile_node(right)),
+                }
+            }
+            ExprKind::Binary { op, left, right } if matches!(op, BinaryOp::SvaAnd) => {
+                SvaNode::And(
+                    Box::new(self.sva_compile_node(left)),
+                    Box::new(self.sva_compile_node(right)),
+                )
+            }
+            ExprKind::Binary { op, left, right } if matches!(op, BinaryOp::SeqOr) => {
+                SvaNode::Or(
+                    Box::new(self.sva_compile_node(left)),
+                    Box::new(self.sva_compile_node(right)),
+                )
+            }
+            ExprKind::Unary { op, operand }
+                if matches!(op, UnaryOp::LogNot) && Self::sva_is_temporal(operand) =>
+            {
+                SvaNode::Not(Box::new(self.sva_compile_node(operand)))
+            }
+            ExprKind::Unary { op, operand } if matches!(op, UnaryOp::SEventually) => {
+                SvaNode::Eventually((**operand).clone())
+            }
+            ExprKind::Unary { op, operand } if matches!(op, UnaryOp::SAlways) => {
+                SvaNode::Always((**operand).clone())
+            }
+            _ => {
+                let mut steps = Vec::new();
+                self.sva_flatten_steps(e, &mut steps);
+                SvaNode::Seq(steps)
+            }
+        }
+    }
+
+    /// Split a site body into its `disable iff` guard and compiled property.
+    fn sva_compile_site(&mut self, body: &Expression) -> (Option<Expression>, SvaNode) {
+        let mut inner = body;
+        while let ExprKind::Paren(p) = &inner.kind {
+            inner = p;
+        }
+        if let ExprKind::Binary { op, left, right } = &inner.kind {
+            if matches!(op, crate::ast::expr::BinaryOp::SvaDisableIff) {
+                let node = self.sva_compile_node(right);
+                return (Some((**left).clone()), node);
+            }
+        }
+        (None, self.sva_compile_node(inner))
+    }
+
+    fn sva_new_state(node: &SvaNode) -> SvaState {
+        match node {
+            SvaNode::Seq(_) => SvaState::Seq { threads: Vec::new(), started: false },
+            SvaNode::Not(inner) => SvaState::Not(Box::new(Self::sva_new_state(inner))),
+            SvaNode::Impl { .. } => SvaState::Impl {
+                ante: Box::new(SvaState::Seq { threads: Vec::new(), started: false }),
+                ante_alive: true,
+                matched_any: false,
+                cons: Vec::new(),
+            },
+            SvaNode::And(a, b) => SvaState::And {
+                a: Box::new(Self::sva_new_state(a)),
+                b: Box::new(Self::sva_new_state(b)),
+                ra: None,
+                rb: None,
+            },
+            SvaNode::Or(a, b) => SvaState::Or {
+                a: Box::new(Self::sva_new_state(a)),
+                b: Box::new(Self::sva_new_state(b)),
+                ra: None,
+                rb: None,
+            },
+            SvaNode::Eventually(_) | SvaNode::Always(_) => SvaState::Leaf,
+        }
+    }
+
+    /// Advance a sequence by one clock tick (the first call is the start
+    /// tick). Returns `(matched at this tick, threads still alive)`. With
+    /// `first_match` the sequence stops at its first match.
+    fn sva_advance_seq(
+        &mut self,
+        steps: &[SvaStep],
+        st: &mut SvaState,
+        first_match: bool,
+    ) -> (bool, bool) {
+        let SvaState::Seq { threads, started } = st else {
+            return (false, false);
+        };
+        if !*started {
+            *started = true;
+            threads.push((0, 0));
+        } else {
+            for t in threads.iter_mut() {
+                t.1 = t.1.saturating_add(1);
+            }
+        }
+        let mut work: Vec<(usize, u32)> = std::mem::take(threads);
+        let mut keep: Vec<(usize, u32)> = Vec::new();
+        let mut matched = false;
+        while let Some((k, w)) = work.pop() {
+            if k >= steps.len() {
+                matched = true;
+                if first_match {
+                    keep.clear();
+                    break;
+                }
+                continue;
+            }
+            let step = &steps[k];
+            if w < step.min {
+                keep.push((k, w));
+                continue;
+            }
+            if w > step.max {
+                continue;
+            }
+            if self.eval_expr(&step.cond).is_true() {
+                work.push((k + 1, 0));
+            }
+            if w < step.max {
+                keep.push((k, w));
+            }
+        }
+        *threads = keep;
+        (matched, !threads.is_empty())
+    }
+
+    /// Advance one attempt by one clock tick; `Some` when it is decided.
+    fn sva_advance(&mut self, node: &SvaNode, st: &mut SvaState) -> Option<SvaOutcome> {
+        match (node, st) {
+            (SvaNode::Seq(steps), st @ SvaState::Seq { .. }) => {
+                let (m, alive) = self.sva_advance_seq(steps, st, true);
+                if m {
+                    Some(SvaOutcome::Pass)
+                } else if !alive {
+                    Some(SvaOutcome::Fail)
+                } else {
+                    None
+                }
+            }
+            (SvaNode::Not(inner), SvaState::Not(ist)) => match self.sva_advance(inner, ist) {
+                Some(SvaOutcome::Fail) => Some(SvaOutcome::Pass),
+                Some(_) => Some(SvaOutcome::Fail),
+                None => None,
+            },
+            (
+                SvaNode::Impl { ante, overlap, cons: cons_node },
+                SvaState::Impl { ante: ast, ante_alive, matched_any, cons },
+            ) => {
+                let mut fresh: Option<SvaState> = None;
+                if *ante_alive {
+                    let (m, alive) = self.sva_advance_seq(ante, ast, false);
+                    *ante_alive = alive;
+                    if m {
+                        *matched_any = true;
+                        fresh = Some(Self::sva_new_state(cons_node));
+                    }
+                }
+                let mut failed = false;
+                let mut keep: Vec<(u32, SvaState)> = Vec::new();
+                for (mut delay, mut cst) in cons.drain(..) {
+                    if delay > 0 {
+                        delay -= 1;
+                    }
+                    if delay > 0 {
+                        keep.push((delay, cst));
+                        continue;
+                    }
+                    match self.sva_advance(cons_node, &mut cst) {
+                        Some(SvaOutcome::Fail) => failed = true,
+                        Some(_) => {}
+                        None => keep.push((0, cst)),
+                    }
+                }
+                if let Some(mut cst) = fresh {
+                    if *overlap {
+                        match self.sva_advance(cons_node, &mut cst) {
+                            Some(SvaOutcome::Fail) => failed = true,
+                            Some(_) => {}
+                            None => keep.push((0, cst)),
+                        }
+                    } else {
+                        keep.push((1, cst));
+                    }
+                }
+                *cons = keep;
+                if failed {
+                    cons.clear();
+                    *ante_alive = false;
+                    return Some(SvaOutcome::Fail);
+                }
+                if !*ante_alive && cons.is_empty() {
+                    Some(if *matched_any { SvaOutcome::Pass } else { SvaOutcome::Vacuous })
+                } else {
+                    None
+                }
+            }
+            (SvaNode::And(na, nb), SvaState::And { a, b, ra, rb }) => {
+                if ra.is_none() {
+                    *ra = self.sva_advance(na, a);
+                }
+                if rb.is_none() {
+                    *rb = self.sva_advance(nb, b);
+                }
+                if *ra == Some(SvaOutcome::Fail) || *rb == Some(SvaOutcome::Fail) {
+                    return Some(SvaOutcome::Fail);
+                }
+                match (*ra, *rb) {
+                    (Some(x), Some(y)) => Some(
+                        if x == SvaOutcome::Vacuous && y == SvaOutcome::Vacuous {
+                            SvaOutcome::Vacuous
+                        } else {
+                            SvaOutcome::Pass
+                        },
+                    ),
+                    _ => None,
+                }
+            }
+            (SvaNode::Or(na, nb), SvaState::Or { a, b, ra, rb }) => {
+                if ra.is_none() {
+                    *ra = self.sva_advance(na, a);
+                }
+                if rb.is_none() {
+                    *rb = self.sva_advance(nb, b);
+                }
+                if *ra == Some(SvaOutcome::Pass) || *rb == Some(SvaOutcome::Pass) {
+                    return Some(SvaOutcome::Pass);
+                }
+                if *ra == Some(SvaOutcome::Vacuous) || *rb == Some(SvaOutcome::Vacuous) {
+                    return Some(SvaOutcome::Vacuous);
+                }
+                match (*ra, *rb) {
+                    (Some(_), Some(_)) => Some(SvaOutcome::Fail),
+                    _ => None,
+                }
+            }
+            (SvaNode::Eventually(e), SvaState::Leaf) => {
+                if self.eval_expr(e).is_true() {
+                    Some(SvaOutcome::Pass)
+                } else {
+                    None
+                }
+            }
+            (SvaNode::Always(e), SvaState::Leaf) => {
+                if self.eval_expr(e).is_true() {
+                    None
+                } else {
+                    Some(SvaOutcome::Fail)
+                }
+            }
+            _ => Some(SvaOutcome::Vacuous),
+        }
     }
 
     /// Tally one finished attempt on a site: cover sites count matches only.
@@ -76257,107 +76593,95 @@ if self.profile_report {
             if !(prev == 0 && cur_clk_bit == 1) {
                 continue;
             }
+            let span_key = self.sva_sites[i].span_key;
+            let site_kind = self.sva_sites[i].kind;
+            let node = self.sva_sites[i].node.clone();
+            let disable = self.sva_sites[i].disable.clone();
+            let body = self.sva_sites[i].body.clone();
             // LRM §16.5.1: the referenced-signal ids whose Preponed samples
             // this fire's predicates must read (see eval_sva_sampled).
             let sampled_ids = self.sva_sites[i].sampled_ids.clone();
-            // 1) Drain pending consequents whose counter is 1 (they're
-            //    due this cycle), decrement the rest.
-            let mut due: Vec<Expression> = Vec::new();
-            {
-                let pend = &mut self.sva_sites[i].pending;
-                let mut keep: std::collections::VecDeque<(u32, Expression)> =
-                    std::collections::VecDeque::new();
-                while let Some((cycles, e)) = pend.pop_front() {
-                    if cycles <= 1 {
-                        due.push(e);
-                    } else {
-                        keep.push_back((cycles - 1, e));
-                    }
-                }
-                *pend = keep;
-            }
-            // 1b) LRM §16.12.6 `s_eventually` watchers — each tick,
-            // evaluate every watcher; if true, tally PASS and remove.
-            // Otherwise the watcher persists. At end-of-sim, any
-            // remaining watcher counts as FAIL (handled later).
-            let span_key_for_evt = self.sva_sites[i].span_key;
-            // §16.5: tally under the kind the source wrote (assert/assume/cover).
-            let site_kind = self.sva_sites[i].kind;
-            let watchers: Vec<Expression> = std::mem::take(&mut self.sva_sites[i].s_eventually);
-            for w in watchers {
-                let outcome = self.eval_sva_sampled(&sampled_ids, &w);
-                if outcome {
-                    let stat = self
-                        .assertion_stats
-                        .entry(span_key_for_evt)
-                        .or_insert_with(|| AssertionStat {
-                            kind: site_kind,
-                            pass_count: 0,
-                            fail_count: 0,
-                        });
-                    stat.pass_count += 1;
-                    self.fire_sva_action(i, true);
-                } else {
-                    self.sva_sites[i].s_eventually.push(w);
-                }
-            }
-            // 1c) LRM §16.12.6 `s_always` watchers — each tick,
-            // evaluate; first failure tallies FAIL + removes; success
-            // persists. (Bound-less case; ranged `s_always [m:n]` is
-            // a follow-up.)
-            let always_watchers: Vec<Expression> = std::mem::take(&mut self.sva_sites[i].s_always);
-            for w in always_watchers {
-                let outcome = self.eval_sva_sampled(&sampled_ids, &w);
-                if outcome {
-                    self.sva_sites[i].s_always.push(w);
-                } else {
-                    let stat = self
-                        .assertion_stats
-                        .entry(span_key_for_evt)
-                        .or_insert_with(|| AssertionStat {
-                            kind: site_kind,
-                            pass_count: 0,
-                            fail_count: 0,
-                        });
-                    if site_kind != 2 {
-                        // §16.12: a cover has hits, not verdicts.
-                        stat.fail_count += 1;
-                    }
-                    self.fire_sva_action(i, false);
-                }
-            }
-            let span_key = self.sva_sites[i].span_key;
-            for e in due {
-                let mut steps = Vec::new();
-                Self::sva_flatten_steps(&e, &mut steps);
-                if let Some(v) = self.sva_run_steps(i, &sampled_ids, steps) {
-                    self.sva_tally(i, span_key, v);
-                }
-            }
-            // 2) Process the property body for this clock fire.
-            let body = self.sva_sites[i].body.clone();
-            // LRM §16.9.3: refresh the past-value snapshots BEFORE the
-            // body evaluates, so the body's `$past(<sig>)` reads the
-            // value as of the previous clock cycle. We walk the body
-            // once to collect the `$past`-referenced signal names.
-            self.refresh_sva_past_snapshots(i, &body);
             let prev_active = self.active_sva_site.replace(i);
-            self.tick_sva_body(span_key, i, &body, &sampled_ids);
+            // LRM §16.9.3: refresh the past-value snapshots BEFORE anything
+            // evaluates, so `$past(<sig>)` in a consequent that comes due
+            // this tick reads the previous cycle's sample too.
+            self.refresh_sva_past_snapshots(i, &body, &sampled_ids);
+            // §16.12 `disable iff`: an asserted guard cancels every attempt
+            // in flight, including the one that would start now.
+            if let Some(g) = &disable {
+                if self.eval_expr(g).is_true() {
+                    self.sva_sites[i].attempts.clear();
+                    self.active_sva_site = prev_active;
+                    continue;
+                }
+            }
+            let saved = self.install_preponed(&sampled_ids);
+            let mut attempts = std::mem::take(&mut self.sva_sites[i].attempts);
+            attempts.push(Self::sva_new_state(&node));
+            let mut results: Vec<SvaOutcome> = Vec::new();
+            let mut live: Vec<SvaState> = Vec::with_capacity(attempts.len());
+            for mut st in attempts.drain(..) {
+                match self.sva_advance(&node, &mut st) {
+                    Some(r) => results.push(r),
+                    None => live.push(st),
+                }
+            }
+            // An attempt that can never finish (`s_eventually` of a signal
+            // that never rises, `##[1:$]`) must not grow without bound.
+            const SVA_MAX_ATTEMPTS: usize = 1024;
+            if live.len() > SVA_MAX_ATTEMPTS {
+                live.drain(..live.len() - SVA_MAX_ATTEMPTS);
+            }
+            self.sva_sites[i].attempts = live;
+            self.restore_preponed(saved);
+            for r in results {
+                match r {
+                    SvaOutcome::Pass => self.sva_tally(i, span_key, true),
+                    SvaOutcome::Fail => self.sva_tally(i, span_key, false),
+                    SvaOutcome::Vacuous => {
+                        let stat = self
+                            .assertion_stats
+                            .entry(span_key)
+                            .or_insert_with(|| AssertionStat {
+                                kind: site_kind,
+                                pass_count: 0,
+                                fail_count: 0,
+                            });
+                        stat.kind = site_kind;
+                        // §16.12.1: holds, but no pass action.
+                        if site_kind != 2 {
+                            stat.pass_count += 1;
+                        }
+                    }
+                }
+            }
             self.active_sva_site = prev_active;
         }
     }
 
     /// Collect bare-signal `$past` argument names into the site's
-    /// snapshot ring, pushing the current value and trimming to a max
-    /// depth. Each unique signal gets its own ring; index 0 = most
-    /// recent (1 cycle ago).
-    fn refresh_sva_past_snapshots(&mut self, site_idx: usize, body: &Expression) {
+    /// snapshot ring, pushing this cycle's sampled value and trimming to a
+    /// max depth. Each unique signal gets its own ring; index 0 = this
+    /// cycle, index N = N cycles ago.
+    fn refresh_sva_past_snapshots(
+        &mut self,
+        site_idx: usize,
+        body: &Expression,
+        sampled_ids: &[usize],
+    ) {
         const PAST_MAX_DEPTH: usize = 16;
         let mut names: Vec<String> = Vec::new();
         self.collect_past_arg_names(body, &mut names);
         for name in names {
-            let v = self
-                .get_signal_value_by_name(&name)
+            // The sampled (Preponed) value when the site tracks the signal.
+            let pre = self
+                .signal_name_to_id
+                .get(name.as_str())
+                .copied()
+                .filter(|id| sampled_ids.contains(id))
+                .and_then(|id| self.sva_preponed.get(&id).cloned());
+            let v = pre
+                .or_else(|| self.get_signal_value_by_name(&name))
                 .unwrap_or_else(|| Value::zero(32));
             let ring = self.sva_sites[site_idx]
                 .past_snapshots
@@ -76423,122 +76747,6 @@ if self.profile_report {
                 self.collect_past_arg_names(body, out);
             }
             _ => {}
-        }
-    }
-
-    /// LRM §16.5: process one clock fire of an SVA property body.
-    /// `sampled_ids` are the body's referenced signal ids whose Preponed
-    /// (slot-entry) values the antecedent/consequent predicates must sample
-    /// (see `eval_sva_sampled`).
-    fn tick_sva_body(
-        &mut self,
-        span_key: usize,
-        site_idx: usize,
-        body: &Expression,
-        sampled_ids: &[usize],
-    ) {
-        // §16.5: tally under the kind the source wrote; a cover has hits,
-        // not verdicts, so it is never filed as an assert here either.
-        let site_kind = self.sva_sites[site_idx].kind;
-        // LRM §16.6 `disable iff (g)` wrapper. The parser encodes the
-        // clause as `Binary{LogAnd, !g, inner_body}`. When `g` is true
-        // (so `!g` is false), the property is suppressed for this
-        // cycle and any deferred consequents from prior cycles are
-        // dropped — LRM-correct disable-iff semantics.
-        if let ExprKind::Binary { op, left, right } = &body.kind {
-            if matches!(op, crate::ast::expr::BinaryOp::LogAnd) {
-                if let ExprKind::Unary { op: uop, operand } = &left.kind {
-                    if matches!(uop, crate::ast::expr::UnaryOp::LogNot) {
-                        let g_true = self.eval_expr(operand).is_true();
-                        if g_true {
-                            // Suppress this cycle: drop any pending
-                            // consequents and skip tally.
-                            self.sva_sites[site_idx].pending.clear();
-                            return;
-                        }
-                        // Guard false: process the inner body as
-                        // normal.
-                        return self.tick_sva_body(span_key, site_idx, right, sampled_ids);
-                    }
-                }
-            }
-        }
-        match &body.kind {
-            // `lhs |=> rhs` — non-overlapping implication. If `lhs` is
-            // true now, register `rhs` to evaluate at the next clock.
-            // Special case: `lhs |=> s_eventually inner` — when lhs
-            // fires, push `inner` to the s_eventually watcher list
-            // instead of a 1-cycle defer; the tick loop checks it
-            // every cycle until true (LRM §16.12.6).
-            ExprKind::Binary { op, left, right }
-                if matches!(op, crate::ast::expr::BinaryOp::OrFatArrow) =>
-            {
-                let lhs_true = self.eval_sva_sampled(sampled_ids, left);
-                if lhs_true {
-                    if let ExprKind::Unary { op: uop, operand } = &right.kind {
-                        if matches!(uop, crate::ast::expr::UnaryOp::SEventually) {
-                            self.sva_sites[site_idx]
-                                .s_eventually
-                                .push((**operand).clone());
-                            return;
-                        }
-                        if matches!(uop, crate::ast::expr::UnaryOp::SAlways) {
-                            self.sva_sites[site_idx].s_always.push((**operand).clone());
-                            return;
-                        }
-                    }
-                    // `lhs |=> ##N inner` — defer the inner check by
-                    // 1+N cycles (the |=> 1-cycle defer plus the
-                    // ##N delay).
-                    // `|=>`: the consequent sequence starts NEXT tick.
-                    let mut steps = Vec::new();
-                    Self::sva_flatten_steps(right, &mut steps);
-                    if let Some(first) = steps.first_mut() {
-                        first.0 += 1;
-                    }
-                    if let Some(v) = self.sva_run_steps(site_idx, sampled_ids, steps) {
-                        self.sva_tally(site_idx, span_key, v);
-                    }
-                }
-            }
-            // `lhs |-> rhs` — overlapping implication. If `lhs` true,
-            // require `rhs` true at the same clock; tally now.
-            // Special case: when `rhs` is `Binary{HashHash, N, body}`,
-            // i.e. `lhs |-> ##N body`, defer the body check by N cycles
-            // instead of tallying now.
-            ExprKind::Binary { op, left, right }
-                if matches!(op, crate::ast::expr::BinaryOp::OrMinusArrow) =>
-            {
-                let lhs = self.eval_sva_sampled(sampled_ids, left);
-                if !lhs {
-                    let stat =
-                        self.assertion_stats
-                        .entry(span_key)
-                        .or_insert_with(|| AssertionStat {
-                            kind: site_kind,
-                            pass_count: 0,
-                            fail_count: 0,
-                        });
-                    stat.pass_count += 1; // vacuous
-                    return;
-                }
-                // `lhs |-> seq` (overlap): the consequent sequence starts
-                // THIS tick — leading delay-0 terms sample now, the rest is
-                // queued as cycle steps.
-                let mut steps = Vec::new();
-                Self::sva_flatten_steps(right, &mut steps);
-                if let Some(v) = self.sva_run_steps(site_idx, sampled_ids, steps) {
-                    self.sva_tally(site_idx, span_key, v);
-                }
-            }
-            // Plain boolean / sequence body: evaluate each clock.
-            _ => {
-                let mut steps = Vec::new();
-                Self::sva_flatten_steps(body, &mut steps);
-                if let Some(v) = self.sva_run_steps(site_idx, sampled_ids, steps) {
-                    self.sva_tally(site_idx, span_key, v);
-                }
-            }
         }
     }
 

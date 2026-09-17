@@ -9,6 +9,14 @@ and the development workflow are in [README.md](README.md).
 
 **Correctness**
 
+* Concurrent assertions evaluate as attempts with real sequence matching
+  (issues #176–#183): a multi-cycle antecedent (`a ##1 b |-> c`) triggers on
+  its last cycle; a ranged consequent (`##[1:2] b`) fails only when the whole
+  window has passed; `not (a ##1 b)` fails only on a match; `$past` inside a
+  deferred consequent reads the previous clock cycle and returns the type's
+  default before enough history exists; `disable iff` cancels attempts in
+  flight; property `and`/`or` parse and evaluate; and `(##2 (b))` means the
+  same as `##2 b`.
 * Package-qualified variables inside tasks and functions: a write such as
   `store_pkg::scalar = d;`, `pkg::arr[i] = v;` or `pkg::v[3:0] = x;` in a
   subroutine body was silently dropped, and a read of `pkg::arr[i]` or
