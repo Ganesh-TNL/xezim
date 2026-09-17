@@ -29,6 +29,38 @@ fn msgs(src: &str) -> Vec<String> {
 }
 
 #[test]
+fn wide_repetition_preserves_fill_and_general_patterns() {
+    let out = msgs(
+        r#"
+module top;
+  logic flag;
+  logic [3:0] nibble;
+  logic [31:0] strip;
+  logic [63:0] ribbon;
+  logic [127:0] spread;
+  logic [127:0] tiled;
+  always_comb strip = {32{flag}};
+  always_comb ribbon = {16{nibble}};
+  always_comb spread = {128{flag}};
+  always_comb tiled = {32{nibble}};
+  initial begin
+    flag = 1'b0; nibble = 4'h3; #1;
+    $display("A_%08h_%016h_%032h_%032h", strip, ribbon, spread, tiled);
+    flag = 1'b1; nibble = 4'hc; #1;
+    $display("B_%08h_%016h_%032h_%032h", strip, ribbon, spread, tiled);
+  end
+endmodule
+"#,
+    );
+    assert!(out.contains(
+        &"A_00000000_3333333333333333_00000000000000000000000000000000_33333333333333333333333333333333".to_string()
+    ), "{out:?}");
+    assert!(out.contains(
+        &"B_ffffffff_cccccccccccccccc_ffffffffffffffffffffffffffffffff_cccccccccccccccccccccccccccccccc".to_string()
+    ), "{out:?}");
+}
+
+#[test]
 fn case_jump_table_values() {
     let out = msgs(
         r#"

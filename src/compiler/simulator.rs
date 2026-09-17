@@ -3573,6 +3573,23 @@ fn wmask_top<const N: usize>(x: &mut [u64; N], w: u16) {
     }
 }
 
+#[inline(always)]
+fn replicate_narrow(part: u64, width: u8, count: u8) -> u64 {
+    if width == 1 {
+        let fill = 0u64.wrapping_sub(part & 1);
+        return if count >= 64 {
+            fill
+        } else {
+            fill & ((1u64 << count) - 1)
+        };
+    }
+    let mut acc = 0u64;
+    for _ in 0..count {
+        acc = (acc << width) | part;
+    }
+    acc
+}
+
 /// `x << sh` across N words (bits shifted past the top word are dropped).
 #[inline(always)]
 fn wshl<const N: usize>(x: [u64; N], sh: u32) -> [u64; N] {
@@ -22169,11 +22186,7 @@ impl Simulator {
                         xbail!();
                     }
                     regs[*dl as usize] = v;
-                    let mut acc = 0u64;
-                    for _ in 0..*count {
-                        acc = (acc << *w) | v;
-                    }
-                    regs[*d as usize] = acc;
+                    regs[*d as usize] = replicate_narrow(v, *w, *count);
                 }
                 TsInsn::LoadSigSigRange { dl, sig, d, sig2, lo, mask } => {
                     let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
@@ -22389,11 +22402,7 @@ impl Simulator {
                 }
                 TsInsn::Repl { d, s, w, count } => {
                     let part = regs[*s as usize];
-                    let mut acc = 0u64;
-                    for _ in 0..*count {
-                        acc = (acc << *w) | part;
-                    }
-                    regs[*d as usize] = acc;
+                    regs[*d as usize] = replicate_narrow(part, *w, *count);
                 }
                 TsInsn::WSigRange { d, sig, lo, w } => {
                     // Any X/Z bit in the slice bails to the 4-state path
@@ -22420,10 +22429,16 @@ impl Simulator {
                 }
                 TsInsn::WRepl { d, s, w, count } => {
                     let part = regs[*s as usize];
-                    let mut acc = [0u64; N];
-                    for _ in 0..*count {
-                        acc = wshl(acc, *w as u32);
-                        acc[0] |= part;
+                    let mut acc;
+                    if *w == 1 {
+                        acc = [0u64.wrapping_sub(part & 1); N];
+                        wmask_top(&mut acc, *count);
+                    } else {
+                        acc = [0u64; N];
+                        for _ in 0..*count {
+                            acc = wshl(acc, *w as u32);
+                            acc[0] |= part;
+                        }
                     }
                     wregs[*d as usize] = acc;
                 }
@@ -23060,11 +23075,7 @@ impl Simulator {
                         xbail!();
                     }
                     r!(*dl) = v;
-                    let mut acc = 0u64;
-                    for _ in 0..*count {
-                        acc = (acc << *w) | v;
-                    }
-                    r!(*d) = acc;
+                    r!(*d) = replicate_narrow(v, *w, *count);
                 }
                 TsInsn::LoadSigSigRange { dl, sig, d, sig2, lo, mask } => {
                     let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
@@ -23234,11 +23245,7 @@ impl Simulator {
                 }
                 TsInsn::Repl { d, s, w, count } => {
                     let part = r!(*s);
-                    let mut acc = 0u64;
-                    for _ in 0..*count {
-                        acc = (acc << *w) | part;
-                    }
-                    r!(*d) = acc;
+                    r!(*d) = replicate_narrow(part, *w, *count);
                 }
                 TsInsn::WSigRange { .. } => {
                     unreachable!("wide insn outside the wide executor")
@@ -24083,11 +24090,7 @@ impl Simulator {
                         xbail!();
                     }
                     (*rp.add(*dl as usize)) = v;
-                    let mut acc = 0u64;
-                    for _ in 0..*count {
-                        acc = (acc << *w) | v;
-                    }
-                    (*rp.add(*d as usize)) = acc;
+                    (*rp.add(*d as usize)) = replicate_narrow(v, *w, *count);
                 }
                 TsInsn::LoadSigSigRange { dl, sig, d, sig2, lo, mask } => {
                     let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
@@ -24300,11 +24303,7 @@ impl Simulator {
                 }
                 TsInsn::Repl { d, s, w, count } => {
                     let part = (*rp.add(*s as usize));
-                    let mut acc = 0u64;
-                    for _ in 0..*count {
-                        acc = (acc << *w) | part;
-                    }
-                    (*rp.add(*d as usize)) = acc;
+                    (*rp.add(*d as usize)) = replicate_narrow(part, *w, *count);
                 }
                 TsInsn::WSigRange { .. } => {
                     unreachable!("wide insn outside the wide executor")
