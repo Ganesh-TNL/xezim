@@ -1714,6 +1714,24 @@ struct ProcCont {
     stmts: Arc<[Statement]>,
     start: usize,
     next: Option<Arc<ProcCont>>,
+    // Absolute index into `stmts` of a synthesized `While`/`Repeat` re-entry
+    // tail, if this frame carries one (see bug 28's PR #174 follow-up).
+    // Those two kinds are reused for BOTH a loop's own continuation
+    // (re-appended after unrolling one iteration, which must consume a
+    // pending `break`/`continue`) and an ordinary fresh occurrence of the
+    // same kind reached for the first time while a flag from an ENCLOSING
+    // loop happens to be pending (which must NOT consume it — it has to be
+    // skipped like any other statement, §9.3.3/§12.7). The two are
+    // structurally identical (same `StatementKind` variant), so the
+    // run_process_stmts top guard cannot tell them apart by kind alone; this
+    // field names the ONE index in this frame that is a genuine re-entry.
+    // `While` and `Repeat` are the only kinds ever re-appended: a blocking
+    // `for` lowers to `while (cond) { body; step }` and a `do…while` to
+    // `body; while (cond) body`, so `For`/`DoWhile` are only ever reached
+    // fresh. `Foreach`/`Forever` re-enter through the distinct
+    // `ForeachTail`/`ForeverTail` kinds, so their base kind is never
+    // ambiguous and is never a flag consumer.
+    loop_tail_at: Option<usize>,
 }
 
 /// Defense in depth for the chain length: the derived drop for a linked list
@@ -1735,7 +1753,7 @@ impl Drop for ProcCont {
 impl ProcCont {
     /// A continuation over a freshly synthesized statement list.
     fn from_vec(stmts: Vec<Statement>) -> Self {
-        ProcCont { stmts: Arc::from(stmts), start: 0, next: None }
+        ProcCont { stmts: Arc::from(stmts), start: 0, next: None, loop_tail_at: None }
     }
 
     /// Nothing to run.
@@ -1743,16 +1761,19 @@ impl ProcCont {
         thread_local! {
             static EMPTY: Arc<[Statement]> = Arc::from(Vec::new());
         }
-        ProcCont { stmts: EMPTY.with(Arc::clone), start: 0, next: None }
+        ProcCont { stmts: EMPTY.with(Arc::clone), start: 0, next: None, loop_tail_at: None }
     }
 
     /// Resume at `idx` of THIS frame, keeping the rest of the chain. This is the
-    /// operation that used to be a deep clone.
+    /// operation that used to be a deep clone. `loop_tail_at` names a position
+    /// in THIS SAME `stmts` array, so it carries over unchanged — moving the
+    /// cursor doesn't move the tail.
     fn resume_at(&self, idx: usize) -> Self {
         ProcCont {
             stmts: Arc::clone(&self.stmts),
             start: idx.min(self.stmts.len()),
             next: self.next.clone(),
+            loop_tail_at: self.loop_tail_at,
         }
     }
 
@@ -1774,7 +1795,17 @@ impl ProcCont {
         } else {
             Some(Arc::new(self.resume_at(resume_at)))
         };
-        ProcCont { stmts: Arc::from(stmts), start: 0, next }
+        ProcCont { stmts: Arc::from(stmts), start: 0, next, loop_tail_at: None }
+    }
+
+    /// Like `pushed`, but `stmts[tail_idx]` is a synthesized `While`/`Repeat`
+    /// re-entry — the ONE occurrence of that kind in this frame allowed to
+    /// consume a pending `break`/`continue` (see `loop_tail_at`'s doc
+    /// comment on `ProcCont`).
+    fn pushed_with_tail(&self, stmts: Vec<Statement>, resume_at: usize, tail_idx: usize) -> Self {
+        let mut c = self.pushed(stmts, resume_at);
+        c.loop_tail_at = Some(tail_idx);
+        c
     }
 
     /// Run a previously prepared statement frame, then resume this chain.
@@ -1784,7 +1815,20 @@ impl ProcCont {
         } else {
             Some(Arc::new(self.resume_at(resume_at)))
         };
-        ProcCont { stmts, start: 0, next }
+        ProcCont { stmts, start: 0, next, loop_tail_at: None }
+    }
+
+    /// Like `pushed_frame`, but `stmts[tail_idx]` is a synthesized loop
+    /// re-entry (see `pushed_with_tail`).
+    fn pushed_frame_with_tail(
+        &self,
+        stmts: Arc<[Statement]>,
+        resume_at: usize,
+        tail_idx: usize,
+    ) -> Self {
+        let mut c = self.pushed_frame(stmts, resume_at);
+        c.loop_tail_at = Some(tail_idx);
+        c
     }
 
     /// This frame only, from the cursor.
@@ -43273,6 +43317,68 @@ impl Simulator {
                 continue;
             }
 
+            // §12.7 / §9.3.3: while a `break`/`continue` is pending, the REST of
+            // the loop body must be skipped — INCLUDING blocking statements. The
+            // synchronous `exec_statement` already no-ops every statement while
+            // these flags are set (its top guard), and `blocking_loop_flag_gate`
+            // relies on that: it assumes "the body statements after the `continue`
+            // were already skipped". But a BLOCKING statement — a call to a
+            // time-consuming task/method, a `#delay`, an `@event`, a `fork`, or a
+            // blocking begin/end — is intercepted in THIS function AHEAD of
+            // `exec_statement`, and inlining a blocking task even SAVES AND CLEARS
+            // these flags for the callee's body (`bind_task_frame`). So without
+            // this guard a `continue`/`break` guarding a call to a blocking
+            // subroutine was ignored and the call ran for the skipped iterations
+            // — bug 28: the mesh smoke seq's
+            // `if (!has_neighbor(r,dir)) continue; send_directed(...);` leaked
+            // off-mesh flits because `send_directed` blocks in
+            // `start_item`/`finish_item`. Inline `#delay`s escaped the bug only
+            // because the flag PERSISTS across suspend/resume, so the post-delay
+            // assignment was still skipped; a called task clears it.
+            //
+            // Do NOT skip the statements that CONSUME the flag: `LoopStep`
+            // (continue's barrier, handled just above), `ScopePop`
+            // (task-frame cleanup), the `ForeachTail`/`ForeverTail` re-entry
+            // sentinels (unambiguous — `Foreach`/`Forever` always lower to
+            // one of these for re-entry, so the BASE kind is never itself a
+            // tail and is never exempted here), and — ONLY at the exact
+            // position `pc.loop_tail_at` names — a `While`/`Repeat` re-entry.
+            //
+            // That position check matters because those two kinds are
+            // reused for BOTH the genuine re-entry AND an ordinary fresh
+            // occurrence of the same kind reached for the first time right
+            // after the `break`/`continue` (a nested loop in source, sitting
+            // in the body BEFORE the re-appended tail). The two are the same
+            // `StatementKind` variant, so matching on kind alone treats the
+            // fresh one as if it were consuming ITS OWN flag: a `continue`
+            // followed by a nested `for`/`while`/`repeat` ran anyway, and a
+            // `break` followed by a nested `foreach`/loop got swallowed by
+            // it instead of stopping the outer loop (PR #174 review, on top
+            // of the original bug 28 fix — e.g. the mesh seq's
+            // `if (!has_neighbor(...)) continue; for (dir2 ...) ...`).
+            // `pc.loop_tail_at`, set only at the three sites that actually
+            // re-append a `While`/`Repeat` as a tail (see its doc comment on
+            // `ProcCont`; `For`/`DoWhile` lower to a `While` tail and are
+            // themselves only ever reached fresh), is what tells the two
+            // apart. A `disable` (disable_target set) drives its own unwind
+            // through `break_flag` — leave that path untouched.
+            if (self.break_flag || self.continue_flag) && self.disable_target.is_none() {
+                let is_flag_consumer = matches!(
+                    &stmt.kind,
+                    StatementKind::ScopePop
+                        | StatementKind::ForeachTail { .. }
+                        | StatementKind::ForeverTail { .. }
+                ) || (pc.loop_tail_at == Some(pc.start + i)
+                    && matches!(
+                        &stmt.kind,
+                        StatementKind::While { .. } | StatementKind::Repeat { .. }
+                    ));
+                if !is_flag_consumer {
+                    i += 1;
+                    continue;
+                }
+            }
+
             // Expand SeqBlocks: flatten begin/end so that timing controls and waits
             // inside them are properly handled with process suspension.
             if let StatementKind::SeqBlock { stmts: inner, .. } = &stmt.kind {
@@ -44551,7 +44657,11 @@ impl Simulator {
                         stmt.span,
                     ));
                     // Chain the caller's tail rather than copying it (ProcCont::pushed).
-                    let cont = pc.pushed(cont, pc.start + i + 1);
+                    // The just-appended Repeat IS this frame's genuine re-entry
+                    // tail (see `loop_tail_at`'s doc comment) — it sits at the
+                    // last index of `cont`.
+                    let tail_idx = cont.len() - 1;
+                    let cont = pc.pushed_with_tail(cont, pc.start + i + 1, tail_idx);
                     self.continue_stmts_or_trampoline(pid, cont);
                     return;
                 }
@@ -44827,7 +44937,13 @@ impl Simulator {
                             }
                             frame
                         };
-                        let cont = pc.pushed_frame(frame, pc.start + i + 1);
+                        // `frame` always ends with the re-appended `stmt.clone()`
+                        // (freshly built above, or the identical shape pulled
+                        // from `suspended_loop_frames` — same span, same tail
+                        // position either way): that last slot is this frame's
+                        // genuine re-entry (see `loop_tail_at`'s doc comment).
+                        let tail_idx = frame.len() - 1;
+                        let cont = pc.pushed_frame_with_tail(frame, pc.start + i + 1, tail_idx);
                         self.continue_stmts_or_trampoline(pid, cont);
                         return;
                     } else {
@@ -44855,8 +44971,13 @@ impl Simulator {
                         stmt.span,
                     ));
                     // Chain the caller's tail instead of copying it onto the end of
-                    // the spliced body (ProcCont::pushed).
-                    self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
+                    // the spliced body (ProcCont::pushed). The appended `While`
+                    // is this frame's genuine re-entry tail.
+                    let tail_idx = cont.len() - 1;
+                    self.run_process_stmts(
+                        pid,
+                        &pc.pushed_with_tail(cont, pc.start + i + 1, tail_idx),
+                    );
                     return;
                 }
             }
