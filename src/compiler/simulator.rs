@@ -14718,6 +14718,23 @@ impl Simulator {
             .is_some()
     }
 
+    /// Scope an edge block's fallback statements run under: the block's own
+    /// inlining scope, else the instance prefix of its first sensitivity.
+    /// Shared by the `edge_block_scope` table and the native compile of the
+    /// block, so `%m`, bare names and `%t` agree between the two paths.
+    fn edge_block_scope_for(&self, idx: usize) -> Option<String> {
+        self.edge_blocks.get(idx).and_then(|b| {
+            if !b.scope.is_empty() {
+                Some(b.scope.clone())
+            } else {
+                b.resolved_sensitivities
+                    .first()
+                    .and_then(|sid| self.id_to_name.get(sid.signal_id))
+                    .and_then(|full| full.rsplit_once('.').map(|(p, _)| p.to_string()))
+            }
+        })
+    }
+
     pub fn edge_block_scope_at(&self, bi: usize) -> Option<String> {
         self.edge_block_scope.get(bi).and_then(|s| s.clone())
     }
@@ -24984,6 +25001,12 @@ impl Simulator {
                     // populated signal_inline_bits.
                     let inline_ptr = self.signal_inline_bits.as_ptr() as u64;
                     let inline_len = self.signal_inline_bits.len() as u32;
+                    // Fallback statements inside a natively compiled block
+                    // run under the block's scope (%m, bare names, %t), as
+                    // on the bytecode path.
+                    let edge_scopes: Vec<Option<String>> = (0..self.compiled_edge_blocks.len())
+                        .map(|i| self.edge_block_scope_for(i))
+                        .collect();
                     if let Some(jm) = self.jit_module.as_mut() {
                         if inline_len > 0 {
                             jm.set_inline_bits_storage(inline_ptr, inline_len);
@@ -25202,11 +25225,12 @@ impl Simulator {
                                         eprintln!("[JITBLK]   {:?}", i);
                                     }
                                 }
-                                let compiled_fn = jm.try_compile_with_xz(
+                                let compiled_fn = jm.try_compile_with_xz_hint(
                                     &cb.instructions,
                                     cb.num_regs,
                                     xz_ptr,
                                     xz_len,
+                                    edge_scopes.get(idx).and_then(|s| s.as_deref()),
                                 );
                                 if compiled_fn.is_none() && trace_bails {
                                     eprintln!(
@@ -25383,16 +25407,7 @@ impl Simulator {
             self.edge_block_insn_len
                 .push(cb.as_ref().map(|cb| cb.instructions.len() as u32).unwrap_or(0));
             // Prefer the block's own inlining scope (see compile_edge_blocks).
-            let scope = self.edge_blocks.get(idx).and_then(|b| {
-                if !b.scope.is_empty() {
-                    Some(b.scope.clone())
-                } else {
-                    b.resolved_sensitivities
-                        .first()
-                        .and_then(|sid| self.id_to_name.get(sid.signal_id))
-                        .and_then(|full| full.rsplit_once('.').map(|(p, _)| p.to_string()))
-                }
-            });
+            let scope = self.edge_block_scope_for(idx);
             self.edge_block_scope.push(scope);
         }
         sim_dbg_eprintln!(

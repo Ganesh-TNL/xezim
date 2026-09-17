@@ -16,6 +16,11 @@ and the development workflow are in [README.md](README.md).
 * `%m` inside a continuous assignment whose expression falls back to the
   interpreter names the assignment's instance, and `$time` there scales to
   that instance's timescale, as always-block fallbacks already did.
+* With the native compiler on (`XEZIM_JIT=1`), a `$display` or other
+  interpreted statement inside a compiled clocked block now runs under the
+  block's own instance: `%m` names the instance, bare names resolve there,
+  and `$realtime`/`%t` use its timescale. Previously such statements ran
+  under the top scope.
 * A constant part-select write with a negative label (`x[4:-1] = v`,
   `x[0:-1] <= v`) in a clocked block or compiled process keeps its in-range
   bits (IEEE 1800 §11.5.1); the compiled path folded the bounds unsigned,
