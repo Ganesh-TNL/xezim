@@ -3574,18 +3574,90 @@ fn wmask_top<const N: usize>(x: &mut [u64; N], w: u16) {
 }
 
 #[inline(always)]
+fn repeated_word(part: u64, width: u8) -> Option<u64> {
+    match width {
+        1 => Some(0u64.wrapping_sub(part & 1)),
+        2 => Some((part & 0x3).wrapping_mul(0x5555_5555_5555_5555)),
+        4 => Some((part & 0xf).wrapping_mul(0x1111_1111_1111_1111)),
+        8 => Some((part & 0xff).wrapping_mul(0x0101_0101_0101_0101)),
+        16 => Some((part & 0xffff).wrapping_mul(0x0001_0001_0001_0001)),
+        32 => Some((part & 0xffff_ffff).wrapping_mul(0x0000_0001_0000_0001)),
+        64 => Some(part),
+        _ => None,
+    }
+}
+
+#[inline(always)]
 fn replicate_narrow(part: u64, width: u8, count: u8) -> u64 {
-    if width == 1 {
-        let fill = 0u64.wrapping_sub(part & 1);
-        return if count >= 64 {
-            fill
+    if count == 0 {
+        return 0;
+    }
+    if count == 1 {
+        return part;
+    }
+    let total = width as u16 * count as u16;
+    if let Some(word) = repeated_word(part, width) {
+        return if total >= 64 {
+            word
         } else {
-            fill & ((1u64 << count) - 1)
+            word & ((1u64 << total) - 1)
         };
     }
+
     let mut acc = 0u64;
-    for _ in 0..count {
-        acc = (acc << width) | part;
+    let mut chunk = part;
+    let mut chunk_width = width as u32;
+    let mut copies = count;
+    while copies != 0 {
+        if copies & 1 != 0 {
+            acc = (acc << chunk_width) | chunk;
+        }
+        copies >>= 1;
+        if copies != 0 {
+            chunk |= chunk << chunk_width;
+            chunk_width *= 2;
+        }
+    }
+    acc
+}
+
+#[inline(always)]
+fn replicate_wide<const N: usize>(part: u64, width: u8, count: u16) -> [u64; N] {
+    if count == 0 {
+        return [0u64; N];
+    }
+    if count == 1 {
+        let mut acc = [0u64; N];
+        acc[0] = part;
+        return acc;
+    }
+    let total = width as u16 * count;
+    if let Some(word) = repeated_word(part, width) {
+        let mut acc = [word; N];
+        wmask_top(&mut acc, total);
+        return acc;
+    }
+
+    let mut acc = [0u64; N];
+    let mut chunk = [0u64; N];
+    chunk[0] = part;
+    let mut chunk_width = width as u32;
+    let mut copies = count;
+    while copies != 0 {
+        if copies & 1 != 0 {
+            acc = wshl(acc, chunk_width);
+            for i in 0..N {
+                acc[i] |= chunk[i];
+            }
+        }
+        copies >>= 1;
+        if copies != 0 {
+            let shifted = wshl(chunk, chunk_width);
+            for i in 0..N {
+                chunk[i] |= shifted[i];
+            }
+            chunk_width *= 2;
+        }
     }
     acc
 }
@@ -22429,18 +22501,7 @@ impl Simulator {
                 }
                 TsInsn::WRepl { d, s, w, count } => {
                     let part = regs[*s as usize];
-                    let mut acc;
-                    if *w == 1 {
-                        acc = [0u64.wrapping_sub(part & 1); N];
-                        wmask_top(&mut acc, *count);
-                    } else {
-                        acc = [0u64; N];
-                        for _ in 0..*count {
-                            acc = wshl(acc, *w as u32);
-                            acc[0] |= part;
-                        }
-                    }
-                    wregs[*d as usize] = acc;
+                    wregs[*d as usize] = replicate_wide(part, *w, *count);
                 }
                 TsInsn::BrSigFalse { sig, bit, t } => {
                     let cond = if *bit == u32::MAX {
@@ -125661,6 +125722,49 @@ mod vm_fastpath_tests {
                     let reference = Value::concat_refs(std::iter::repeat_n(&a, n));
                     same((v, x, w, false), &reference);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn repetition_helpers_match_shift_reference() {
+        for width in 1u8..=64 {
+            let mask = if width == 64 { u64::MAX } else { (1u64 << width) - 1 };
+            let part = 0xd6a5_39c7_b84e_102f & mask;
+
+            for count in 0u8..=64 / width {
+                let mut reference = 0u64;
+                if width == 64 {
+                    if count != 0 {
+                        reference = part;
+                    }
+                } else {
+                    for _ in 0..count {
+                        reference = (reference << width) | part;
+                    }
+                }
+                assert_eq!(
+                    replicate_narrow(part, width, count),
+                    reference,
+                    "narrow width={width} count={count}"
+                );
+            }
+
+            let max_count = 512u16 / width as u16;
+            for count in [0u16, 1, 2, 3, max_count] {
+                if count > max_count {
+                    continue;
+                }
+                let mut reference = [0u64; 8];
+                for _ in 0..count {
+                    reference = wshl(reference, width as u32);
+                    reference[0] |= part;
+                }
+                assert_eq!(
+                    replicate_wide::<8>(part, width, count),
+                    reference,
+                    "wide width={width} count={count}"
+                );
             }
         }
     }
