@@ -11207,27 +11207,82 @@ impl Simulator {
         Some((prefix, spec.to_ascii_lowercase()))
     }
 
-    fn parse_plusarg_value(raw: &str, spec: char) -> Option<Value> {
+    /// Two's complement negation at the value's own width: `-x` is `!x + 1`,
+    /// so `-1` read into a 160-bit destination is 2^160-1. Callers build the
+    /// operand at the destination width first, which is what makes the result
+    /// the destination's `-x` rather than a truncated one.
+    ///
+    /// Neither `Value::negate` nor the `!x + 1` spelling can do this. `negate`
+    /// funnels the operand through `to_u64`, and `to_u64` on `Wide` storage
+    /// answers with the low word alone; `add` reduces both `Wide` operands
+    /// through `u128`, so the carry dies at bit 127 and bits 128 and up come
+    /// back 0 — `-1` into 160 bits came out as 2^128-1. `bitwise_not` does
+    /// cover the full width, so only the increment has to be walked by hand.
+    fn negate_twos_complement(v: Value) -> Value {
+        // Unknown bits poison an arithmetic result the way `add` and `negate`
+        // already answer them.
+        if v.has_xz() {
+            let mut x = Value::new(v.width);
+            x.is_signed = true;
+            return x;
+        }
+        let mut n = v.bitwise_not();
+        let w = n.width;
+        let mut i = 0u32;
+        let mut carry = true;
+        while carry && i < w {
+            if n.get_bit(i as usize) == LogicBit::Zero {
+                n.set_bit(i as usize, LogicBit::One);
+                carry = false;
+            } else {
+                // 1 + 1 wraps to 0 and keeps carrying.
+                n.set_bit(i as usize, LogicBit::Zero);
+            }
+            i += 1;
+        }
+        n.is_signed = true;
+        n
+    }
+
+    fn parse_plusarg_value(raw: &str, spec: char, width: u32) -> Option<Value> {
         let cleaned: String = raw.chars().filter(|c| *c != '_').collect();
+        let w = width.max(1);
         match spec {
             'd' => {
-                if let Ok(v) = cleaned.parse::<i64>() {
-                    let mut out = Value::from_u64(v as u64, 64);
-                    out.is_signed = true;
-                    Some(out)
-                } else {
-                    None
+                // Sign first, magnitude after — the split `$sscanf` makes below.
+                // The destination decides the two's complement, not the text:
+                // reading the magnitude and dropping the `-` here would hand
+                // back the same bits for `-1` and `1`.
+                let (negative, digits) = match cleaned.strip_prefix('-') {
+                    Some(rest) => (true, rest),
+                    None => (false, cleaned.strip_prefix('+').unwrap_or(&cleaned)),
+                };
+                // A payload that isn't a number is no match, and the caller has
+                // to move on to the next plusarg. Accumulating while skipping
+                // non-digits summed `+N=abc` down to zero, so the register got
+                // 0 and $value$plusargs reported a successful match.
+                if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
                 }
+                // One decimal parser for every width; core folds digits past
+                // u64 into limbs and truncates to `w`.
+                let mut v = Value::from_str_radix(digits, 10, w);
+                if negative {
+                    v = Self::negate_twos_complement(v);
+                } else {
+                    v.is_signed = true;
+                }
+                Some(v)
             }
             'h' | 'x' => {
                 let s = cleaned
                     .strip_prefix("0x")
                     .or_else(|| cleaned.strip_prefix("0X"))
                     .unwrap_or(&cleaned);
-                Some(Value::from_str_radix(s, 16, 64))
+                Some(Value::from_str_radix(s, 16, w))
             }
-            'o' => Some(Value::from_str_radix(&cleaned, 8, 64)),
-            'b' => Some(Value::from_str_radix(&cleaned, 2, 64)),
+            'o' => Some(Value::from_str_radix(&cleaned, 8, w)),
+            'b' => Some(Value::from_str_radix(&cleaned, 2, w)),
             's' => Some(Value::from_string(raw)),
             'f' | 'e' | 'g' => cleaned.parse::<f64>().ok().map(Value::from_f64),
             _ => None,
@@ -11245,6 +11300,9 @@ impl Simulator {
         let Some((prefix, spec)) = Self::parse_plusarg_format(&fmt) else {
             return Value::zero(32);
         };
+        // The destination's width, so a 160-bit field keeps all 160 bits of
+        // the token instead of whatever survives a trip through i64.
+        let dest_width = self.infer_lhs_width(&args[1]).max(1);
 
         for arg in &self.plusargs {
             let payload = Self::plusarg_payload(arg);
@@ -11252,7 +11310,7 @@ impl Simulator {
                 continue;
             }
             let suffix = &payload[prefix.len()..];
-            if let Some(v) = Self::parse_plusarg_value(suffix, spec) {
+            if let Some(v) = Self::parse_plusarg_value(suffix, spec, dest_width) {
                 self.assign_value(&args[1], &v);
                 return Value::from_u64(1, 32);
             }
@@ -11425,19 +11483,35 @@ impl Simulator {
                             break;
                         }
                         let text: String = s[dstart..si2].iter().filter(|c| **c != '_').collect();
-                        match i64::from_str_radix(&text, radix) {
-                            Ok(mut n) => {
-                                if neg {
-                                    n = -n;
-                                }
-                                si = si2;
-                                if oi < outs.len() {
-                                    self.assign_value(&outs[oi], &Value::from_u64(n as u64, 32));
-                                    oi += 1;
-                                    assigned += 1;
-                                }
-                            }
-                            Err(_) => break,
+                        // The scan above admits `char::is_digit`, which is
+                        // Unicode-aware, so a non-ASCII digit can land here.
+                        // `from_str_radix` would answer X; `$sscanf` has to
+                        // report a failed conversion and stop, the way the old
+                        // `i64::from_str_radix` returning `Err` did.
+                        if text
+                            .bytes()
+                            .any(|b| !b.is_ascii() || (b as char).to_digit(radix).is_none())
+                        {
+                            break;
+                        }
+                        // Parse at the destination's width, not a fixed 32: a
+                        // 160-bit field has to keep all 160 bits of the token.
+                        let dest_width = if oi < outs.len() {
+                            self.infer_lhs_width(&outs[oi]).max(1)
+                        } else {
+                            32
+                        };
+                        let mut v = Value::from_str_radix(&text, radix, dest_width);
+                        if neg {
+                            v = Self::negate_twos_complement(v);
+                        } else {
+                            v.is_signed = signed;
+                        }
+                        si = si2;
+                        if oi < outs.len() {
+                            self.assign_value(&outs[oi], &v);
+                            oi += 1;
+                            assigned += 1;
                         }
                     }
                     _ => break,
