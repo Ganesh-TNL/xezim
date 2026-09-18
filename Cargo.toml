@@ -1,6 +1,6 @@
 [package]
 name = "xezim"
-version = "0.10.5"
+version = "0.10.6"
 build = "src/build.rs"
 edition = "2024"
 rust-version = "1.92"
@@ -20,8 +20,8 @@ rand = "0.8"
 # `./scripts/use-local-core.sh` once (or use scripts/cargo-local.sh per
 # invocation) and plain `cargo build` uses it — no network, no git dep.
 # See "Modifying xezim-core" in README.md.
-xezim-core = { git = "https://github.com/aionhw/xezim-core.git", rev = "3aa9653" }
-sv-parser = { git = "https://github.com/aionhw/xezim-core.git", rev = "3aa9653" }
+xezim-core = { git = "https://github.com/aionhw/xezim-core.git", rev = "045a357" }
+sv-parser = { git = "https://github.com/aionhw/xezim-core.git", rev = "045a357" }
 libloading = "0.8"
 libffi = "3"
 libc = "0.2"
