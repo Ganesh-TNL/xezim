@@ -72,3 +72,51 @@ fn warm_cache_replays_elaboration_warnings() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// §20.3: cached elaboration must not change the scope used to scale `$time`.
+#[test]
+fn cached_edge_block_keeps_its_time_scope() {
+    let dir = std::env::temp_dir().join(format!("xezim_warmtime_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let child = dir.join("unit.sv");
+    let top = dir.join("shell.sv");
+    std::fs::write(
+        &child,
+        "module pulse_cell(input phase, output logic mark = 0);\n\
+         always @(posedge phase) mark <= ~mark;\n\
+         endmodule\n",
+    )
+    .expect("write child");
+    std::fs::write(
+        &top,
+        "`timescale 10ps/1ps\n\
+         module shell; logic phase = 0; wire mark; always #4 phase = ~phase;\n\
+         pulse_cell u_cell(.phase(phase), .mark(mark));\n\
+         always @(posedge phase) $display(\"STAMP=%0d\", $time);\n\
+         initial #20 $finish; endmodule\n",
+    )
+    .expect("write top");
+    let cache = dir.join("cache");
+
+    let run = || {
+        let out = Command::new(xezim_bin())
+            .args(["--simulate", "-s", "shell", "--cache-dir"])
+            .arg(&cache)
+            .arg(&child)
+            .arg(&top)
+            .output()
+            .expect("run xezim");
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let cold = run();
+    let warm = run();
+    for text in [&cold, &warm] {
+        assert!(text.contains("STAMP=4"), "first edge used the wrong unit:\n{text}");
+        assert!(text.contains("STAMP=12"), "second edge used the wrong unit:\n{text}");
+        assert!(!text.contains("STAMP=0"), "scope leaked across processes:\n{text}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -39,6 +39,30 @@ endmodule
     );
 }
 
+/// §23.2.2.4: the same initializer must survive hierarchy flattening.
+#[test]
+fn nested_output_port_default_is_initializer() {
+    let sim = simulate(
+        r#"
+module source_unit(output logic ready = 0);
+endmodule
+module shell;
+  wire observed;
+  source_unit u_source(.ready(observed));
+  initial begin #1; $display("READY=%b", observed); $finish; end
+endmodule
+"#,
+        1000,
+    )
+    .expect("sim");
+    let msgs = messages(&sim);
+    assert!(
+        msgs.iter().any(|m| m == "READY=0"),
+        "nested output-port initializer was lost: {:?}",
+        msgs
+    );
+}
+
 #[test]
 fn disable_task_terminates_other_process() {
     let sim = simulate(

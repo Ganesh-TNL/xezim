@@ -15,6 +15,8 @@
 mod collection_of_handles_new;
 #[path = "classes/class_unpacked_struct_array_store.rs"]
 mod class_unpacked_struct_array_store;
+#[path = "classes/memory_tasks_fixed_property.rs"]
+mod memory_tasks_fixed_property;
 #[path = "classes/static_fixed_array_storage.rs"]
 mod static_fixed_array_storage;
 #[path = "classes/array_equality_class.rs"]

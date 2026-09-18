@@ -62,6 +62,48 @@ endmodule
     assert_eq!(fails(&text), vec!["FAIL 15"] as Vec<&str>, "FAIL lines:\n{text}");
 }
 
+/// §16.8: a sequence after a cycle delay may begin with a unary expression.
+#[test]
+fn delayed_unary_sequence_is_evaluated() {
+    let text = run("delayed_unary_sequence_is_evaluated", r#"
+module t; logic phase = 0; always #5 phase = ~phase;
+  logic launch = 0, guard = 1;
+  p: assert property (@(posedge phase) launch |-> ##1 !guard)
+     else $display("FAIL unary %0d", $time);
+  initial begin #1 launch = 1; #10 launch = 0; #30 $finish; end
+endmodule
+"#);
+    assert_eq!(fails(&text), vec!["FAIL unary 15"] as Vec<&str>, "FAIL lines:\n{text}");
+}
+
+/// §16.9.3: one signal is sampled once per property clock even when several
+/// sampled-value calls in the same property reference it.
+#[test]
+fn repeated_sampled_value_calls_share_one_history_step() {
+    let text = run("repeated_sampled_value_calls_share_one_history_step", r#"
+module t;
+  logic phase = 0; always #5 phase = ~phase;
+  logic serial_level, clear;
+  integer step;
+  localparam logic [0:11] LEVELS = 12'b110001000000;
+  localparam logic [0:11] CLEARS = 12'b110000000000;
+  p: assert property (@(posedge phase) disable iff (clear)
+       (!serial_level) && $past(serial_level, 1) |->
+       (##1 (!serial_level)) ##1
+       (1'b1 ##1 (serial_level == $past(serial_level, 1)))[*2])
+     else $display("FAIL sampled %0d", $time);
+  initial begin
+    for (step = 0; step < 12; step++) begin
+      serial_level = LEVELS[step]; clear = CLEARS[step];
+      @(posedge phase); #1;
+    end
+    $finish;
+  end
+endmodule
+"#);
+    assert_eq!(fails(&text), vec!["FAIL sampled 55"] as Vec<&str>, "FAIL lines:\n{text}");
+}
+
 #[test]
 fn multi_cycle_antecedent_triggers_on_its_last_cycle() {
     let text = run("multi_cycle_antecedent_triggers_on_its_last_cycle", r#"

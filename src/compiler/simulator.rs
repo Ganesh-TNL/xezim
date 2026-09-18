@@ -11817,6 +11817,15 @@ impl Simulator {
     }
 
     fn resolve_array_name_from_expr(&self, expr: &Expression) -> Option<String> {
+        // §8.5: fixed arrays declared as class properties live in the
+        // per-object store.  Memory tasks accept those arrays just as they do
+        // module arrays, both through `obj.member` and a bare member inside a
+        // method.
+        if let Some(name) = self.handle_member_array_name(expr) {
+            if self.module.arrays.contains_key(&name) {
+                return Some(name);
+            }
+        }
         let (resolved, raw) = match &expr.kind {
             ExprKind::Ident(hier) => {
                 let resolved = self.resolve_hier_name(hier);
@@ -11830,6 +11839,11 @@ impl Simulator {
             }
             _ => return None,
         };
+        if let Some(name) = self.instance_assoc_member(&raw) {
+            if self.module.arrays.contains_key(&name) {
+                return Some(name);
+            }
+        }
         if self.module.arrays.contains_key(&*resolved) {
             return Some(resolved.to_string());
         }
@@ -15259,7 +15273,11 @@ impl Simulator {
                 b.resolved_sensitivities
                     .first()
                     .and_then(|sid| self.id_to_name.get(sid.signal_id))
-                    .and_then(|full| full.rsplit_once('.').map(|(p, _)| p.to_string()))
+                    .map(|full| {
+                        full.rsplit_once('.')
+                            .map(|(p, _)| p.to_string())
+                            .unwrap_or_else(|| self.module.name.clone())
+                    })
             }
         })
     }
@@ -77477,6 +77495,11 @@ if self.profile_report {
         const PAST_MAX_DEPTH: usize = 16;
         let mut names: Vec<String> = Vec::new();
         self.collect_past_arg_names(body, &mut names);
+        // A signal is sampled once per property clock, regardless of how many
+        // sampled-value calls reference it.  Pushing duplicate names made
+        // ring[1] another copy of the current cycle instead of the prior one.
+        names.sort_unstable();
+        names.dedup();
         for name in names {
             // The sampled (Preponed) value when the site tracks the signal.
             let pre = self

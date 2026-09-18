@@ -10412,6 +10412,16 @@ impl<'a> BytecodeCompiler<'a> {
                         | BinaryOp::LogEquiv
                 ) {
                     1
+                } else if matches!(
+                    op,
+                    BinaryOp::ShiftLeft
+                        | BinaryOp::ShiftRight
+                        | BinaryOp::ArithShiftLeft
+                        | BinaryOp::ArithShiftRight
+                ) {
+                    // §11.4.10: a shift result has the left operand's width;
+                    // the self-determined right operand cannot widen it.
+                    self.expr_max_width(left)
                 } else {
                     self.expr_max_width(left).max(self.expr_max_width(right))
                 }

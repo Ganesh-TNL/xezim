@@ -173,6 +173,8 @@ mod real_literal_comb_eval;
 mod real_valued_delay;
 #[path = "types/shift_context_width.rs"]
 mod shift_context_width;
+#[path = "types/logical_shift_self_width.rs"]
+mod logical_shift_self_width;
 #[path = "types/shift_width_and_scope_hint.rs"]
 mod shift_width_and_scope_hint;
 #[path = "types/size_cast_context_and_fn_return_default.rs"]
