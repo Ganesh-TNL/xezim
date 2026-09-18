@@ -95,6 +95,8 @@ mod multiple_top_modules;
 mod nested_cross_module_call;
 #[path = "hierarchy/nonansi_port_completion.rs"]
 mod nonansi_port_completion;
+#[path = "hierarchy/port_net_pull_resolution.rs"]
+mod port_net_pull_resolution;
 #[path = "hierarchy/nonansi_ports_and_vif_accessors.rs"]
 mod nonansi_ports_and_vif_accessors;
 #[path = "hierarchy/null_ports_lib_defines_nowarn.rs"]
