@@ -43,6 +43,16 @@ and the development workflow are in [README.md](README.md).
   nothing, matching the interpreter and IEEE 1800 7.4.6 / 11.5.1. The
   native code previously zeroed the unknown bits and used the result as
   the index.
+* Port declarations with explicit net types (`tri0`, `tri1`, `supply0`,
+  `supply1`, `wand`, `wor`, `triand`, `trior`, `trireg`, `uwire`,
+  `interconnect`) now initialize to the net type's IEEE 1800 §6.6 pull value
+  rather than a direction-derived default. The `default_port_value()` helper
+  now consults `PortDeclaration.net_type` / `AnsiPort.net_type`; driverless
+  weak/supply nets on ports register their implicit pull drivers in the
+  multi-driver resolution fold; and the `NetDeclaration` completion path
+  (a net declaration following a port declaration) handles all net types,
+  not only `supply0`/`supply1`. The idle value for a never-driven `trireg`
+  is `z` (per xrun), not `x`.
 * A constant part-select write with a negative label (`x[4:-1] = v`,
   `x[0:-1] <= v`) in a clocked block or compiled process keeps its in-range
   bits (IEEE 1800 §11.5.1); the compiled path folded the bounds unsigned,

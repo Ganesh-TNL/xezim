@@ -39,6 +39,8 @@ mod dump_merged_sv_adopted_primary;
 mod dump_merged_sv_library_dedup;
 #[path = "hierarchy/port_net_driven_from_inside.rs"]
 mod port_net_driven_from_inside;
+#[path = "hierarchy/port_net_type_directions.rs"]
+mod port_net_type_directions;
 #[path = "hierarchy/bind_upward_refs.rs"]
 mod bind_upward_refs;
 #[path = "hierarchy/c910_scoped_cont_assign.rs"]
