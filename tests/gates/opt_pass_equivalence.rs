@@ -1,4 +1,4 @@
-//! Equivalence tests for opt-in structural optimizations.
+//! Equivalence tests for structural optimizations.
 //!
 //! * `XEZIM_BUF_COLLAPSE` — folds whole-net identity continuous assigns
 //!   (`assign y = x;`) onto their source net, the analogue of the reference
@@ -155,8 +155,8 @@ fn buffer_net_collapse_is_observationally_identical() {
 
 #[test]
 fn edge_block_merge_is_observationally_identical() {
-    let (_, base) = run(MERGE_DESIGN, "merge_base", &[]);
-    let (text, merged) = run(MERGE_DESIGN, "merge_on", &[("XEZIM_EDGE_MERGE", "2")]);
+    let (_, base) = run(MERGE_DESIGN, "merge_base", &[("XEZIM_EDGE_MERGE", "0")]);
+    let (text, merged) = run(MERGE_DESIGN, "merge_on", &[]);
     assert!(
         !base.is_empty(),
         "baseline produced no program output — the test would be vacuous"
@@ -173,12 +173,12 @@ fn edge_block_merge_is_observationally_identical() {
 /// the configuration the benchmarks use.
 #[test]
 fn collapse_and_merge_together_are_identical() {
-    let (_, base) = run(MERGE_DESIGN, "both_base", &[("XEZIM_BUF_COLLAPSE", "0")]);
-    let (_, both) = run(
+    let (_, base) = run(
         MERGE_DESIGN,
-        "both_on",
-        &[("XEZIM_EDGE_MERGE", "2")],
+        "both_base",
+        &[("XEZIM_BUF_COLLAPSE", "0"), ("XEZIM_EDGE_MERGE", "0")],
     );
+    let (_, both) = run(MERGE_DESIGN, "both_on", &[]);
     assert!(!base.is_empty(), "baseline produced no program output");
     assert_eq!(base, both, "collapse+merge changed observable output");
 }

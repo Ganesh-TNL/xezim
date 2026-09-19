@@ -86,7 +86,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_EDGE_BLOCK_STATS", "Print per-edge-block execution statistics"),
     ("XEZIM_EDGE_FIRE_TRACE", "Trace every edge-block firing (very verbose)"),
     ("XEZIM_EDGE_FIRE_WATCH", "Watch a named signal's edge firings"),
-    ("XEZIM_EDGE_MERGE", "Opt-in: merge same-sensitivity edge blocks into one compiled block (=census to size; =N chunk cap)"),
+    ("XEZIM_EDGE_MERGE", "Merge same-sensitivity edge blocks into one compiled block (default 8; =0 disables; =census reports; =N sets the chunk cap)"),
     ("XEZIM_EDGE_SCAN_STATS", "Print edge-scan cost statistics"),
     ("XEZIM_ELAB_STATS", "Elab: print elaboration statistics (instances, signals, timing)"),
     ("XEZIM_ENABLE_CACHE", "Elab cache: force-enable the design cache (overrides --no-cache heuristics)"),

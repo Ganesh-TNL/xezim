@@ -13,6 +13,8 @@
 
 #[path = "hierarchy/flat_actual_struct_port.rs"]
 mod flat_actual_struct_port;
+#[path = "hierarchy/packed_record_output_chain.rs"]
+mod packed_record_output_chain;
 #[path = "hierarchy/nested_member_in_instance.rs"]
 mod nested_member_in_instance;
 #[path = "hierarchy/undefined_call_in_instance.rs"]

@@ -25035,8 +25035,7 @@ impl Simulator {
         self.compiled_edge_blocks = compiled;
         self.ts_edge.clear();
 
-        // Process merging (the reference simulator ships this enabled by
-        // DEFAULT; opt-in here):
+        // Process merging:
         // merge edge blocks with IDENTICAL plain sensitivities into one
         // compiled block. Same-signature members always fire together (100%
         // co-activation BY CONSTRUCTION — the recompute-waste defect that
@@ -25053,10 +25052,11 @@ impl Simulator {
         //    signal, which is observable for blocking writes but not for
         //    queued NBAs;
         //  * no `iff` / non-trivial event terms; no fallback insns.
-        // `XEZIM_EDGE_MERGE=census` sizes the population; `=N` merges with at
-        // most N members per merged block.
-        if let Ok(em) = std::env::var("XEZIM_EDGE_MERGE") {
+        // The measured default cap is eight. `=0` disables the pass,
+        // `=census` sizes the population, and `=N` selects another cap.
+        {
             use super::bytecode::Insn as EI;
+            let em = std::env::var("XEZIM_EDGE_MERGE").unwrap_or_else(|_| "8".to_string());
             let census_only = em == "census";
             let cap: usize = if census_only {
                 usize::MAX
@@ -79498,11 +79498,17 @@ if self.profile_report {
             let has_comb_deps = id + 1 >= self.comb_dep_offsets.len()
                 || self.comb_dep_offsets[id] != self.comb_dep_offsets[id + 1];
             if has_comb_deps {
-                if !self.dirty_signals[id] {
+                if self.ts_direct_writes {
+                    if self.dirty_list.last() != Some(&id) {
+                        self.dirty_list.push(id);
+                    }
+                } else if !self.dirty_signals[id] {
                     self.dirty_signals[id] = true;
                     self.dirty_list.push(id);
                 }
-                self.dirty_any = true;
+                if !self.ts_direct_writes {
+                    self.dirty_any = true;
+                }
             }
         }
     }
@@ -80658,11 +80664,17 @@ if self.profile_report {
         let has_comb_deps = id + 1 >= self.comb_dep_offsets.len()
             || self.comb_dep_offsets[id] != self.comb_dep_offsets[id + 1];
         if has_comb_deps {
-            if !self.dirty_signals[id] {
+            if self.ts_direct_writes {
+                if self.dirty_list.last() != Some(&id) {
+                    self.dirty_list.push(id);
+                }
+            } else if !self.dirty_signals[id] {
                 self.dirty_signals[id] = true;
                 self.dirty_list.push(id);
             }
-            self.dirty_any = true;
+            if !self.ts_direct_writes {
+                self.dirty_any = true;
+            }
         }
         if self.activity_mon {
             if self.signal_toggle_counts.len() != self.signal_table.len() {
@@ -87089,11 +87101,7 @@ if self.profile_report {
                 resized.is_signed = self.signal_signed[id];
             }
             if self.signal_table[id] != resized {
-                if !self.dirty_signals[id] {
-                    self.dirty_signals[id] = true;
-                    self.dirty_list.push(id);
-                }
-                self.dirty_any = true;
+                self.mark_dirty_id(id);
                 write_sig!(self, id, resized);
                 self.table_modified = true;
                 // §9.2.2.2: a queue / dynamic / associative ELEMENT that
@@ -87127,11 +87135,7 @@ if self.profile_report {
                 resized.is_signed = self.signal_signed[id];
             }
             if self.signal_table[id] != resized {
-                if !self.dirty_signals[id] {
-                    self.dirty_signals[id] = true;
-                    self.dirty_list.push(id);
-                }
-                self.dirty_any = true;
+                self.mark_dirty_id(id);
                 write_sig!(self, id, resized);
                 self.table_modified = true;
             }
