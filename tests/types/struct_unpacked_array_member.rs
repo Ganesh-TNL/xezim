@@ -113,6 +113,38 @@ endmodule
     assert_eq!(u(&sim, "e3"), 0x1003);
 }
 
+/// §7.4.2: every fixed unpacked dimension on a struct member is part of the
+/// member's array shape; a later dimension is not a packed bit-select.
+#[test]
+fn multidimensional_struct_member_keeps_each_dimension() {
+    let src = r#"
+typedef struct {
+  logic [7:0] lanes [0:1][2:3];
+} parcel_t;
+
+module top;
+  logic [7:0] stimulus = '0;
+  parcel_t parcel;
+  logic [7:0] result;
+  int row = 1;
+  int column = 3;
+
+  always_comb parcel.lanes[row][column] = stimulus;
+  assign result = parcel.lanes[1][3] ^ 8'hA5;
+
+  initial begin
+    #1 stimulus = 8'h11;
+    #1 stimulus = 8'h22;
+    #1 stimulus = 8'h33;
+    #1;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(u(&sim, "parcel.lanes[1][3]") & 0xFF, 0x33);
+    assert_eq!(u(&sim, "result") & 0xFF, 0x96);
+}
+
 /// The guard: an ordinary packed-vector bit-write must NOT be diverted into the
 /// element path — `v` is a signal of its own, the discriminator the fix uses.
 #[test]

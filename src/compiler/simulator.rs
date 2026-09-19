@@ -35625,47 +35625,59 @@ impl Simulator {
         })?
     }
 
-    /// Dependency names for a 2-D unpacked-array read `m[i][j]`. Constant
-    /// indices select one element; genuinely dynamic indices retain the
-    /// conservative whole-array dependency required for correctness.
+    /// Dependency names for a fully-indexed multi-dimensional unpacked-array
+    /// read. Constant indices select one element; genuinely dynamic indices
+    /// retain the conservative matching-array dependency required for
+    /// correctness.
     fn multi_dim_elem_names(
         base: &Expression,
         outer_index: &Expression,
         module: &ElaboratedModule,
     ) -> Option<Vec<String>> {
-        let ExprKind::Index {
-            expr: inner,
-            index: inner_index,
-        } = &base.kind
-        else {
-            return None;
-        };
-        let ExprKind::Ident(h) = &inner.kind else {
-            return None;
-        };
+        let mut rev_indices = vec![outer_index];
+        let mut cur = base;
+        while let ExprKind::Index { expr, index } = &cur.kind {
+            rev_indices.push(index);
+            cur = expr;
+        }
+        let ExprKind::Ident(h) = &cur.kind else { return None };
+        rev_indices.reverse();
         let name = Self::resolve_hier_name_static(h, module);
-        let ((a0, a1), (b0, b1), _) = *module.arrays_2d.get(&name)?;
-        let (alo, ahi) = (a0.min(a1), a0.max(a1));
-        let (blo, bhi) = (b0.min(b1), b0.max(b1));
-        if let (Some(a), Some(b)) = (
-            Self::constant_array_index(inner_index, module),
-            Self::constant_array_index(outer_index, module),
-        ) {
-            let in_a = (alo..=ahi).contains(&a);
-            let in_b = (blo..=bhi).contains(&b);
-            return Some(if in_a && in_b {
-                vec![format!("{}[{}][{}]", name, a, b)]
-            } else {
-                Vec::new()
-            });
+        let shape: Vec<(i64, i64)> = if let Some(&(a, b, _)) = module.arrays_2d.get(&name) {
+            vec![a, b]
+        } else {
+            module.arrays_nd.get(&name)?.0.clone()
+        };
+        if rev_indices.len() != shape.len() {
+            return None;
         }
-        let mut out = Vec::new();
-        for a in alo..=ahi {
-            for b in blo..=bhi {
-                out.push(format!("{}[{}][{}]", name, a, b));
+        let choices: Vec<Vec<i64>> = shape
+            .iter()
+            .zip(rev_indices)
+            .map(|(&(left, right), index)| {
+                let lo = left.min(right);
+                let hi = left.max(right);
+                match Self::constant_array_index(index, module) {
+                    Some(i) if (lo..=hi).contains(&i) => vec![i],
+                    Some(_) => Vec::new(),
+                    None => (lo..=hi).collect(),
+                }
+            })
+            .collect();
+        if choices.iter().any(Vec::is_empty) {
+            return Some(Vec::new());
+        }
+        let mut names = vec![name];
+        for dim in choices {
+            let mut next = Vec::with_capacity(names.len().saturating_mul(dim.len()));
+            for prefix in names {
+                for index in &dim {
+                    next.push(format!("{}[{}]", prefix, index));
+                }
             }
+            names = next;
         }
-        Some(out)
+        Some(names)
     }
 
     /// Resolve a collected READ name to a signal id, falling back to
@@ -35926,14 +35938,15 @@ impl Simulator {
                     for e in elems {
                         reads.insert(e);
                     }
-                    if let ExprKind::Index {
+                    let mut cur = base.as_ref();
+                    while let ExprKind::Index {
+                        expr: inner,
                         index: inner_index,
-                        ..
-                    } = &base.kind
-                    {
+                    } = &cur.kind {
                         if Self::constant_array_index(inner_index, module).is_none() {
                             Self::collect_expr_reads(inner_index, module, reads);
                         }
+                        cur = inner;
                     }
                 } else {
                     // Non-Ident base (e.g. nested Index, RangeSelect from inlining
@@ -36221,7 +36234,11 @@ impl Simulator {
             ExprKind::Ident(hier) => {
                 writes.insert(Self::resolve_hier_name_static(hier, module));
             }
-            ExprKind::Index { expr: base, .. } => {
+            ExprKind::Index { expr: base, index } => {
+                if let Some(elems) = Self::multi_dim_elem_names(base, index, module) {
+                    writes.extend(elems);
+                    return;
+                }
                 match &base.kind {
                     ExprKind::Ident(hier) => {
                         let name = Self::resolve_hier_name_static(hier, module);

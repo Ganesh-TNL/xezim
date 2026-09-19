@@ -128,3 +128,29 @@ fn parameter_named_unpacked_dimension_is_a_size_not_an_associative_key() {
     // past the mis-sized bound read z.
     assert_eq!(get(&sim, "driven") & 0xF, 0xF);
 }
+
+/// §9.2.2.2: a reader of a fixed N-dimensional element is sensitive to that
+/// element, just like the established two-dimensional case above.
+#[test]
+fn three_dimensional_element_change_reaches_comb_reader() {
+    let src = r#"
+module tb;
+  logic [7:0] stimulus = '0;
+  logic [7:0] volume [0:0][0:0][0:0];
+  logic [7:0] result;
+
+  always_comb volume[0][0][0] = stimulus;
+  assign result = volume[0][0][0] ^ 8'hA5;
+
+  initial begin
+    #1 stimulus = 8'h11;
+    #1 stimulus = 8'h22;
+    #1 stimulus = 8'h33;
+    #1;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(get(&sim, "volume[0][0][0]") & 0xFF, 0x33);
+    assert_eq!(get(&sim, "result") & 0xFF, 0x96);
+}
