@@ -37,9 +37,9 @@ fn get(sim: &xezim::compiler::Simulator, name: &str) -> u64 {
 
 const SRC: &str = r#"
 module tb;
-  logic a1, b1, a2, b2;
-  logic [7:0] g1, g2;
-  integer n1, n2;
+  logic a1, b1, a2, b2, a3, b3;
+  logic [7:0] g1, g2, g3;
+  integer n1, n2, n3;
 
   // The counter/flag is cleared AFTER the stimulus, in the same process.
   initial begin a1 = 1'b0; b1 = 1'b1; g1 = 0; n1 = 0; end
@@ -51,14 +51,22 @@ module tb;
   always @(*) begin if (a2 ^ b2) g2 = 8'h55; end
   always @(*) begin if (a2 ^ b2) n2 = n2 + 1; end
 
-  logic [7:0] seen_g1, seen_g2;
-  integer seen_n1, seen_n2;
+  // Delayed processes run outside the time-zero edge-dispatch context. A
+  // replayed block may itself perform a blocking write that needs settling.
+  initial begin #1; a3 = 1'b0; b3 = 1'b1; g3 = 0; n3 = 0; end
+  always @(*) begin if (a3 ^ b3) g3 = 8'h55; end
+  always @(*) begin if (a3 ^ b3) n3 = n3 + 1; end
+
+  logic [7:0] seen_g1, seen_g2, seen_g3;
+  integer seen_n1, seen_n2, seen_n3;
   initial begin
     #20;
     seen_g1 = g1;
     seen_g2 = g2;
+    seen_g3 = g3;
     seen_n1 = n1;
     seen_n2 = n2;
+    seen_n3 = n3;
   end
 endmodule
 "#;
@@ -68,7 +76,9 @@ fn comb_output_overwritten_later_in_the_same_process_is_recomputed() {
     let sim = simulate(SRC, 200).expect("simulate failed");
     assert_eq!(get(&sim, "seen_g1") & 0xFF, 0x55);
     assert_eq!(get(&sim, "seen_g2") & 0xFF, 0x55);
+    assert_eq!(get(&sim, "seen_g3") & 0xFF, 0x55);
     // Fires exactly once — a re-run must not turn into a self-retrigger loop.
     assert_eq!(get(&sim, "seen_n1"), 1);
     assert_eq!(get(&sim, "seen_n2"), 1);
+    assert_eq!(get(&sim, "seen_n3"), 1);
 }

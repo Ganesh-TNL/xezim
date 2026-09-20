@@ -176,3 +176,94 @@ endmodule
         msgs
     );
 }
+
+#[test]
+fn selected_locals_in_constant_functions() {
+    let sim = simulate(
+        r#"
+module top;
+  localparam A = rotate_slot(5);
+  localparam B = low_part(21);
+  localparam C = gap_count(5, A, 2);
+  localparam TOTAL = A + B + C;
+
+  function [1:0] rotate_slot(input integer count);
+    integer left;
+    reg [2:0] cursor;
+    begin
+      cursor = 0;
+      left = count;
+      while (left != 0) begin
+        cursor[1:0] = cursor[1:0] - 1'b1;
+        left = left - 1;
+      end
+      rotate_slot = cursor[1:0];
+    end
+  endfunction
+
+  function [3:0] low_part(input integer value);
+    integer temp;
+    begin
+      temp = value;
+      low_part = temp[3:0];
+    end
+  endfunction
+
+  function [3:0] gap_count(
+    input integer needed,
+    input reg [1:0] first,
+    input reg [1:0] last
+  );
+    integer loops;
+    begin
+      loops = 0;
+      while (((4 - first) + last + 4*loops) < needed)
+        loops = loops + 1;
+      gap_count = loops[3:0];
+    end
+  endfunction
+
+  logic [TOTAL-1:0] payload;
+  leaf #(.OFFSET(2)) u_leaf();
+  initial begin
+    $display("SEL=%0d,%0d,%0d,%0d,%0d", A, B, C, TOTAL, $bits(payload));
+    $finish;
+  end
+endmodule
+
+module leaf #(parameter integer OFFSET = 0);
+  localparam SLOT = derive_slot(OFFSET);
+  localparam integer COUNT = 5;
+
+  function [1:0] derive_slot(input integer adjustment);
+    integer left;
+    reg [2:0] cursor;
+    begin
+      cursor = adjustment;
+      left = COUNT;
+      while (left != 0) begin
+        cursor[1:0] = cursor[1:0] - 1'b1;
+        left = left - 1;
+      end
+      derive_slot = cursor[1:0];
+    end
+  endfunction
+
+  initial $display("FWD=%0d", SLOT);
+endmodule
+"#,
+        100,
+    )
+    .expect("sim");
+    let msgs = messages(&sim);
+    assert!(
+        msgs.iter().any(|m| m == "SEL=3,5,1,9,9"),
+        "selected-local constant evaluation mismatch; output: {:?}",
+        msgs
+    );
+    assert!(
+        msgs.iter().any(|m| m == "FWD=1"),
+        "caller-scope constant dependency mismatch; output: {:?}",
+        msgs
+    );
+}

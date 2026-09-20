@@ -41853,10 +41853,11 @@ impl Simulator {
             return;
         }
         let mut pending = std::mem::take(&mut self.deferred_comb);
-        let entries = std::mem::take(&mut self.comb_entries);
         for (eidx, snap) in pending.iter() {
             let eidx = *eidx;
-            let Some(entry) = entries.get(eidx) else { continue };
+            // Clone only the uncommon replayed entry. Keeping the canonical
+            // table installed lets a blocking write settle recursively.
+            let Some(entry) = self.comb_entries.get(eidx).cloned() else { continue };
             let clobbered = snap.iter().any(|(id, v)| {
                 self.signal_table.get(*id).is_some_and(|cur| cur != v)
             });
@@ -41864,7 +41865,7 @@ impl Simulator {
                 continue;
             }
             match &entry.item {
-                CombItem::AlwaysBlock { .. } => self.eval_ast_comb_entry(entry),
+                CombItem::AlwaysBlock { .. } => self.eval_ast_comb_entry(&entry),
                 CombItem::CompiledAlwaysBlock { compiled, .. } => {
                     if self.vm_regs.len() < compiled.num_regs as usize {
                         self.vm_regs
@@ -41896,7 +41897,6 @@ impl Simulator {
                 _ => {}
             }
         }
-        self.comb_entries = entries;
         for (_, v) in pending.iter_mut() {
             v.clear();
         }
