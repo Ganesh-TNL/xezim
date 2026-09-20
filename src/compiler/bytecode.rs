@@ -8534,8 +8534,18 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some(r) = self.compile_string_method(func, args, expr.span) {
                     return Some(r);
                 }
-                self.compile_pure_call(func, args, ctx_width)
-                    .or_else(|| self.emit_expr_fallback(expr, ctx_width, "Expr_Call_impure"))
+                // Pure-call inlining is speculative. A body can compile a
+                // prefix (including placeholder branches) before an
+                // unsupported local lvalue makes it fall back. Do not leave
+                // that incomplete prefix in the caller's instruction stream.
+                let start = self.insns.len();
+                let first_reg = self.next_reg;
+                if let Some(r) = self.compile_pure_call(func, args, ctx_width) {
+                    return Some(r);
+                }
+                self.insns.truncate(start);
+                self.next_reg = first_reg;
+                self.emit_expr_fallback(expr, ctx_width, "Expr_Call_impure")
             }
             other => {
                 let n: &'static str = match other {

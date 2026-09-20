@@ -227,5 +227,7 @@ mod package_and_unit_delays_scale_by_timescale;
 mod clocking_cont_trigger_same_step;
 #[path = "scheduling/intra_assignment_delay_in_always.rs"]
 mod intra_assignment_delay_in_always;
+#[path = "scheduling/inlined_call_rollback.rs"]
+mod inlined_call_rollback;
 #[path = "scheduling/delay_always_compound_body.rs"]
 mod delay_always_compound_body;
