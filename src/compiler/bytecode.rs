@@ -2752,6 +2752,7 @@ impl<'a> BytecodeCompiler<'a> {
         if Self::expr_has_sampled_value_call(e) {
             return None;
         }
+        self.trace_fallback_site(reason, e.span, "expr");
         let r = self.alloc_reg();
         self.emit(Insn::EvalExprFallback(
             Box::new((Arc::new(e.clone()), Arc::from(reason))),
@@ -2759,6 +2760,33 @@ impl<'a> BytecodeCompiler<'a> {
             ctx_width,
         ));
         Some(r)
+    }
+
+    /// `XEZIM_FALLBACK_SITES=1`: report every construct the compiler hands
+    /// to the AST interpreter, as `reason`, source byte span and enclosing
+    /// scope. A fallback inside a loop costs microseconds per execution and
+    /// forces the whole loop onto the interpreter, so on a slow design this
+    /// names the statements worth compiling — the `[PROF] fallback_reason`
+    /// counters say how much they cost, this says where they are.
+    fn trace_fallback_site(&mut self, reason: &str, span: crate::ast::Span, what: &str) {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        let on = *ON.get_or_init(|| {
+            std::env::var("XEZIM_FALLBACK_SITES")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false)
+        });
+        if !on {
+            return;
+        }
+        eprintln!(
+            "[FALLBACK] {} reason={} bytes={}..{} scope={}",
+            what,
+            reason,
+            span.start,
+            span.end,
+            self.scope_hint.as_deref().unwrap_or("-")
+        );
     }
 
     fn emit_fallback(&mut self, stmt: &Statement) -> bool {
@@ -2776,6 +2804,7 @@ impl<'a> BytecodeCompiler<'a> {
             let reason = self
                 .bail_reason
                 .unwrap_or_else(|| Self::stmt_kind_label(stmt));
+            self.trace_fallback_site(reason, stmt.span, "stmt");
             self.emit(Insn::StmtFallback(Box::new((
                 Arc::new(stmt.clone()),
                 Arc::from(reason),
@@ -8631,6 +8660,303 @@ impl<'a> BytecodeCompiler<'a> {
         Some((self.array_operand(name), idx_reg, hi_reg, lo_reg, resized))
     }
 
+    /// A packed lvalue PATH that mixes several dynamic steps:
+    /// `sig[i][j]`, `sig[i].m`, `sig[i][hi:lo]`, `sig[i][b +: w]` and the
+    /// dotted-member roots those accept (`s.arr[i].f`).
+    ///
+    /// Each store arm above resolves ONE dynamic component and bails on a
+    /// combination — and a bail demotes the whole statement, plus any loop
+    /// holding it, to the AST interpreter. The levels compose arithmetically:
+    /// an index contributes `slot * <width of what it selects>`, a member its
+    /// static field offset, a part-select its low bound. Summing them gives
+    /// one dynamic bit offset into the ROOT signal, which the existing
+    /// dynamic-range stores take as-is.
+    ///
+    /// Returns `(root signal id, lo-bit register, width)`, or `None` when a
+    /// level is not statically resolvable — the caller's bail then stands.
+    /// An x/z index poisons the offset arithmetic, so the dynamic-range store
+    /// discards the write exactly as the single-level arms do (§11.5.1).
+    fn packed_path_dyn_range(&mut self, lhs: &Expression) -> Option<(usize, RegId, u32)> {
+        // A member or part-select may only sit at the LEAF; everything above
+        // it must be an index chain over a packed root.
+        let mut tail_member: Option<&str> = None;
+        let mut tail_range: Option<(&Expression, &Expression, &RangeKind)> = None;
+        let mut cur = lhs;
+        match &cur.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                tail_member = Some(member.name.as_str());
+                cur = expr;
+            }
+            ExprKind::RangeSelect {
+                expr,
+                left,
+                right,
+                kind,
+            } => {
+                tail_range = Some((left, right, kind));
+                cur = expr;
+            }
+            _ => {}
+        }
+        let mut idx_nodes: Vec<&Expression> = Vec::new();
+        while let ExprKind::Index { expr, .. } = &cur.kind {
+            idx_nodes.push(cur);
+            cur = expr;
+        }
+        if idx_nodes.is_empty() {
+            // Single-level shapes already have their own arms.
+            return None;
+        }
+        idx_nodes.reverse();
+        let ExprKind::Ident(hier) = &cur.kind else {
+            return None;
+        };
+        // Unpacked arrays, associative arrays and collections keep their own
+        // stores — this is the packed-vector path only.
+        if self.lookup_array_name(hier).is_some()
+            || self.is_multi_dim_array(hier)
+            || self.is_assoc_target(hier)
+            || self.collection_store_denied(hier)
+        {
+            return None;
+        }
+        // The root is either a signal of its own or a member of one: a
+        // struct member (`hc.lane_dec`) has no signal, only a bit range
+        // inside its carrier, so start the offset at that range's base.
+        let (id, mut const_off, member_w) = match self.lookup_signal_id(hier) {
+            Some(id) => (id, 0u32, None),
+            None => {
+                let (base_id, off, mw) = self.packed_struct_member_target(hier)?;
+                (base_id, off, Some(mw))
+            }
+        };
+        let dims: Vec<(i64, i64)> = self.packed_full_dims_of(hier)?.clone();
+        if dims.is_empty() || dims.len() < idx_nodes.len() {
+            return None;
+        }
+        // Strides come from the DECLARED dimensions, not from
+        // `infer_lhs_width` of the sub-expression: width inference does not
+        // model these nested selects (it answers 32 for `q[i][j]`), which is
+        // why they reach this path at all. `packed_full_dims_of` lists every
+        // packed dimension down to the bit, element types included, so the
+        // stride of level k is the product of the dimensions below it and the
+        // product of them all must be the signal's width — if it is not, the
+        // layout is something this arithmetic does not describe.
+        let counts: Vec<u64> = dims
+            .iter()
+            .map(|&(l, r)| (l.max(r) - l.min(r) + 1) as u64)
+            .collect();
+        let root_w = match member_w {
+            Some(mw) => mw as u64,
+            None => self.infer_lhs_width(cur) as u64,
+        };
+        if root_w == 0 || counts.iter().product::<u64>() != root_w {
+            return None;
+        }
+        let stride = |k: usize| -> u64 { counts[k + 1..].iter().product::<u64>() };
+        // §7.4.1: an ascending dimension mirrors its labels. Those bases are
+        // AST-only everywhere else in this compiler; keep it that way rather
+        // than introduce a second mapping rule here.
+        if dims
+            .iter()
+            .take(idx_nodes.len())
+            .any(|&d| Self::dim_is_ascending(Some(d)))
+        {
+            return None;
+        }
+
+        let mut acc: Option<RegId> = None;
+        let mut add_term = |c: &mut Self, term: RegId, acc: &mut Option<RegId>| match *acc {
+            None => *acc = Some(term),
+            Some(a) => {
+                let sum = c.alloc_reg();
+                c.emit(Insn::Add(sum, a, term));
+                *acc = Some(sum);
+            }
+        };
+        for (level, node) in idx_nodes.iter().enumerate() {
+            let ExprKind::Index { index, .. } = &node.kind else {
+                return None;
+            };
+            // The width of what THIS index selects is the stride of the level.
+            let elem_w = u32::try_from(stride(level)).ok()?;
+            if elem_w == 0 {
+                return None;
+            }
+            if let Some(k) = self.eval_const_bound(index) {
+                let lsb = Self::packed_elem_lsb(Some(dims[level]), k, elem_w);
+                if lsb < 0 {
+                    return None;
+                }
+                const_off = const_off.checked_add(u32::try_from(lsb).ok()?)?;
+                continue;
+            }
+            let idx_reg = self.compile_expr(index, 0)?;
+            let slot = self.emit_packed_slot_index(Some(dims[level]), idx_reg);
+            let term = if elem_w == 1 {
+                slot
+            } else {
+                let w_reg = self.alloc_reg();
+                self.emit(Insn::LoadConst(
+                    w_reg,
+                    Box::new(Value::from_u64(elem_w as u64, 32)),
+                ));
+                let t = self.alloc_reg();
+                self.emit(Insn::Mul(t, slot, w_reg));
+                t
+            };
+            add_term(self, term, &mut acc);
+        }
+
+        let width = if let Some(m) = tail_member {
+            // The layout map holds the ELEMENT struct's fields for an
+            // array-of-struct signal (as `packed_array_member_store` uses it).
+            let (_, fields) = self.packed_struct_layout_for_hier(hier)?;
+            let &(_, off, mw) = fields.iter().find(|(n, _, _)| n == m)?;
+            if mw == 0 {
+                return None;
+            }
+            const_off = const_off.checked_add(off)?;
+            mw
+        } else if let Some((left, right, kind)) = tail_range {
+            match kind {
+                RangeKind::Constant => {
+                    let hi = self.eval_const_bound(left)?;
+                    let lo = self.eval_const_bound(right)?;
+                    if lo < 0 || hi < lo {
+                        return None;
+                    }
+                    const_off = const_off.checked_add(u32::try_from(lo).ok()?)?;
+                    u32::try_from(hi - lo + 1).ok()?
+                }
+                RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                    let w = self.fold_const(right).and_then(|v| v.to_u64()).filter(|&w| w > 0)?;
+                    let w = u32::try_from(w).ok()?;
+                    if let Some(b) = self.eval_const_bound(left) {
+                        // `b -: w` runs down from b, so its low bit is b-w+1.
+                        let lo = if matches!(kind, RangeKind::IndexedUp) {
+                            b
+                        } else {
+                            b - (w as i64) + 1
+                        };
+                        if lo < 0 {
+                            return None;
+                        }
+                        const_off = const_off.checked_add(u32::try_from(lo).ok()?)?;
+                    } else {
+                        let base = self.compile_expr(left, 0)?;
+                        let lo_reg = if matches!(kind, RangeKind::IndexedUp) {
+                            base
+                        } else {
+                            let d = self.alloc_reg();
+                            self.emit(Insn::LoadConst(
+                                d,
+                                Box::new(Value::from_u64((w - 1) as u64, 32)),
+                            ));
+                            let out = self.alloc_reg();
+                            self.emit(Insn::Sub(out, base, d));
+                            out
+                        };
+                        add_term(self, lo_reg, &mut acc);
+                    }
+                    w
+                }
+                _ => return None,
+            }
+        } else {
+            u32::try_from(stride(idx_nodes.len() - 1)).ok()?
+        };
+        if width == 0 {
+            return None;
+        }
+
+        let lo_reg = match acc {
+            None => {
+                let r = self.alloc_reg();
+                self.emit(Insn::LoadConst(
+                    r,
+                    Box::new(Value::from_u64(const_off as u64, 32)),
+                ));
+                r
+            }
+            Some(a) if const_off == 0 => a,
+            Some(a) => {
+                let c = self.alloc_reg();
+                self.emit(Insn::LoadConst(
+                    c,
+                    Box::new(Value::from_u64(const_off as u64, 32)),
+                ));
+                let sum = self.alloc_reg();
+                self.emit(Insn::Add(sum, a, c));
+                sum
+            }
+        };
+        Some((id, lo_reg, width))
+    }
+
+    /// `(hi, lo)` registers and the value resized to `width`, for the dynamic
+    /// range stores that `packed_path_dyn_range` feeds.
+    fn packed_path_store_regs(
+        &mut self,
+        lo_reg: RegId,
+        width: u32,
+        val_reg: RegId,
+    ) -> (RegId, RegId) {
+        let resized = self.alloc_reg();
+        self.emit(Insn::Move(resized, val_reg));
+        self.emit(Insn::Resize(resized, width));
+        let hi_reg = if width == 1 {
+            lo_reg
+        } else {
+            let d = self.alloc_reg();
+            self.emit(Insn::LoadConst(
+                d,
+                Box::new(Value::from_u64((width - 1) as u64, 32)),
+            ));
+            let hi = self.alloc_reg();
+            self.emit(Insn::Add(hi, lo_reg, d));
+            hi
+        };
+        (hi_reg, resized)
+    }
+
+    /// Try the composed packed path, emitting `store` on success. The
+    /// resolver emits address arithmetic as it descends, so a level it cannot
+    /// resolve must leave NOTHING behind: the instruction stream, the register
+    /// counter and the bail reason are all restored before returning false.
+    fn try_packed_path(
+        &mut self,
+        lhs: &Expression,
+        val_reg: RegId,
+        nba: bool,
+    ) -> bool {
+        let start = self.insns.len();
+        let start_reg = self.next_reg;
+        let saved_reason = self.bail_reason;
+        if let Some((id, lo_reg, w)) = self.packed_path_dyn_range(lhs) {
+            let (hi_reg, resized) = self.packed_path_store_regs(lo_reg, w, val_reg);
+            let sig = as_sig_id(id);
+            self.emit(if nba {
+                Insn::NbaAssignRangeDyn(sig, hi_reg, lo_reg, resized)
+            } else {
+                Insn::BlockingAssignRangeDyn(sig, hi_reg, lo_reg, resized)
+            });
+            return true;
+        }
+        self.insns.truncate(start);
+        self.next_reg = start_reg;
+        self.bail_reason = saved_reason;
+        false
+    }
+
+    fn try_packed_path_nba(&mut self, lhs: &Expression, val_reg: RegId) -> bool {
+        self.try_packed_path(lhs, val_reg, true)
+    }
+
+    fn try_packed_path_blocking(&mut self, lhs: &Expression, val_reg: RegId) -> bool {
+        self.try_packed_path(lhs, val_reg, false)
+    }
+
     fn compile_nba_target(&mut self, lhs: &Expression, val_reg: RegId, width: u32) -> bool {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
@@ -8747,6 +9073,9 @@ impl<'a> BytecodeCompiler<'a> {
                         self.compile_2d_flat_index(hier, i_expr, j_expr)
                 {
                     self.emit(Insn::NbaAssignArray(array, flat, val_reg, width));
+                    return true;
+                }
+                if self.try_packed_path_nba(lhs, val_reg) {
                     return true;
                 }
                 self.bail("nba_index_other");
@@ -8969,6 +9298,9 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                 }
+                if self.try_packed_path_nba(lhs, val_reg) {
+                    return true;
+                }
                 self.bail("nba_range_unresolved");
                 false
             }
@@ -9020,6 +9352,9 @@ impl<'a> BytecodeCompiler<'a> {
                     self.emit(Insn::NbaAssignArrayRange(
                         array, idx_reg, hi_reg, lo_reg, resized,
                     ));
+                    return true;
+                }
+                if self.try_packed_path_nba(lhs, val_reg) {
                     return true;
                 }
                 self.bail("nba_member_access");
@@ -9360,6 +9695,9 @@ impl<'a> BytecodeCompiler<'a> {
                         return true;
                     }
                 }
+                if self.try_packed_path_blocking(lhs, val_reg) {
+                    return true;
+                }
                 self.bail("blocking_target");
                 false
             }
@@ -9644,6 +9982,9 @@ impl<'a> BytecodeCompiler<'a> {
                             }
                         }
                     }
+                }
+                if self.try_packed_path_blocking(lhs, val_reg) {
+                    return true;
                 }
                 self.bail("blocking_target");
                 false

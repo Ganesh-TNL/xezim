@@ -386,3 +386,5 @@ mod nettype_struct_variable_driver;
 mod struct_named_pattern_continuous_assign;
 #[path = "types/grouped_class_fields.rs"]
 mod grouped_class_fields;
+#[path = "types/packed_path_dynamic_stores.rs"]
+mod packed_path_dynamic_stores;

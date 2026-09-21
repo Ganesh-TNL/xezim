@@ -97,6 +97,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_EVENT_EDGE_HEAL", "Event-edge engine: re-arm/heal mode for missed gateable flops"),
     ("XEZIM_EVENT_EDGE_MEASURE", "Event-edge engine: measure gateable-flop skip effectiveness"),
     ("XEZIM_EV_DBG", "Debug: trace named-event trigger/wait matching"),
+    ("XEZIM_FALLBACK_SITES", "Report each construct handed to the AST interpreter: reason, source byte span, scope"),
     ("XEZIM_FOLD_CONST_REGS", "Bytecode: set to 0 to disable register constant propagation (constant add chains, static bit indexes)"),
     ("XEZIM_FOLD_CONST_STATS", "Bytecode: print per-block register constant-folding counts"),
     ("XEZIM_FORCE_PARALLEL", "Parallel: force parallel dispatch even below thresholds"),

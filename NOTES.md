@@ -129,6 +129,16 @@ and the development workflow are in [README.md](README.md).
 
 **Performance** (instruction counts, output identical)
 
+* Writes that combine two dynamic steps into a packed vector now compile
+  instead of falling back to the interpreter: `q[i][j]`, `mem[a][(i*W) +: W]`,
+  `s.arr[i].field` and their blocking forms, with either index dynamic. A
+  fallback inside a loop over a register-held variable demotes the whole loop,
+  so these statements cost microseconds each; a memory model built from them
+  runs 41x faster here, and a c906 run is unchanged.
+* `XEZIM_FALLBACK_SITES=1` reports every construct handed to the interpreter
+  with its reason, source byte span and scope, so the statements worth
+  compiling on a slow design can be found without guessing.
+
 * A compiled stimulus process (the default for clocked initial-block loops)
   now runs its wait-to-wait segments on the two-state executor: waits are
   opcodes that suspend the executor, the process keeps its own two-state
