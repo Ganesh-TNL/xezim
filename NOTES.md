@@ -153,6 +153,13 @@ and the development workflow are in [README.md](README.md).
   c906 SoC only 618 of 3605 blocks could skip, and 55 million flop fires that
   used to be skipped ran. Merging is now worth 6.9% on that design instead of
   costing 18%.
+* Starting a design with large memories is faster again: deciding which
+  clocked blocks may skip idle edges asked a hash map, once per element of
+  every memory a block writes, whether anything else wrote it. A c906 SoC
+  spent 1.8 seconds and several hundred megabytes on 19 million of those
+  questions; one byte per signal answers them now, and whole arrays are
+  counted as ranges. The pass went from 2.8 seconds to 30 milliseconds and a
+  c906 run drops another 4%.
 * Designs with large memory arrays start simulating sooner: the pass that
   decides which clocked blocks may skip idle edges named every element of
   every memory a block writes, one string per element, and then read names it

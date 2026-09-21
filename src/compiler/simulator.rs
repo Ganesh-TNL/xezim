@@ -80284,7 +80284,18 @@ if self.profile_report {
         // edge process drives it. Count per-block writers, not instructions:
         // several conditional assignments in one process are still one owner.
         let mut block_writes = vec![HashSet::default(); nb];
-        let mut writer_counts: HashMap<usize, usize> = HashMap::default();
+        // A whole-array write is kept as its element RANGE. Expanding it to
+        // ids cost 19M hash inserts on a c906 SoC (1.8 s, ~400 MB) only to
+        // ask "does anything else write this"; the counter below answers that
+        // from a byte per signal, and the ranges are scanned in place.
+        let mut block_arrays: Vec<Vec<(usize, usize)>> = vec![Vec::new(); nb];
+        // Saturating at two: the only question asked of it is `> 1`.
+        let mut writer_counts = vec![0u8; self.signal_widths.len()];
+        let bump = |counts: &mut Vec<u8>, id: usize| {
+            if let Some(c) = counts.get_mut(id) {
+                *c = c.saturating_add(1);
+            }
+        };
         let top_prefix = format!("{}.", self.module.name);
         let retired: Vec<bool> = {
             let mut v = self.edge_block_retired.clone();
@@ -80350,9 +80361,8 @@ if self.profile_report {
                         .copied();
                     match ids {
                         Some((first, lo, hi)) => {
-                            for k in 0..=(hi - lo).max(0) {
-                                block_writes[bi].insert(first + k as usize);
-                            }
+                            let len = ((hi - lo).max(0) as usize).saturating_add(1);
+                            block_arrays[bi].push((first, len));
                         }
                         // Not a dense array after all: fall back to the
                         // per-element names, which is what this path did
@@ -80372,12 +80382,18 @@ if self.profile_report {
                 }
             }
             for &id in &block_writes[bi] {
-                *writer_counts.entry(id).or_default() += 1;
+                bump(&mut writer_counts, id);
+            }
+            for &(first, len) in &block_arrays[bi] {
+                let end = first.saturating_add(len).min(writer_counts.len());
+                for c in &mut writer_counts[first.min(end)..end] {
+                    *c = c.saturating_add(1);
+                }
             }
         }
         for entry in &self.comb_entries {
             for &id in &entry.cold.write_signal_ids {
-                *writer_counts.entry(id).or_default() += 1;
+                bump(&mut writer_counts, id);
             }
         }
         let mut data_reads: Vec<Vec<u32>> = vec![Vec::new(); nb];
@@ -80546,7 +80562,13 @@ if self.profile_report {
             if has_wide && !self.armed_edge {
                 gate_census[6] += 1;
             }
-            let shared_output = block_writes[bi].iter().any(|id| writer_counts[id] > 1);
+            let shared_output = block_writes[bi]
+                .iter()
+                .any(|&id| writer_counts.get(id).is_some_and(|&c| c > 1))
+                || block_arrays[bi].iter().any(|&(first, len)| {
+                    let end = first.saturating_add(len).min(writer_counts.len());
+                    writer_counts[first.min(end)..end].iter().any(|&c| c > 1)
+                });
             gateable[bi] = !dynamic && !opaque && !shared_output && (!has_wide || self.armed_edge);
             wide_read[bi] = has_wide;
             data_reads[bi] = reads;
