@@ -26326,6 +26326,19 @@ impl Simulator {
                     );
                 }
                 // Fused load+select (finish() peephole).
+                Insn::LoadSignalRangeDyn(d, sig_id, lo_reg, w) => {
+                    // §11.5.1: an x/z offset selects nothing — whole-x at the
+                    // slice's width. Otherwise read the slice in place; the
+                    // signal is never copied.
+                    let lo_v = &vm_regs[*lo_reg as usize];
+                    vm_regs[*d as usize] = match lo_v.to_index() {
+                        Some(lo) => {
+                            let lo = lo as i32 as i64;
+                            oob_range_select(&signal_table[*sig_id as usize], lo + *w as i64 - 1, lo)
+                        }
+                        None => Value::new(*w),
+                    };
+                }
                 Insn::LoadSignalRange(d, sig_id, l, r) => {
                     let sig_id = &(*sig_id as usize);
                     // §11.5.1: a select past the signal's MSB is partially
@@ -27032,6 +27045,19 @@ impl Simulator {
                     );
                 }
                 // Fused load+select (finish() peephole).
+                Insn::LoadSignalRangeDyn(d, sig_id, lo_reg, w) => {
+                    // §11.5.1: an x/z offset selects nothing — whole-x at the
+                    // slice's width. Otherwise read the slice in place; the
+                    // signal is never copied.
+                    let lo_v = &vm_regs[*lo_reg as usize];
+                    vm_regs[*d as usize] = match lo_v.to_index() {
+                        Some(lo) => {
+                            let lo = lo as i32 as i64;
+                            oob_range_select(&view[*sig_id as usize], lo + *w as i64 - 1, lo)
+                        }
+                        None => Value::new(*w),
+                    };
+                }
                 Insn::LoadSignalRange(d, sig_id, l, r) => {
                     let sig_id = &(*sig_id as usize);
                     // §11.5.1: a select past the MSB is partially out of range.
@@ -28526,6 +28552,23 @@ impl Simulator {
                 }
                 // Fused load+select (finish() peephole): slice straight out of
                 // the signal — no whole-Value copy into a register first.
+                Insn::LoadSignalRangeDyn(d, sig_id, lo_reg, w) => {
+                    // §11.5.1: an x/z offset selects nothing — whole-x at the
+                    // slice's width. Otherwise read the slice in place.
+                    let lo_v = &self.vm_regs[*lo_reg as usize];
+                    let out = match lo_v.to_index() {
+                        Some(lo) => {
+                            let lo = lo as i32 as i64;
+                            oob_range_select(
+                                &self.signal_table[*sig_id as usize],
+                                lo + *w as i64 - 1,
+                                lo,
+                            )
+                        }
+                        None => Value::new(*w),
+                    };
+                    self.vm_regs[*d as usize] = out;
+                }
                 Insn::LoadSignalRange(d, sig_id, l, r) => {
                     let sig_id = &(*sig_id as usize);
                     let (d, l, r) = (*d as usize, *l as usize, *r as usize);
@@ -40923,6 +40966,7 @@ impl Simulator {
     fn edge_opcode_name(insn: &super::bytecode::Insn) -> &'static str {
         use super::bytecode::Insn;
         match insn {
+            Insn::LoadSignalRangeDyn(..) => "LoadRngDyn",
             Insn::WaitDelayReg(..) => "WaitDly",
             Insn::WaitEdge(..) => "WaitEdge",
             Insn::CaseLut(..) => "CaseLut",

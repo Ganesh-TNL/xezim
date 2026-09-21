@@ -153,6 +153,12 @@ and the development workflow are in [README.md](README.md).
   c906 SoC only 618 of 3605 blocks could skip, and 55 million flop fires that
   used to be skipped ran. Merging is now worth 6.9% on that design instead of
   costing 18%.
+* Reading an element of a packed memory no longer copies the whole memory.
+  `mem[addr]` on a `logic [N-1:0][W-1:0]` loaded every bit of `mem` into a
+  register and selected the word from that, so each read cost as much as the
+  memory is big: a 16x deeper memory cost 3x per read. The slice is taken
+  where it lies now, read cost is flat in the memory's size, and a
+  32-port read benchmark runs 42% faster.
 * Starting a design with large memories is faster again: deciding which
   clocked blocks may skip idle edges asked a hash map, once per element of
   every memory a block writes, whether anything else wrote it. A c906 SoC

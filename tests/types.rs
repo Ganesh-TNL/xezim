@@ -390,3 +390,5 @@ mod grouped_class_fields;
 mod packed_path_dynamic_stores;
 #[path = "types/select_label_mapping.rs"]
 mod select_label_mapping;
+#[path = "types/packed_memory_read.rs"]
+mod packed_memory_read;

@@ -426,6 +426,12 @@ pub enum Insn {
     /// `Wide` storage (1 byte/bit) into a VM register only to slice a few
     /// bits out. Also removes one dispatch + one 32-byte register write.
     LoadSignalRange(RegId, SigId, u32, u32), // (dest, signal_id, left, right)
+    /// `dest = signal[lo +: width]` with a RUNTIME low bound, read straight
+    /// out of the signal. The packed-element read this replaces loaded the
+    /// WHOLE signal into a register and sliced that, so one read of a packed
+    /// memory copied the entire memory and its cost grew with the memory's
+    /// size (3x per read on a 16x deeper array).
+    LoadSignalRangeDyn(RegId, SigId, RegId, u32), // (dest, signal_id, lo_reg, width)
     /// Fused `LoadSignal` + `BitSelectConst`: dest = signal_table[sig][index].
     LoadSignalBit(RegId, SigId, u32), // (dest, signal_id, index)
 
@@ -606,6 +612,10 @@ impl Insn {
             | BlockingAssign(_, a, _)
             | BlockingAssignRange(_, _, _, a)
             | BlockingAssignString(_, a) => *a += rb,
+            LoadSignalRangeDyn(a, _, b, _) => {
+                *a += rb;
+                *b += rb;
+            }
             Move(a, b)
             | MoveResize(a, b, _)
             | BitNot(a, b)
@@ -763,6 +773,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::BranchUnlessZero(..) => "BrNz",
         Insn::LoadSignalBit(..) => "LoadBit",
         Insn::LoadSignalRange(..) => "LoadRng",
+        Insn::LoadSignalRangeDyn(..) => "LoadRngDyn",
         Insn::LoadArrayElem(..) => "LoadArr",
         Insn::BlockingAssign(..) => "Assign",
         Insn::BlockingAssignRange(..) => "AssignRng",
@@ -7725,7 +7736,6 @@ impl<'a> BytecodeCompiler<'a> {
                     // and writes stay symmetric.
                     let elem_w = self.packed_elem_width_of(hier);
                     if let Some(elem_w) = elem_w {
-                        let base = self.compile_expr(expr, 0)?;
                         // Constant index (the common case — genvar-unrolled
                         // `idx_nodes[n] = idx_lut[k]` in rr_arb_tree/lzc, and
                         // any literal `b[4]`): emit a CONSTANT-range slice.
@@ -7738,6 +7748,7 @@ impl<'a> BytecodeCompiler<'a> {
                         // never forwards" root cause: the arbiter's selected
                         // index came out X.)
                         if let Some(idx) = self.eval_const_expr(index) {
+                            let base = self.compile_expr(expr, 0)?;
                             let lo = Self::packed_elem_lsb(
                                 self.packed_outer_dim(hier),
                                 idx as i64,
@@ -7749,6 +7760,10 @@ impl<'a> BytecodeCompiler<'a> {
                             self.emit(Insn::RangeSelectConst(dest, base, hi, lo));
                             return Some(dest);
                         }
+                        // The element sits at a runtime offset inside the
+                        // signal: slice it in place rather than copying the
+                        // whole signal (a memory) into a register first.
+                        let sig = self.lookup_signal_id(hier);
                         let idx_reg = self.compile_expr(index, 0)?;
                         // §7.4.1: normalize a DYNAMIC index against the
                         // declared outer range, exactly like the constant
@@ -7767,6 +7782,17 @@ impl<'a> BytecodeCompiler<'a> {
                         ));
                         let lo_reg = self.alloc_reg();
                         self.emit(Insn::Mul(lo_reg, idx_reg, elem_w_reg));
+                        if let Some(id) = sig {
+                            let dest = self.alloc_reg();
+                            self.emit(Insn::LoadSignalRangeDyn(
+                                dest,
+                                as_sig_id(id),
+                                lo_reg,
+                                elem_w,
+                            ));
+                            return Some(dest);
+                        }
+                        let base = self.compile_expr(expr, 0)?;
                         let em1_reg = self.alloc_reg();
                         self.emit(Insn::LoadConst(
                             em1_reg,
@@ -11068,6 +11094,7 @@ impl<'a> BytecodeCompiler<'a> {
             Insn::Format(_, f) => f.args.contains(&r),
             Insn::StrOp(_, _, args) => args.contains(&r),
             Insn::BlockingAssignString(_, v) => *v == r,
+            Insn::LoadSignalRangeDyn(_, _, lo, _) => *lo == r,
             Insn::LoadConst(..)
             | Insn::LoadSignal(..)
             | Insn::LoadSignalSigned(..)
@@ -12456,6 +12483,10 @@ impl<'a> BytecodeCompiler<'a> {
                 // `range_select_zext`'s guard against an underflowed index,
                 // which returns a bounded all-X value instead; `ok` excludes
                 // exactly the widths that can reach it.
+                Insn::LoadSignalRangeDyn(d, _, _, w) => {
+                    let f = ok(*w).map(|w| (w, true));
+                    store(&mut rw, *d, f);
+                }
                 Insn::LoadSignalRange(d, _, l, r) | Insn::RangeSelectConst(d, _, l, r) => {
                     let f = l
                         .abs_diff(*r)
