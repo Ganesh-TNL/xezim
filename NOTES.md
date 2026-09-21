@@ -138,6 +138,12 @@ and the development workflow are in [README.md](README.md).
 * `XEZIM_FALLBACK_SITES=1` reports every construct handed to the interpreter
   with its reason, source byte span and scope, so the statements worth
   compiling on a slow design can be found without guessing.
+* Designs with large memory arrays start simulating sooner: the pass that
+  decides which clocked blocks may skip idle edges named every element of
+  every memory a block writes, one string per element, and then read names it
+  discarded. A c906 SoC spent 33 seconds there, a second per one-million-entry
+  SRAM; that is now arithmetic on the element range, with the same skip
+  decisions. The whole run drops 36% of its instructions.
 
 * A compiled stimulus process (the default for clocked initial-block loops)
   now runs its wait-to-wait segments on the two-state executor: waits are

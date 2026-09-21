@@ -36229,6 +36229,19 @@ impl Simulator {
         module: &ElaboratedModule,
         writes: &mut HashSet<String>,
     ) {
+        Self::collect_lhs_writes_ex(lhs, module, writes, None)
+    }
+
+    /// Whole-array writes report the ARRAY when `arrays` is given, instead of
+    /// one interned name per element: a 1M-entry memory produced a million
+    /// `String`s here, which the caller turned straight back into a
+    /// contiguous id range (0.75 s per SRAM block on a c906 SoC).
+    fn collect_lhs_writes_ex(
+        lhs: &Expression,
+        module: &ElaboratedModule,
+        writes: &mut HashSet<String>,
+        mut arrays: Option<&mut HashSet<String>>,
+    ) {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
                 writes.insert(Self::resolve_hier_name_static(hier, module));
@@ -36242,8 +36255,12 @@ impl Simulator {
                     ExprKind::Ident(hier) => {
                         let name = Self::resolve_hier_name_static(hier, module);
                         if let Some((lo, hi, _)) = module.arrays.get(&name) {
-                            for i in *lo..=*hi {
-                                writes.insert(format!("{}[{}]", name, i));
+                            if let Some(a) = arrays.as_deref_mut() {
+                                a.insert(name);
+                            } else {
+                                for i in *lo..=*hi {
+                                    writes.insert(format!("{}[{}]", name, i));
+                                }
                             }
                         } else {
                             writes.insert(name);
@@ -36262,7 +36279,7 @@ impl Simulator {
                     // FIX: nested Index/RangeSelect (from inlining sliced port
                     // connections) — recurse to find the underlying signal so
                     // the write is correctly tracked.
-                    _ => Self::collect_lhs_writes(base, module, writes),
+                    _ => Self::collect_lhs_writes_ex(base, module, writes, arrays.as_deref_mut()),
                 }
             }
             ExprKind::MemberAccess { expr, member } => {
@@ -36276,11 +36293,11 @@ impl Simulator {
                 }
             }
             ExprKind::RangeSelect { expr: base, .. } => {
-                Self::collect_lhs_writes(base, module, writes)
+                Self::collect_lhs_writes_ex(base, module, writes, arrays.as_deref_mut())
             }
             ExprKind::Concatenation(exprs) => {
                 for e in exprs {
-                    Self::collect_lhs_writes(e, module, writes);
+                    Self::collect_lhs_writes_ex(e, module, writes, arrays.as_deref_mut());
                 }
             }
             _ => {}
@@ -36294,13 +36311,26 @@ impl Simulator {
         reads: &mut HashSet<String>,
         writes: &mut HashSet<String>,
     ) {
+        Self::collect_stmt_rw(stmt, module, Some(reads), writes, None)
+    }
+
+    /// `reads` is optional — a caller that needs only the write set skips
+    /// building read names at all — and `arrays` collects whole-array write
+    /// targets instead of one name per element (see `collect_lhs_writes_ex`).
+    fn collect_stmt_rw(
+        stmt: &Statement,
+        module: &ElaboratedModule,
+        mut reads: Option<&mut HashSet<String>>,
+        writes: &mut HashSet<String>,
+        mut arrays: Option<&mut HashSet<String>>,
+    ) {
         match &stmt.kind {
             StatementKind::BlockingAssign { lvalue, rvalue }
             | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
-                Self::collect_expr_reads(rvalue, module, reads);
-                Self::collect_lhs_writes(lvalue, module, writes);
+                if let Some(r) = reads.as_deref_mut() { Self::collect_expr_reads(rvalue, module, r) };
+                Self::collect_lhs_writes_ex(lvalue, module, writes, arrays.as_deref_mut());
                 // Also read the index expression of the LHS if it's an array/range select
-                Self::collect_lhs_index_reads(lvalue, module, reads);
+                if let Some(r) = reads.as_deref_mut() { Self::collect_lhs_index_reads(lvalue, module, r) };
             }
             StatementKind::If {
                 condition,
@@ -36308,19 +36338,19 @@ impl Simulator {
                 else_stmt,
                 ..
             } => {
-                Self::collect_expr_reads(condition, module, reads);
-                Self::collect_stmt_reads(then_stmt, module, reads, writes);
+                if let Some(r) = reads.as_deref_mut() { Self::collect_expr_reads(condition, module, r) };
+                Self::collect_stmt_rw(then_stmt, module, reads.as_deref_mut(), writes, arrays.as_deref_mut());
                 if let Some(el) = else_stmt {
-                    Self::collect_stmt_reads(el, module, reads, writes);
+                    Self::collect_stmt_rw(el, module, reads.as_deref_mut(), writes, arrays.as_deref_mut());
                 }
             }
             StatementKind::Case { expr, items, .. } => {
-                Self::collect_expr_reads(expr, module, reads);
+                if let Some(r) = reads.as_deref_mut() { Self::collect_expr_reads(expr, module, r) };
                 for item in items {
                     for pat in &item.patterns {
-                        Self::collect_expr_reads(pat, module, reads);
+                        if let Some(r) = reads.as_deref_mut() { Self::collect_expr_reads(pat, module, r) };
                     }
-                    Self::collect_stmt_reads(&item.stmt, module, reads, writes);
+                    Self::collect_stmt_rw(&item.stmt, module, reads.as_deref_mut(), writes, arrays.as_deref_mut());
                 }
             }
             StatementKind::For {
@@ -36332,43 +36362,43 @@ impl Simulator {
                 for fi in init {
                     match fi {
                         ForInit::Assign { lvalue, rvalue } => {
-                            Self::collect_expr_reads(rvalue, module, reads);
-                            Self::collect_lhs_writes(lvalue, module, writes);
+                            if let Some(r) = reads.as_deref_mut() { Self::collect_expr_reads(rvalue, module, r) };
+                            Self::collect_lhs_writes_ex(lvalue, module, writes, arrays.as_deref_mut());
                         }
                         ForInit::VarDecl {
                             name, init: rvalue, ..
                         } => {
-                            Self::collect_expr_reads(rvalue, module, reads);
+                            if let Some(r) = reads.as_deref_mut() { Self::collect_expr_reads(rvalue, module, r) };
                             writes.insert(name.name.clone());
                         }
                     }
                 }
                 if let Some(c) = condition {
-                    Self::collect_expr_reads(c, module, reads);
+                    if let Some(r) = reads.as_deref_mut() { Self::collect_expr_reads(c, module, r) };
                 }
                 // Step expressions are typically i = i + 1, parsed as
                 // Binary { op: Assign, left, right }. Collect both reads and
                 // LHS writes so loop variables are excluded from sensitivity.
                 for s in step {
-                    Self::collect_expr_reads(s, module, reads);
+                    if let Some(r) = reads.as_deref_mut() { Self::collect_expr_reads(s, module, r) };
                     if let ExprKind::Binary {
                         op: BinaryOp::Assign,
                         left,
                         ..
                     } = &s.kind
                     {
-                        Self::collect_lhs_writes(left, module, writes);
+                        Self::collect_lhs_writes_ex(left, module, writes, arrays.as_deref_mut());
                     }
                 }
-                Self::collect_stmt_reads(body, module, reads, writes);
+                Self::collect_stmt_rw(body, module, reads.as_deref_mut(), writes, arrays.as_deref_mut());
             }
             StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
                 for s in stmts {
-                    Self::collect_stmt_reads(s, module, reads, writes);
+                    Self::collect_stmt_rw(s, module, reads.as_deref_mut(), writes, arrays.as_deref_mut());
                 }
             }
             StatementKind::Expr(e) => {
-                Self::collect_expr_reads(e, module, reads);
+                if let Some(r) = reads.as_deref_mut() { Self::collect_expr_reads(e, module, r) };
                 // An expression STATEMENT can also write: `cnt++`, `--cnt`,
                 // and `(x = y)` all assign their target. Only reads were
                 // recorded here, so the target survived the implicit
@@ -36380,20 +36410,20 @@ impl Simulator {
             }
             StatementKind::While { condition, body }
             | StatementKind::DoWhile { body, condition } => {
-                Self::collect_expr_reads(condition, module, reads);
-                Self::collect_stmt_reads(body, module, reads, writes);
+                if let Some(r) = reads.as_deref_mut() { Self::collect_expr_reads(condition, module, r) };
+                Self::collect_stmt_rw(body, module, reads.as_deref_mut(), writes, arrays.as_deref_mut());
             }
             StatementKind::Forever { body }
             | StatementKind::Repeat { body, .. }
             | StatementKind::Foreach { body, .. } => {
-                Self::collect_stmt_reads(body, module, reads, writes);
+                Self::collect_stmt_rw(body, module, reads.as_deref_mut(), writes, arrays.as_deref_mut());
             }
             // §9.2.2.2: a function body reached through `collect_function_reads`
             // usually ends in `return <expr>` — dropping it hid every module
             // variable the function reads only there, so an always_comb calling
             // it never re-fired on those variables.
             StatementKind::Return(Some(e)) => {
-                Self::collect_expr_reads(e, module, reads);
+                if let Some(r) = reads.as_deref_mut() { Self::collect_expr_reads(e, module, r) };
             }
             StatementKind::VarDecl { declarators, .. } => {
                 for d in declarators {
@@ -36401,7 +36431,7 @@ impl Simulator {
                     // trigger — but its INITIALIZER reads are real inputs.
                     writes.insert(d.name.name.clone());
                     if let Some(init) = &d.init {
-                        Self::collect_expr_reads(init, module, reads);
+                        if let Some(r) = reads.as_deref_mut() { Self::collect_expr_reads(init, module, r) };
                     }
                 }
             }
@@ -80268,12 +80298,53 @@ if self.profile_report {
             // Compiled signal ids avoid another hierarchical AST walk for
             // ordinary flops. Keep interpreted writers in the census too.
             if needs_ast {
-                let mut reads = HashSet::default();
+                // Only the WRITE set is used here, and a whole-array write is
+                // a contiguous id range: collecting element names (and read
+                // names that are then dropped) cost 33 s on a c906 SoC, all of
+                // it in `String` building and hashing for the SRAM models.
                 let mut writes = HashSet::default();
-                Self::collect_stmt_reads(&block.stmt, &self.module, &mut reads, &mut writes);
+                let mut arrays: HashSet<String> = HashSet::default();
+                Self::collect_stmt_rw(
+                    &block.stmt,
+                    &self.module,
+                    None,
+                    &mut writes,
+                    Some(&mut arrays),
+                );
                 for name in writes {
                     if let Some(id) = self.resolve_read_name(&name, &top_prefix) {
                         block_writes[bi].insert(id);
+                    }
+                }
+                for name in arrays {
+                    let ids = self
+                        .array_first_id
+                        .get(name.as_str())
+                        .or_else(|| {
+                            self.array_first_id
+                                .get(format!("{}{}", top_prefix, name).as_str())
+                        })
+                        .copied();
+                    match ids {
+                        Some((first, lo, hi)) => {
+                            for k in 0..=(hi - lo).max(0) {
+                                block_writes[bi].insert(first + k as usize);
+                            }
+                        }
+                        // Not a dense array after all: fall back to the
+                        // per-element names, which is what this path did
+                        // before, so the writer census stays exact.
+                        None => {
+                            if let Some(&(lo, hi, _)) = self.module.arrays.get(&name) {
+                                for i in lo..=hi {
+                                    if let Some(id) = self
+                                        .resolve_read_name(&format!("{}[{}]", name, i), &top_prefix)
+                                    {
+                                        block_writes[bi].insert(id);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
