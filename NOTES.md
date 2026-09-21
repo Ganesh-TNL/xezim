@@ -138,6 +138,13 @@ and the development workflow are in [README.md](README.md).
 * `XEZIM_FALLBACK_SITES=1` reports every construct handed to the interpreter
   with its reason, source byte span and scope, so the statements worth
   compiling on a slow design can be found without guessing.
+* Merging same-sensitivity clocked blocks no longer costs the idle-edge
+  skip. The blocks folded into a merged one keep their original statements,
+  and the skip census still counted those writes, so every merged output
+  looked like it had two drivers and the merged block was disqualified: on a
+  c906 SoC only 618 of 3605 blocks could skip, and 55 million flop fires that
+  used to be skipped ran. Merging is now worth 6.9% on that design instead of
+  costing 18%.
 * Designs with large memory arrays start simulating sooner: the pass that
   decides which clocked blocks may skip idle edges named every element of
   every memory a block writes, one string per element, and then read names it

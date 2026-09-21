@@ -6284,6 +6284,12 @@ pub struct Simulator {
     armed_input_ranges: Vec<(u32, u32)>,
     armed_input_blocks: Vec<u32>,
     edge_block_armed: Vec<u8>,
+    /// Edge blocks whose work was folded into a merged block: their
+    /// sensitivities are cleared, so they never fire again. The skip census
+    /// must ignore them wholesale — counting their ORIGINAL statement's
+    /// writes made every merged target look multiply driven, and a
+    /// multiply-driven output disqualifies the block that absorbed them.
+    edge_block_retired: Vec<bool>,
     armed_fast_skips: u64,
     armed_shadow_checks: u64,
     // Phase-granular monotonic counter: bumped at each check_edges entry AND
@@ -9651,6 +9657,7 @@ impl Simulator {
             armed_input_ranges: Vec::new(),
             armed_input_blocks: Vec::new(),
             edge_block_armed: Vec::new(),
+            edge_block_retired: Vec::new(),
             armed_fast_skips: 0,
             armed_shadow_checks: 0,
             event_phase: 0,
@@ -25290,6 +25297,11 @@ impl Simulator {
                         // out of every trigger path: the edge fanout index and
                         // the scan structures are built from these lists AFTER
                         // this function returns.
+                        self.edge_block_retired
+                            .resize(self.compiled_edge_blocks.len(), false);
+                        for &m in &retired {
+                            self.edge_block_retired[m] = true;
+                        }
                         let blocks = Arc::make_mut(&mut self.edge_blocks);
                         for m in retired {
                             blocks[m].resolved_sensitivities.clear();
@@ -80274,7 +80286,18 @@ if self.profile_report {
         let mut block_writes = vec![HashSet::default(); nb];
         let mut writer_counts: HashMap<usize, usize> = HashMap::default();
         let top_prefix = format!("{}.", self.module.name);
+        let retired: Vec<bool> = {
+            let mut v = self.edge_block_retired.clone();
+            v.resize(nb, false);
+            v
+        };
         for (bi, block) in self.edge_blocks.iter().enumerate().take(nb) {
+            if retired[bi] {
+                // Folded into a merged block, which already carries these
+                // writes; counting them again would give every merged output
+                // a second driver.
+                continue;
+            }
             let mut needs_ast = self.compiled_edge_blocks[bi].is_none();
             if let Some(cb) = &self.compiled_edge_blocks[bi] {
                 for insn in &cb.instructions {
@@ -80378,6 +80401,9 @@ if self.profile_report {
             .map(|c| c.signal_id as u32)
             .collect();
         for bi in 0..nb {
+            if retired[bi] {
+                continue;
+            }
             let Some(cb) = self.compiled_edge_blocks[bi].as_ref() else {
                 gate_census[0] += 1;
                 continue;
