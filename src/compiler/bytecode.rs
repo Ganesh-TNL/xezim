@@ -2793,11 +2793,23 @@ impl<'a> BytecodeCompiler<'a> {
         if !self.decl_local_regs.is_empty() {
             // See decl_local_regs — the interpreter has no storage for a
             // register-backed block local, so bail the whole block instead.
+            self.trace_fallback_site(
+                self.bail_reason.unwrap_or_else(|| Self::stmt_kind_label(stmt)),
+                stmt.span,
+                "block-bail(local-regs)",
+            );
             return false;
         }
         if self.reg_var_loop_depth > 0 {
             // See reg_var_loop_depth — a fallback here would mis-read the
-            // register-backed loop var; force the whole loop to bail.
+            // register-backed loop var; force the whole loop to bail. This is
+            // the expensive case: one statement takes its whole loop to the
+            // interpreter, so report it even though no fallback is emitted.
+            self.trace_fallback_site(
+                self.bail_reason.unwrap_or_else(|| Self::stmt_kind_label(stmt)),
+                stmt.span,
+                "loop-bail",
+            );
             return false;
         }
         if self.allow_ast_fallback {
@@ -5334,6 +5346,43 @@ impl<'a> BytecodeCompiler<'a> {
     /// when the base needs a label mapping those arms do not emit. A packed
     /// multi-D Ident base is excluded — its element machinery normalizes
     /// slots itself (including ascending outer dims).
+    /// §7.4.1 declared dimension of whatever a select applies to: the vector
+    /// itself for `sig[..]`, or the ELEMENT an index chain lands on for
+    /// `sig[i][..]`. `None` when the layout is not on file, which leaves the
+    /// historical zero-based reading in place.
+    fn sel_base_dim(&self, base: &Expression) -> Option<(i64, i64)> {
+        let mut cur = base;
+        let mut layers = 0usize;
+        while let ExprKind::Index { expr: inner, .. } = &cur.kind {
+            cur = inner;
+            layers += 1;
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return None;
+        };
+        let dims = self.packed_full_dims_of(h)?;
+        if layers == 0 {
+            return dims.first().copied();
+        }
+        // An element of an UNPACKED array keeps the interpreter path: writes
+        // to `arr[i][label]` do not map the label there (they land at
+        // `label * width`, while every read maps it), so compiling the read
+        // alone would pair a mapped read with an unmapped write. The plain
+        // packed bases below have no such gap.
+        if self.lookup_array_name(h).is_some() || self.is_multi_dim_array(h) {
+            return None;
+        }
+        dims.get(layers).copied()
+    }
+
+    /// §7.4.1 physical bit position of a declared label: a descending range
+    /// counts up from its low bound, an ascending one mirrors. Selects on
+    /// such bases used to go to the AST interpreter for want of this map.
+    fn label_to_phys(dim: (i64, i64), label: i64) -> i64 {
+        let (lo_b, hi_b) = (dim.0.min(dim.1), dim.0.max(dim.1));
+        if dim.0 >= dim.1 { label - lo_b } else { hi_b - label }
+    }
+
     fn sel_base_needs_ast(&self, base: &Expression) -> bool {
         match &base.kind {
             ExprKind::Ident(h) => {
@@ -7773,13 +7822,17 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                 }
-                // §7.4.1/§11.5.1: ascending or element-of-collection bases
-                // need label mapping the rebase cannot express — AST only.
-                if self.sel_base_needs_ast(expr) {
+                // §7.4.1: a base whose labels need mapping compiles only when
+                // that map is known here; the rest keep the AST path, which
+                // applies the mapping itself.
+                if self.sel_base_needs_ast(expr) && self.sel_base_dim(expr).is_none() {
                     self.bail("bit_sel_base_maps");
                     return None;
                 }
                 let base = self.compile_expr(expr, 0)?;
+                // Map the declared label to a physical bit: this covers an
+                // ascending range and a dimension that does not start at zero.
+                let sel_dim = self.sel_base_dim(expr);
                 let base_lo = match &expr.kind {
                     ExprKind::Ident(h) => self.declared_low_bound(h),
                     _ => 0,
@@ -7789,7 +7842,10 @@ impl<'a> BytecodeCompiler<'a> {
                     // Saturate rather than wrap: an out-of-range declared index
                     // is already x-valued, and a negative operand would read as
                     // a huge unsigned bit position.
-                    let phys = idx as i64 - base_lo;
+                    let phys = match sel_dim {
+                        Some(d) => Self::label_to_phys(d, idx as i64),
+                        None => idx as i64 - base_lo,
+                    };
                     if phys < 0 {
                         // §11.5.1: below the declared low bound reads x.
                         self.emit(Insn::LoadConst(dest, Box::new(Value::new(1))));
@@ -7799,13 +7855,9 @@ impl<'a> BytecodeCompiler<'a> {
                     return Some(dest);
                 }
                 let idx = self.compile_expr(index, 0)?;
-                let idx = if base_lo != 0 {
-                    match &expr.kind {
-                        ExprKind::Ident(h) => self.emit_rebased_index(h, idx),
-                        _ => idx,
-                    }
-                } else {
-                    idx
+                let idx = match sel_dim {
+                    Some(d) => self.emit_packed_slot_index(Some(d), idx),
+                    None => idx,
                 };
                 let dest = self.alloc_reg();
                 self.emit(Insn::BitSelect(dest, base, idx));
@@ -7819,9 +7871,7 @@ impl<'a> BytecodeCompiler<'a> {
                 ..
             } => match kind {
                 RangeKind::Constant => {
-                    // §7.4.1/§11.5.1: ascending or element-of-collection
-                    // bases need label mapping — AST path only.
-                    if self.sel_base_needs_ast(expr) {
+                    if self.sel_base_needs_ast(expr) && self.sel_base_dim(expr).is_none() {
                         self.bail("range_sel_base_maps");
                         return None;
                     }
@@ -7847,15 +7897,15 @@ impl<'a> BytecodeCompiler<'a> {
                                 return Some(dest);
                             }
                         }
-                        let mut phys_l = l as i64;
-                        let mut phys_r = r as i64;
-                        if let ExprKind::Ident(h) = &expr.kind {
-                            if let Some((dl, dr)) = self.packed_outer_dim(h) {
-                                let lo_b = dl.min(dr);
-                                if lo_b != 0 {
-                                    phys_l -= lo_b;
-                                    phys_r -= lo_b;
-                                }
+                        // §7.4.1: labels to physical bits, for an ascending
+                        // range or an element dimension that does not start
+                        // at zero as much as for the plain descending case.
+                        let (mut phys_l, mut phys_r) = (l as i64, r as i64);
+                        if let Some(d) = self.sel_base_dim(expr) {
+                            phys_l = Self::label_to_phys(d, phys_l);
+                            phys_r = Self::label_to_phys(d, phys_r);
+                            if phys_l < phys_r {
+                                std::mem::swap(&mut phys_l, &mut phys_r);
                             }
                         }
                         let dest = self.alloc_reg();
@@ -7885,9 +7935,7 @@ impl<'a> BytecodeCompiler<'a> {
                     Some(dest)
                 }
                 RangeKind::IndexedUp | RangeKind::IndexedDown => {
-                    // §7.4.1/§11.5.1: ascending or element-of-collection
-                    // bases need label mapping — AST path only.
-                    if self.sel_base_needs_ast(expr) {
+                    if self.sel_base_needs_ast(expr) && self.sel_base_dim(expr).is_none() {
                         self.bail("range_sel_base_maps");
                         return None;
                     }
@@ -7911,17 +7959,24 @@ impl<'a> BytecodeCompiler<'a> {
                         } else {
                             (c, c - width as i64 + 1)
                         };
-                        let plain = matches!(&expr.kind, ExprKind::Ident(h)
-                            if self.packed_elem_width_of(h).filter(|&w| w > 1).is_none());
+                        let plain = match &expr.kind {
+                            ExprKind::Ident(h) => {
+                                self.packed_elem_width_of(h).filter(|&w| w > 1).is_none()
+                            }
+                            // An index has already selected an element, so
+                            // what remains is a plain vector.
+                            ExprKind::Index { .. } => true,
+                            _ => false,
+                        };
                         if plain && r >= 0 {
+                            // Both label bounds map, then order them: on an
+                            // ascending base `+:` runs DOWN the physical bits.
                             let (mut phys_l, mut phys_r) = (l, r);
-                            if let ExprKind::Ident(h) = &expr.kind {
-                                if let Some((dl, dr)) = self.packed_outer_dim(h) {
-                                    let lo_b = dl.min(dr);
-                                    if lo_b != 0 {
-                                        phys_l -= lo_b;
-                                        phys_r -= lo_b;
-                                    }
+                            if let Some(d) = self.sel_base_dim(expr) {
+                                phys_l = Self::label_to_phys(d, phys_l);
+                                phys_r = Self::label_to_phys(d, phys_r);
+                                if phys_l < phys_r {
+                                    std::mem::swap(&mut phys_l, &mut phys_r);
                                 }
                             }
                             if phys_r >= 0 {
@@ -7938,20 +7993,17 @@ impl<'a> BytecodeCompiler<'a> {
                     // does. Without this `w[1 +: 2]` on a `logic [3:1] w` read
                     // physical 2:1 (declared 3:2) instead of declared 2:1, and
                     // `w[3 -: 2]` ran off the top of the signal and returned x.
-                    let idx = match &expr.kind {
-                        ExprKind::Ident(h) => self.emit_rebased_index(h, idx),
-                        _ => idx,
+                    let sel_dim = self.sel_base_dim(expr);
+                    let idx = match sel_dim {
+                        Some(d) => self.emit_packed_slot_index(Some(d), idx),
+                        None => idx,
                     };
+                    // On an ascending base the mapped index counts the other
+                    // way, so `+:` becomes a downward physical range.
+                    let ascending = sel_dim.is_some_and(|d| d.0 < d.1);
+                    let up = (*kind == RangeKind::IndexedUp) != ascending;
                     let dest = self.alloc_reg();
-                    {
-                        self.emit(Insn::RangeSelectW(
-                            dest,
-                            base,
-                            idx,
-                            width,
-                            *kind == RangeKind::IndexedUp,
-                        ));
-                    }
+                    self.emit(Insn::RangeSelectW(dest, base, idx, width, up));
                     Some(dest)
                 }
             },

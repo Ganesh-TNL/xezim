@@ -388,3 +388,5 @@ mod struct_named_pattern_continuous_assign;
 mod grouped_class_fields;
 #[path = "types/packed_path_dynamic_stores.rs"]
 mod packed_path_dynamic_stores;
+#[path = "types/select_label_mapping.rs"]
+mod select_label_mapping;

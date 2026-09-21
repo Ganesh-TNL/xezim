@@ -135,9 +135,17 @@ and the development workflow are in [README.md](README.md).
   fallback inside a loop over a register-held variable demotes the whole loop,
   so these statements cost microseconds each; a memory model built from them
   runs 41x faster here, and a c906 run is unchanged.
+* Selects whose declared dimension does not start at zero or runs ascending
+  compile instead of falling back: `v[hi:lo]`, `v[b +: w]`, `v[b -: w]` and
+  bit selects on such a vector, and on an element of a packed array. A lane
+  vector selected in a loop runs 11x faster here. An element of an UNPACKED
+  array keeps the interpreter path, where its label mapping already agrees
+  with the writes.
 * `XEZIM_FALLBACK_SITES=1` reports every construct handed to the interpreter
   with its reason, source byte span and scope, so the statements worth
-  compiling on a slow design can be found without guessing.
+  compiling on a slow design can be found without guessing. It now also
+  reports the expensive case, a statement that takes its whole loop to the
+  interpreter because a fallback cannot be emitted inside one.
 * Merging same-sensitivity clocked blocks no longer costs the idle-edge
   skip. The blocks folded into a merged one keep their original statements,
   and the skip census still counted those writes, so every merged output
