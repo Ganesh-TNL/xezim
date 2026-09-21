@@ -384,3 +384,5 @@ mod class_type_param_struct_prop;
 mod nettype_struct_variable_driver;
 #[path = "types/struct_named_pattern_continuous_assign.rs"]
 mod struct_named_pattern_continuous_assign;
+#[path = "types/grouped_class_fields.rs"]
+mod grouped_class_fields;

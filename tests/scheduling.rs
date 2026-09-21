@@ -41,6 +41,10 @@ mod always_comb_sensitivity_audit;
 mod always_iff_guard;
 #[path = "scheduling/always_level_delay.rs"]
 mod always_level_delay;
+#[path = "scheduling/explicit_level_suspend.rs"]
+mod explicit_level_suspend;
+#[path = "scheduling/shared_edge_outputs.rs"]
+mod shared_edge_outputs;
 #[path = "scheduling/audit_ports_disable_drivers.rs"]
 mod audit_ports_disable_drivers;
 #[path = "scheduling/bare_clocking_event.rs"]

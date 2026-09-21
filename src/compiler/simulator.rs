@@ -19165,17 +19165,16 @@ impl Simulator {
                 // region commits on time, and busy-body edges are missed
                 // per §9.2.2 exactly as the reference behaves.
                 if self.stmt_calls_blocking_task(&body, &ab.scope, 3)
-                    // Delay-routing applies to EDGE-triggered blocks only: a
-                    // level/`@(*)` block's star sensitivity resolves to an
-                    // empty list on the process path and would spin (the
-                    // star_sensitivity suite's defect #1). Level blocks keep
-                    // their established edge-path delay handling.
-                    || (!all_level && Self::stmt_contains_delay_control(&body))
+                    // §9.2.2/§9.4: any blocking body needs a process, including
+                    // level controls, condition waits and inferred sensitivity.
+                    // The process runner derives @* sensitivity from its body.
+                    || self.stmt_is_blocking(&body)
+                    || Self::stmt_contains_delay_control(&body)
                     // A nested `@(...)` wait is the same class: the edge
                     // path's synchronous executor cannot suspend, so it ran
                     // the inner wait as a no-op (a `repeat (lat) @(posedge
                     // clk)` paced response streamed with zero latency).
-                    || (!all_level && Self::stmt_contains_event_control(&body))
+                    || Self::stmt_contains_event_control(&body)
                 {
                     // This body already leaves the edge path for the process path
                     // (§9.2.2: edges arriving mid-flight are missed). A compiled process
@@ -46177,11 +46176,16 @@ impl Simulator {
                     }
                     TimingControl::Event(event) => {
                         let key = (pid, s.span.start as u32);
+                        let is_star = matches!(event, EventControl::Star | EventControl::ParenStar);
                         let cached = self.forever_sens_cache.get(&key).cloned();
                         let (resolved, is_clk_ev) = match cached {
                             Some(c) => c,
                             None => {
-                                let sens = self.event_to_sens(event);
+                                let sens = if is_star {
+                                    self.star_sens_from_body(tbody)
+                                } else {
+                                    self.event_to_sens(event)
+                                };
                                 let is_clk_ev = self.is_clocking_event(event);
                                 let resolved = self.resolve_sens_ids(&sens);
                                 if !sens.is_empty() && resolved.len() == sens.len() {
@@ -46195,6 +46199,11 @@ impl Simulator {
                                 }
                             }
                         };
+                        // §9.4.2.2: an inferred control with no inputs can
+                        // never wake. Do not fall through to synchronous exec.
+                        if is_star && resolved.is_empty() {
+                            return;
+                        }
                         if !resolved.is_empty() {
                             let cont = self.forever_cont(pid, body, body_stmts, i, 1, tbody);
                             { let w = self.make_event_waiter_resolved(
@@ -80229,6 +80238,54 @@ if self.profile_report {
     fn build_event_measure_state(&mut self) {
         use super::bytecode::Insn;
         let nb = self.compiled_edge_blocks.len();
+        // §9.2: unchanged inputs do not imply an unchanged output when another
+        // edge process drives it. Count per-block writers, not instructions:
+        // several conditional assignments in one process are still one owner.
+        let mut block_writes = vec![HashSet::default(); nb];
+        let mut writer_counts: HashMap<usize, usize> = HashMap::default();
+        let top_prefix = format!("{}.", self.module.name);
+        for (bi, block) in self.edge_blocks.iter().enumerate().take(nb) {
+            let mut needs_ast = self.compiled_edge_blocks[bi].is_none();
+            if let Some(cb) = &self.compiled_edge_blocks[bi] {
+                for insn in &cb.instructions {
+                    match insn {
+                        Insn::NbaAssign(id, ..) | Insn::NbaAssignConst(id, ..)
+                        | Insn::NbaAssignRange(id, ..) | Insn::NbaAssignRangeDyn(id, ..)
+                        | Insn::NbaAssignBitDyn(id, ..) | Insn::NbaAssignArrayRead(id, ..)
+                        | Insn::BlockingAssign(id, ..) | Insn::BlockingAssignRange(id, ..)
+                        | Insn::BlockingAssignRangeDyn(id, ..) | Insn::BlockingAssignBitDyn(id, ..) => {
+                            block_writes[bi].insert(*id as usize);
+                        }
+                        Insn::StmtFallback(..) | Insn::EvalExprFallback(..)
+                        | Insn::NbaAssignArray(..) | Insn::BlockingAssignArray(..)
+                        | Insn::NbaAssignArrayRange(..) | Insn::BlockingAssignArrayRange(..) => {
+                            needs_ast = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Compiled signal ids avoid another hierarchical AST walk for
+            // ordinary flops. Keep interpreted writers in the census too.
+            if needs_ast {
+                let mut reads = HashSet::default();
+                let mut writes = HashSet::default();
+                Self::collect_stmt_reads(&block.stmt, &self.module, &mut reads, &mut writes);
+                for name in writes {
+                    if let Some(id) = self.resolve_read_name(&name, &top_prefix) {
+                        block_writes[bi].insert(id);
+                    }
+                }
+            }
+            for &id in &block_writes[bi] {
+                *writer_counts.entry(id).or_default() += 1;
+            }
+        }
+        for entry in &self.comb_entries {
+            for &id in &entry.cold.write_signal_ids {
+                *writer_counts.entry(id).or_default() += 1;
+            }
+        }
         let mut data_reads: Vec<Vec<u32>> = vec![Vec::new(); nb];
         let mut data_metas: Vec<Vec<(u16, u16)>> = vec![Vec::new(); nb];
         let mut gateable: Vec<bool> = vec![false; nb];
@@ -80392,7 +80449,8 @@ if self.profile_report {
             if has_wide && !self.armed_edge {
                 gate_census[6] += 1;
             }
-            gateable[bi] = !dynamic && !opaque && (!has_wide || self.armed_edge);
+            let shared_output = block_writes[bi].iter().any(|id| writer_counts[id] > 1);
+            gateable[bi] = !dynamic && !opaque && !shared_output && (!has_wide || self.armed_edge);
             wide_read[bi] = has_wide;
             data_reads[bi] = reads;
             data_metas[bi] = metas;
@@ -93369,7 +93427,9 @@ if self.profile_report {
                 Some(&self.module.typedefs),
             )
             .max(1);
-            for d in &m.declarators {
+            // §7.2.1: reverse declarations within a member group too; the
+            // first name in `bit a, b;` is more significant than the second.
+            for d in m.declarators.iter().rev() {
                 if is_union {
                     fields.push((d.name.name.clone(), 0, fw));
                     widest = widest.max(fw);
