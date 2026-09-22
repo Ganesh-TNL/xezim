@@ -235,3 +235,5 @@ mod intra_assignment_delay_in_always;
 mod inlined_call_rollback;
 #[path = "scheduling/delay_always_compound_body.rs"]
 mod delay_always_compound_body;
+#[path = "scheduling/edge_skip_shared_output.rs"]
+mod edge_skip_shared_output;

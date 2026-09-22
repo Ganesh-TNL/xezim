@@ -129,6 +129,12 @@ and the development workflow are in [README.md](README.md).
 
 **Performance** (instruction counts, output identical)
 
+* A clocked block whose inputs did not change may now skip an idle edge even
+  when another block writes a different part of the same register. Generated
+  logic that gives `status[0]` its own `always` block beside one for
+  `status[6:1]` used to keep both firing every cycle; each owns its own bits,
+  so both may rest. Blocks that write overlapping bits still fire on every
+  edge. A C910 SoC runs 2.1% fewer instructions, a c906 SoC 0.7%.
 * Writes that combine two dynamic steps into a packed vector now compile
   instead of falling back to the interpreter: `q[i][j]`, `mem[a][(i*W) +: W]`,
   `s.arr[i].field` and their blocking forms, with either index dynamic. A

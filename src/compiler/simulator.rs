@@ -80328,6 +80328,16 @@ if self.profile_report {
         // edge process drives it. Count per-block writers, not instructions:
         // several conditional assignments in one process are still one owner.
         let mut block_writes = vec![HashSet::default(); nb];
+        // Which BITS of each destination a block claims. Two blocks writing
+        // one register are only two drivers of the same thing where their
+        // slices overlap: a generate that gives `entry_expt[0]` its own arm
+        // beside one for `entry_expt[6:1]` has each bit driven once, and both
+        // arms may still skip an idle edge. Counting the signal was enough to
+        // reject 832 blocks on a C910 SoC. Bit 1 of `q[2:1]` and `q[1:0]`, on
+        // the other hand, has two drivers, and neither of those may skip — so
+        // the test is overlap, not whether the write is partial. A slice whose
+        // bounds are only known at run time claims the whole signal.
+        let mut block_spans: Vec<Vec<(usize, u32, u32)>> = vec![Vec::new(); nb];
         // A whole-array write is kept as its element RANGE. Expanding it to
         // ids cost 19M hash inserts on a c906 SoC (1.8 s, ~400 MB) only to
         // ask "does anything else write this"; the counter below answers that
@@ -80335,6 +80345,9 @@ if self.profile_report {
         let mut block_arrays: Vec<Vec<(usize, usize)>> = vec![Vec::new(); nb];
         // Saturating at two: the only question asked of it is `> 1`.
         let mut writer_counts = vec![0u8; self.signal_widths.len()];
+        let whole_hi = |widths: &[u32], id: usize| -> u32 {
+            widths.get(id).copied().unwrap_or(1).saturating_sub(1)
+        };
         let bump = |counts: &mut Vec<u8>, id: usize| {
             if let Some(c) = counts.get_mut(id) {
                 *c = c.saturating_add(1);
@@ -80357,12 +80370,23 @@ if self.profile_report {
             if let Some(cb) = &self.compiled_edge_blocks[bi] {
                 for insn in &cb.instructions {
                     match insn {
-                        Insn::NbaAssign(id, ..) | Insn::NbaAssignConst(id, ..)
-                        | Insn::NbaAssignRange(id, ..) | Insn::NbaAssignRangeDyn(id, ..)
-                        | Insn::NbaAssignBitDyn(id, ..) | Insn::NbaAssignArrayRead(id, ..)
-                        | Insn::BlockingAssign(id, ..) | Insn::BlockingAssignRange(id, ..)
-                        | Insn::BlockingAssignRangeDyn(id, ..) | Insn::BlockingAssignBitDyn(id, ..) => {
-                            block_writes[bi].insert(*id as usize);
+                        Insn::NbaAssign(id, ..)
+                        | Insn::NbaAssignConst(id, ..)
+                        | Insn::NbaAssignArrayRead(id, ..)
+                        | Insn::BlockingAssign(id, ..)
+                        | Insn::NbaAssignRangeDyn(id, ..)
+                        | Insn::NbaAssignBitDyn(id, ..)
+                        | Insn::BlockingAssignRangeDyn(id, ..)
+                        | Insn::BlockingAssignBitDyn(id, ..) => {
+                            let id = *id as usize;
+                            block_writes[bi].insert(id);
+                            block_spans[bi].push((id, 0, whole_hi(&self.signal_widths, id)));
+                        }
+                        Insn::NbaAssignRange(id, hi, lo, _)
+                        | Insn::BlockingAssignRange(id, hi, lo, _) => {
+                            let id = *id as usize;
+                            block_writes[bi].insert(id);
+                            block_spans[bi].push((id, *lo.min(hi), *lo.max(hi)));
                         }
                         Insn::StmtFallback(..) | Insn::EvalExprFallback(..)
                         | Insn::NbaAssignArray(..) | Insn::BlockingAssignArray(..)
@@ -80392,6 +80416,8 @@ if self.profile_report {
                 for name in writes {
                     if let Some(id) = self.resolve_read_name(&name, &top_prefix) {
                         block_writes[bi].insert(id);
+                        // A name carries no slice, so it claims every bit.
+                        block_spans[bi].push((id, 0, whole_hi(&self.signal_widths, id)));
                     }
                 }
                 for name in arrays {
@@ -80438,6 +80464,26 @@ if self.profile_report {
         for entry in &self.comb_entries {
             for &id in &entry.cold.write_signal_ids {
                 bump(&mut writer_counts, id);
+            }
+        }
+        // Who else claims the bits of a multiply driven signal. Only those
+        // signals can conflict, so a design where every register has one
+        // driver — the ordinary case — builds an empty index.
+        let mut spans_by_sig: HashMap<usize, Vec<(usize, u32, u32)>> = HashMap::default();
+        for (bi, spans) in block_spans.iter().enumerate() {
+            for &(id, lo, hi) in spans {
+                if writer_counts.get(id).is_some_and(|&c| c > 1) {
+                    spans_by_sig.entry(id).or_default().push((bi, lo, hi));
+                }
+            }
+        }
+        // A settle-region writer drives the whole signal and is never one of
+        // the edge blocks, so it conflicts with every span of it.
+        for entry in &self.comb_entries {
+            for &id in &entry.cold.write_signal_ids {
+                if let Some(v) = spans_by_sig.get_mut(&id) {
+                    v.push((usize::MAX, 0, whole_hi(&self.signal_widths, id)));
+                }
             }
         }
         let mut data_reads: Vec<Vec<u32>> = vec![Vec::new(); nb];
@@ -80606,13 +80652,19 @@ if self.profile_report {
             if has_wide && !self.armed_edge {
                 gate_census[6] += 1;
             }
-            let shared_output = block_writes[bi]
-                .iter()
-                .any(|&id| writer_counts.get(id).is_some_and(|&c| c > 1))
-                || block_arrays[bi].iter().any(|&(first, len)| {
-                    let end = first.saturating_add(len).min(writer_counts.len());
-                    writer_counts[first.min(end)..end].iter().any(|&c| c > 1)
-                });
+            // Another driver of the same BITS, rather than merely of the same
+            // signal. An overlap makes this block's output depend on when the
+            // other one last ran, so it must fire on every edge.
+            let shared_output = block_spans[bi].iter().any(|&(id, lo, hi)| {
+                spans_by_sig.get(&id).is_some_and(|others| {
+                    others
+                        .iter()
+                        .any(|&(bj, olo, ohi)| bj != bi && lo <= ohi && olo <= hi)
+                })
+            }) || block_arrays[bi].iter().any(|&(first, len)| {
+                let end = first.saturating_add(len).min(writer_counts.len());
+                writer_counts[first.min(end)..end].iter().any(|&c| c > 1)
+            });
             gateable[bi] = !dynamic && !opaque && !shared_output && (!has_wide || self.armed_edge);
             wide_read[bi] = has_wide;
             data_reads[bi] = reads;
