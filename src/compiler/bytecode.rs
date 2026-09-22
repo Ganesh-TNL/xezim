@@ -5394,6 +5394,29 @@ impl<'a> BytecodeCompiler<'a> {
         if dim.0 >= dim.1 { label - lo_b } else { hi_b - label }
     }
 
+    /// Did a select base compile to nothing but an interpreter call?
+    ///
+    /// An identifier the compiler cannot resolve reaches `emit_expr_fallback`,
+    /// which asks the AST interpreter for one scalar. That is right for a
+    /// scalar, and silently wrong for an AGGREGATE: a class property holding
+    /// an unpacked array evaluates to a single value, and selecting an element
+    /// or a bit of that read 0 rather than the element — `bk.arr[i]` inside an
+    /// `always` block accumulated nothing while `$display` of the same
+    /// expression printed the right number, because the display goes through
+    /// the interpreter, which walks the whole select.
+    ///
+    /// The interpreter evaluates the entire select correctly, and the base was
+    /// already going to enter it once, so handing it the whole expression
+    /// costs the same one call.
+    fn sel_base_is_interpreted(&self, from: usize, base: &Expression) -> bool {
+        matches!(
+            base.kind,
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. }
+        ) && self.insns[from..]
+            .iter()
+            .any(|i| matches!(i, Insn::EvalExprFallback(..)))
+    }
+
     fn sel_base_needs_ast(&self, base: &Expression) -> bool {
         match &base.kind {
             ExprKind::Ident(h) => {
@@ -7057,6 +7080,7 @@ impl<'a> BytecodeCompiler<'a> {
             }
             return Some(dest);
         }
+        let whole = expr;
         match &expr.kind {
             ExprKind::Number(num) => {
                 let val = self.eval_number_static(num)?;
@@ -7855,7 +7879,24 @@ impl<'a> BytecodeCompiler<'a> {
                     self.bail("bit_sel_base_maps");
                     return None;
                 }
+                let base_start = self.insns.len();
+                let base_reg = self.next_reg;
                 let base = self.compile_expr(expr, 0)?;
+                // An identifier the compiler could not resolve came back from
+                // the interpreter as ONE value. Selecting from that is only
+                // right when it really is a scalar, so hand the interpreter
+                // the whole select instead.
+                if self.sel_base_is_interpreted(base_start, expr) {
+                    self.insns.truncate(base_start);
+                    self.next_reg = base_reg;
+                    if let Some(r) =
+                        self.emit_expr_fallback(whole, ctx_width, "sel_base_interpreted")
+                    {
+                        return Some(r);
+                    }
+                    self.bail("sel_base_interpreted");
+                    return None;
+                }
                 // Map the declared label to a physical bit: this covers an
                 // ascending range and a dimension that does not start at zero.
                 let sel_dim = self.sel_base_dim(expr);
@@ -7901,7 +7942,24 @@ impl<'a> BytecodeCompiler<'a> {
                         self.bail("range_sel_base_maps");
                         return None;
                     }
+                    let base_start = self.insns.len();
+                    let base_reg = self.next_reg;
                     let base = self.compile_expr(expr, 0)?;
+                    // An identifier the compiler could not resolve came back from
+                    // the interpreter as ONE value. Selecting from that is only
+                    // right when it really is a scalar, so hand the interpreter
+                    // the whole select instead.
+                    if self.sel_base_is_interpreted(base_start, expr) {
+                        self.insns.truncate(base_start);
+                        self.next_reg = base_reg;
+                        if let Some(r) =
+                            self.emit_expr_fallback(whole, ctx_width, "sel_base_interpreted")
+                        {
+                            return Some(r);
+                        }
+                        self.bail("sel_base_interpreted");
+                        return None;
+                    }
                     if let (Some(l), Some(r)) =
                         (self.eval_const_bound(left), self.eval_const_bound(right))
                     {
@@ -7975,7 +8033,24 @@ impl<'a> BytecodeCompiler<'a> {
                             return None;
                         }
                     };
+                    let base_start = self.insns.len();
+                    let base_reg = self.next_reg;
                     let base = self.compile_expr(expr, 0)?;
+                    // An identifier the compiler could not resolve came back
+                    // from the interpreter as ONE value. Selecting from that
+                    // is only right when it really is a scalar, so hand the
+                    // interpreter the whole select instead.
+                    if self.sel_base_is_interpreted(base_start, expr) {
+                        self.insns.truncate(base_start);
+                        self.next_reg = base_reg;
+                        if let Some(r) =
+                            self.emit_expr_fallback(whole, ctx_width, "sel_base_interpreted")
+                        {
+                            return Some(r);
+                        }
+                        self.bail("sel_base_interpreted");
+                        return None;
+                    }
                     // A constant base index (genvar-unrolled `x[n*W +: W]`)
                     // gives static bounds: select the range directly instead
                     // of computing `idx*W + W-1` in registers on every eval.

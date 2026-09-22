@@ -9,6 +9,12 @@ and the development workflow are in [README.md](README.md).
 
 **Correctness**
 
+* Selecting from a class property inside an `always` block or an `assign`
+  reads the property instead of zero. `bk.arr[i]`, `bk.arr[3][0]` and
+  `bk.arr[i][3:0]` asked the interpreter for `bk.arr` alone, which is an
+  array and does not reduce to one number, and then selected from that
+  number; an accumulator fed by `bk.arr[i]` stayed at 0 while `$display` of
+  the same expression printed the right element.
 * Concurrent assertions evaluate as attempts with real sequence matching
   (issues #176–#183): a multi-cycle antecedent (`a ##1 b |-> c`) triggers on
   its last cycle; a ranged consequent (`##[1:2] b`) fails only when the whole

@@ -291,3 +291,5 @@ mod handle_chain_read_in_instance_task;
 mod implication_joint_distribution;
 #[path = "classes/array_of_collections_property.rs"]
 mod array_of_collections_property;
+#[path = "classes/class_array_property_select.rs"]
+mod class_array_property_select;
