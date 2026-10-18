@@ -125352,6 +125352,22 @@ impl Simulator {
                     self.copy_unpacked_struct(elem, &src, &su.clone());
                     return;
                 }
+                // §7.10.2.2/§13.4.1: a VALUE actual — a function's struct
+                // return (`q.push_back(make(...))`), or any other
+                // value-shaped source (ternary, method call) — has no leaf
+                // source above. Evaluate it ONCE and scatter it across the
+                // element's member leaves, as `r = make(...)` does, so the
+                // element travels by value into callees (`first_c(q)`),
+                // queue copies (`q2 = q`) and foreach loops with its string
+                // members intact. Storing only the packed scalar left every
+                // leaf-based consumer reading "".
+                let v = self.queue_eval_arg(obj_name, arg);
+                if self.spread_into_unpacked_struct(elem, &su, &v) {
+                    // Keep the packed view too: whole-element value reads
+                    // (the caller's `q[0].c` fallback) slice it.
+                    self.set_signal_value_by_name(elem, v);
+                    return;
+                }
             }
         }
         let mut val = self.queue_eval_arg(obj_name, arg);
