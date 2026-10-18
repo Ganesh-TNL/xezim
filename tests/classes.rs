@@ -759,3 +759,6 @@ mod string_frame_teardown;
 
 #[path = "classes/property_seed_order.rs"]
 mod property_seed_order;
+
+#[path = "classes/spec_arg_param_folding.rs"]
+mod spec_arg_param_folding;

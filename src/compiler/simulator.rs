@@ -131177,6 +131177,48 @@ impl Simulator {
         self.module.classes.get(name).map(|c| c.as_ref())
     }
 
+    /// Whether `name` is a type or value parameter of a class whose SCOPE is
+    /// active at the point a specialization argument is being resolved: the
+    /// specialization being built (`current_spec`) plus every enclosing
+    /// specialization still on the scope chain (`spec_scope_stack`).
+    ///
+    /// This is the correct gate for suppressing constant folding of an argument
+    /// that shares a spelling with a class parameter. A class parameter is in
+    /// scope only inside that class's own body, so it shadows a same-named
+    /// design parameter ONLY there. When `inner#(T)` is written inside
+    /// `class outer #(int T)`, `T` is outer's parameter and must not be folded
+    /// to a package parameter of the same name; when `vw#(W)` is written at
+    /// module scope, no class parameter is in scope at all and `W` is the
+    /// package parameter (§8.25, §6.20.2).
+    ///
+    /// The previous gate asked whether ANY class in the design declared the
+    /// name, which made an unrelated, never-instantiated class able to change
+    /// how an argument folds at a call site it has nothing to do with.
+    fn spec_scope_declares_param(&self, name: &str) -> bool {
+        let class_declares = |base: &str| {
+            self.get_class_def(base).is_some_and(|cd| {
+                cd.type_param_names.iter().any(|t| t == name)
+                    || cd.param_order.iter().any(|t| t == name)
+            })
+        };
+        if let Some((base, _)) = &self.current_spec {
+            if class_declares(base) {
+                return true;
+            }
+        }
+        self.spec_scope_stack
+            .iter()
+            .any(|(base, _)| class_declares(base))
+    }
+
+    /// Whether `frag` denotes a DESIGN parameter (package, `$unit` or
+    /// instance) rather than a class parameter. A class parameter shadows a
+    /// same-named design parameter only inside the class that declares it, so
+    /// the active spec scope decides (§8.25).
+    fn arg_names_design_param(&self, frag: &str) -> bool {
+        !self.spec_scope_declares_param(frag) && self.scoped_param_value_qualified(frag).is_some()
+    }
+
     fn substitute_spec_params(&self, frag: &str) -> String {
         let (b, s) = match &self.current_spec {
             Some(pair) => pair,
@@ -131269,12 +131311,21 @@ impl Simulator {
         }
         // A name is folded only when it is a design parameter (`P#(LP)`);
         // a type, class, or enum name keeps its spelling. Its value depends
-        // on the scope, so it is not memoized.
-        if ident_start && b.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_') {
+        // on the scope, so it is not memoized. A package-qualified name
+        // (`P#(pv::LP)`) is the SAME name for this purpose: §6.20.2 gives it
+        // the same value as the bare (imported) spelling, so both must select
+        // one specialization.
+        if ident_start && Self::is_ident_text(b) {
             // `scoped_param_value` tests the parameter leaf names first: the
             // common type / class name costs one probe.
-            let v = self.scoped_param_value(frag)?;
-            if self.class_member_names().params.contains(frag) {
+            let v = self.scoped_param_value_qualified(frag)?;
+            // A class parameter shadows a same-named design parameter only
+            // inside the class that declares it, so the veto is limited to the
+            // scopes actually active here (§8.25). A class elsewhere in the
+            // design must not change how this argument folds. A qualified
+            // name explicitly denotes the package parameter, so no class
+            // parameter can shadow it.
+            if !frag.contains(':') && self.spec_scope_declares_param(frag) {
                 return None;
             }
             return v.to_i64().map(|n| n.to_string());
@@ -131306,12 +131357,18 @@ impl Simulator {
         {
             return None;
         }
-        if b.iter().any(|&c| {
-            matches!(
-                c,
-                b'.' | b'"' | b'$' | b'x' | b'X' | b'z' | b'Z' | b'?' | b'#' | b'[' | b'{'
-            )
-        }) {
+        // A string, a member access, a system call, a nested specialization or
+        // an index is not a constant integer expression. The x/z/`?` test is
+        // gated on a base marker: `x`, `X`, `z` and `Z` are LEGAL in an
+        // identifier (`pv::QZ`, `SIZE_X`), and a text with no `'` cannot
+        // contain a based literal, so testing them unconditionally rejected
+        // every argument whose name happened to contain one of those letters.
+        if b.iter()
+            .any(|&c| matches!(c, b'.' | b'"' | b'$' | b'?' | b'#' | b'[' | b'{'))
+        {
+            return None;
+        }
+        if b.contains(&b'\'') && b.iter().any(|&c| matches!(c, b'x' | b'X' | b'z' | b'Z')) {
             return None;
         }
         if !typed {
@@ -131341,6 +131398,96 @@ impl Simulator {
             .borrow_mut()
             .insert(key, folded.clone());
         folded
+    }
+
+    /// Whether `b` is the text of a (possibly package-qualified) identifier:
+    /// `QW`, `pv::QW`, `a::b::c`. `::` is ONE separator, so empty segments
+    /// (`a::`, `:a`, `a:::b`) and any other character rule it out.
+    fn is_ident_text(b: &[u8]) -> bool {
+        let mut i = 0;
+        let mut seg_nonempty = false;
+        while i < b.len() {
+            let c = b[i];
+            if c == b':' {
+                // Only a well-formed `::` between two segments separates them.
+                if !seg_nonempty || b.get(i + 1) != Some(&b':') {
+                    return false;
+                }
+                i += 2;
+                seg_nonempty = false;
+                continue;
+            }
+            if !(c.is_ascii_alphanumeric() || c == b'_') {
+                return false;
+            }
+            seg_nonempty = true;
+            i += 1;
+        }
+        seg_nonempty
+    }
+
+    /// The parameter-table text of a NAME expression, or None when `e` is not
+    /// a plain name. A package-qualified reference reaches the simulator in
+    /// either of two shapes depending on where it was parsed: a scoped `Ident`
+    /// path (`pv::QW`) or a `MemberAccess` over a package `Ident` (`pv` then
+    /// `QW`). Both denote the same parameter, and
+    /// `const_eval_i64_with_params` probes the `pkg::name` key for both, so
+    /// every specialization-argument folder must accept both.
+    ///
+    /// `this` / `super` roots and any path segment carrying a select are not
+    /// parameters and are rejected here rather than being folded to an
+    /// unrelated same-named constant.
+    fn spec_name_key(e: &Expression) -> Option<String> {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                if h.path.is_empty() || h.path.iter().any(|s| !s.selects.is_empty()) {
+                    return None;
+                }
+                let mut parts: Vec<&str> = Vec::with_capacity(h.path.len() + 1);
+                if let Some(r) = &h.root {
+                    if r == "this" || r == "super" {
+                        return None;
+                    }
+                    parts.push(r.as_str());
+                }
+                parts.extend(h.path.iter().map(|s| s.name.name.as_str()));
+                Some(parts.join("::"))
+            }
+            // Only the exact `pkg::NAME` shape: a single-segment, select-free
+            // base with no root. Anything deeper is a hierarchical reference,
+            // not a package parameter.
+            ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                ExprKind::Ident(h)
+                    if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+                {
+                    Some(format!("{}::{}", h.path[0].name.name, member.name))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The value of a possibly package-qualified design parameter (`pv::QW`).
+    /// parameter (`pv::QW`). `alias_pkg_param` registers every package
+    /// parameter under `pkg::name`, so the qualified spelling is a direct key
+    /// lookup; the dotted form is probed too because instance parameters are
+    /// keyed `scope.name`. A qualified name that is not a parameter (a
+    /// package-scoped type or class name) yields None, so it keeps its
+    /// spelling rather than folding to a same-named parameter of another scope
+    /// — the leaf-name fallback that `scoped_param_value` uses for the bare
+    /// spelling is deliberately NOT applied here.
+    fn scoped_param_value_qualified(&self, name: &str) -> Option<Value> {
+        if let Some(v) = self.module.parameters.get(name) {
+            return Some(v.clone());
+        }
+        if name.contains(':') {
+            if let Some(v) = self.module.parameters.get(&name.replace("::", ".")) {
+                return Some(v.clone());
+            }
+            return None;
+        }
+        self.scoped_param_value(name)
     }
 
     /// The value of design parameter `name` as seen from the executing scope:
@@ -131374,20 +131521,14 @@ impl Simulator {
     #[inline(never)]
     fn fold_const_spec_text(&self, text: &str) -> Option<String> {
         use crate::ast::decl::{ModuleItem, ParameterKind};
-        // Literals, operators, and design parameters no class declares (a
-        // class's own parameter of the same name would shadow it).
-        let names = self.class_member_names();
+        // Literals, operators, and design parameters no ACTIVE class scope
+        // declares (a class's own parameter of the same name would shadow it,
+        // but only inside that class — see `spec_scope_declares_param`).
         let literal_only = |e: &Expression| -> bool {
             fn walk(e: &Expression, ok_name: &dyn Fn(&str) -> bool) -> bool {
                 match &e.kind {
                     ExprKind::Number(NumberLiteral::Integer { .. })
                     | ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => true,
-                    ExprKind::Ident(h) => {
-                        h.root.is_none()
-                            && h.path.len() == 1
-                            && h.path[0].selects.is_empty()
-                            && ok_name(&h.path[0].name.name)
-                    }
                     ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => walk(x, ok_name),
                     ExprKind::Binary { left, right, .. } => {
                         walk(left, ok_name) && walk(right, ok_name)
@@ -131401,11 +131542,18 @@ impl Simulator {
                             && walk(then_expr, ok_name)
                             && walk(else_expr, ok_name)
                     }
-                    _ => false,
+                    // A name, bare (`LP`) or package-qualified (`pv::LP`).
+                    // `spec_name_key` accepts both spellings the parser
+                    // produces for the qualified form: a scoped `Ident` path or
+                    // a `MemberAccess` over a package `Ident`.
+                    _ => match Simulator::spec_name_key(e) {
+                        Some(k) => ok_name(&k),
+                        None => false,
+                    },
                 }
             }
             walk(e, &|n: &str| {
-                !names.params.contains(n) && self.scoped_param_value(n).is_some()
+                !self.spec_scope_declares_param(n) && self.scoped_param_value_qualified(n).is_some()
             })
         };
         let src = format!(
@@ -131442,7 +131590,6 @@ impl Simulator {
         let mut ptab: HashMap<String, Value> = HashMap::default();
         fn names_in(e: &Expression, out: &mut Vec<String>) {
             match &e.kind {
-                ExprKind::Ident(h) => out.push(h.path[0].name.name.clone()),
                 ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => names_in(x, out),
                 ExprKind::Binary { left, right, .. } => {
                     names_in(left, out);
@@ -131457,13 +131604,24 @@ impl Simulator {
                     names_in(then_expr, out);
                     names_in(else_expr, out);
                 }
-                _ => {}
+                _ => {
+                    if let Some(k) = Simulator::spec_name_key(e) {
+                        out.push(k);
+                    }
+                }
             }
         }
         let mut ids = Vec::new();
         names_in(&init, &mut ids);
         for n in ids {
-            ptab.insert(n.clone(), self.scoped_param_value(&n)?);
+            let v = self.scoped_param_value_qualified(&n)?;
+            ptab.insert(n.clone(), v.clone());
+            // `const_eval_i64_with_params` probes a scoped reference under the
+            // `::` join and a dotted one under the `.` join; seed both so a
+            // qualified name of any depth resolves.
+            if n.contains(':') {
+                ptab.insert(n.replace("::", "."), v);
+            }
         }
         let v = super::elaborate::const_eval_i64_with_params(&init, Some(&ptab))?;
         Some(v.to_string())
@@ -131588,6 +131746,20 @@ impl Simulator {
             ExprKind::SystemCall { name, args } if name == "$clog2" => args
                 .iter()
                 .all(|a| self.bind_default_operands(a, earlier, bound, ptab)),
+            // A package-qualified default (`class vp #(int N = pv::QW)`) is
+            // parsed as a `MemberAccess` over the package `Ident`, not as a
+            // scoped `Ident`; it is the same `pkg::name` parameter key.
+            ExprKind::MemberAccess { .. } => {
+                match Self::spec_name_key(e)
+                    .and_then(|k| self.module.parameters.get(&k).map(|v| (k, v.clone())))
+                {
+                    Some((k, v)) => {
+                        ptab.insert(k, v);
+                        true
+                    }
+                    None => false,
+                }
+            }
             ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
                 match h.path.as_slice() {
                     [seg] => {
@@ -131689,7 +131861,17 @@ impl Simulator {
         // substitute the default.
         for i in 0..frags.len() {
             if order.get(i).is_some_and(|p| frags[i] == *p) {
-                if let Some(d) = self.param_default_fragment(cd, i, &frags[..i]) {
+                // §6.20.2: an argument that is the bare NAME of the parameter
+                // at its own position leaves that slot unbound, so it takes its
+                // declared default. The spelling is ambiguous, though: written
+                // at module scope, `vdb#(W)` names the PACKAGE parameter W, not
+                // vdb's own parameter W, and §8.25 makes the argument the
+                // constant 5 -- `vdb#(W)` and `vdb#(5)` are one specialization.
+                // Treat the slot as unbound only when the name does not denote
+                // a design parameter visible from here.
+                if !self.arg_names_design_param(&frags[i])
+                    && let Some(d) = self.param_default_fragment(cd, i, &frags[..i])
+                {
                     frags[i] = d;
                 }
             }
