@@ -354,3 +354,19 @@ fn issue_312_survey_single_module() {
     assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
     assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
 }
+
+/// Issue #391: appending one-character string casts — out = {out, string'(c)}
+/// — padded every character with 127 NUL bytes once the function tiered up
+/// to bytecode ("HELLO" came back with len 513 = 1 + 4*128). The cast now
+/// converts to a string value (§6.16) and the concat takes the §11.4.12
+/// string path; bare and prepended casts are covered as cousins.
+#[test]
+fn issue_391_string_cast_concat_padding() {
+    let msgs = outputs(
+        include_str!("../issue_cases/issue391_string_cast_concat.sv"),
+        100_000,
+    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
+    assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
+}
+

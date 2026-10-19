@@ -116299,6 +116299,18 @@ impl Simulator {
             K::HexToA => Value::from_string(&format!("{:x}", v(0).to_u64().unwrap_or(0))),
             K::OctToA => Value::from_string(&format!("{:o}", v(0).to_u64().unwrap_or(0))),
             K::BinToA => Value::from_string(&format!("{:b}", v(0).to_u64().unwrap_or(0))),
+            K::ToStr => {
+                // §6.16: converting to `string` removes every "\0" character
+                // — not just leading zero bytes. Byte-for-byte the AST cast
+                // arm's rule (`string'(24'hab0063)` is 2 characters).
+                let text: String = v(0)
+                    .sv_string_bytes()
+                    .into_iter()
+                    .filter(|&b| b != 0)
+                    .map(|b| b as char)
+                    .collect();
+                Value::from_string(&text)
+            }
         }
     }
 

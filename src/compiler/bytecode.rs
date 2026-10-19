@@ -266,6 +266,10 @@ pub enum StrOpKind {
     /// family of operators compares strings by (§6.16 Table 6-9). Only the
     /// `compare()` METHOD takes signed-byte differences.
     Order,
+    /// [v] -> the operand converted to a `string` value: its bytes with
+    /// every NUL removed (§6.16 — `string'(24'hab0063)` is 2 characters,
+    /// not 3). Appended last so cached bytecode keeps its variant indices.
+    ToStr,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2811,11 +2815,13 @@ impl<'a> BytecodeCompiler<'a> {
     /// concat semantics). We can only see syntactic clues at compile time —
     /// the full `string_signals` set lives on the simulator, not the
     /// bytecode compiler. A string-literal operand is always a string; a
-    /// `$sformatf` / `$psprintf` call returns a string. Bare idents whose
-    /// declared type we don't have here remain false — those cases get
-    /// folded into the bit-vector concat path, which is the existing
-    /// behavior. The interpreter side's special-case is what carries the
-    /// LRM-correct path when the compiler can't see the type.
+    /// `$sformatf` / `$psprintf` call returns a string, as does a
+    /// `string'(x)` cast (§6.24.3) and a function-LOCAL `string` variable
+    /// (`out` in {out, string'(c)}). Other bare idents whose declared type
+    /// we don't have here remain false — those cases get folded into the
+    /// bit-vector concat path, which is the existing behavior. The
+    /// interpreter side's special-case is what carries the LRM-correct
+    /// path when the compiler can't see the type.
     fn expr_is_string_concat_operand(&self, e: &Expression) -> bool {
         match &e.kind {
             ExprKind::StringLiteral(_) => true,
@@ -2823,8 +2829,17 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Concatenation(parts) => {
                 parts.iter().any(|p| self.expr_is_string_concat_operand(p))
             }
-            ExprKind::SystemCall { name, .. } => matches!(name.as_str(), "$sformatf" | "$psprintf"),
+            ExprKind::SystemCall { name, args } => match name.as_str() {
+                "$sformatf" | "$psprintf" => true,
+                // §6.24.3: `string'(x)` compiles to a string value (ToStr),
+                // so it is a string operand of an §11.4.12 concat.
+                "$__xz_type_cast" => self.cast_arg_targets_string(args),
+                _ => false,
+            },
             ExprKind::Ident(h) => {
+                if self.local_var_is_string.contains(&Self::hier_raw_name(h)) {
+                    return true;
+                }
                 if let Some(set) = self.string_signals {
                     let last = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
                     if set.contains(last) {
@@ -6950,6 +6965,14 @@ impl<'a> BytecodeCompiler<'a> {
         )
     }
 
+    /// §6.24.3: is this `$__xz_type_cast` argument list a cast to `string`?
+    fn cast_arg_targets_string(&self, args: &[Expression]) -> bool {
+        matches!(
+            args.first().map(|a| &a.kind),
+            Some(ExprKind::TypeLiteral(dt)) if self.decl_is_string(dt, None)
+        )
+    }
+
     /// §13.4.1 / §6.8: the initial value of a variable of `dt` — x for a
     /// 4-state type, 0 for a 2-state one. Getting this wrong for an inlined
     /// function's return variable makes a partially-assigned function return 0
@@ -7138,9 +7161,12 @@ impl<'a> BytecodeCompiler<'a> {
             // array (`q[0]` on `string q[$]`) is a string.
             ExprKind::Index { expr: base, .. } => self.local_string_coll(base),
             ExprKind::Paren(inner) => self.expr_is_string_static(inner),
-            ExprKind::SystemCall { name, .. } => {
-                matches!(name.as_str(), "$sformatf" | "$psprintf")
-            }
+            ExprKind::SystemCall { name, args } => match name.as_str() {
+                "$sformatf" | "$psprintf" => true,
+                // §6.24.3: `string'(x)` compiles to a string value (ToStr).
+                "$__xz_type_cast" => self.cast_arg_targets_string(args),
+                _ => false,
+            },
             ExprKind::Ident(h) => {
                 let raw = Self::hier_raw_name(h);
                 if self.local_var_is_string.contains(&raw) {
@@ -14713,6 +14739,16 @@ impl<'a> BytecodeCompiler<'a> {
                             | crate::ast::types::DataType::IntegerVector { .. }
                     );
                     let src = self.compile_expr(inner, if integral { w } else { 0 })?;
+                    // §6.16/§6.24.3: a `string` target CONVERTS the operand
+                    // to a string value — every NUL byte removed. Resizing to
+                    // the 1024-bit string placeholder instead let each
+                    // character appended by {out, string'(c)} carry 127 NUL
+                    // bytes into the concat (#391).
+                    if self.decl_is_string(&dt, None) {
+                        let r = self.alloc_reg();
+                        self.emit(Insn::StrOp(r, StrOpKind::ToStr, Box::new(vec![src])));
+                        return Some(r);
+                    }
                     let r = self.alloc_reg();
                     self.emit(Insn::Move(r, src));
                     if is_real {
