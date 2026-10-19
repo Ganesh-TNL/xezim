@@ -12992,6 +12992,40 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn compile_expr(&mut self, expr: &Expression, ctx_width: u32) -> Option<RegId> {
+        self.compile_expr_typed(expr, ctx_width, false)
+    }
+
+    /// §11.8.2: an unsigned expression changes operand type before any
+    /// context widening or nested operation, rather than after it finishes.
+    fn compile_expr_typed(
+        &mut self,
+        expr: &Expression,
+        ctx_width: u32,
+        unsigned_context: bool,
+    ) -> Option<RegId> {
+        let result = self.compile_expr_inner(expr, ctx_width, unsigned_context)?;
+        let propagates = matches!(
+            expr.kind,
+            ExprKind::Binary { .. }
+                | ExprKind::Conditional { .. }
+                | ExprKind::Paren(_)
+                | ExprKind::Unary {
+                    op: UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot,
+                    ..
+                }
+        );
+        if unsigned_context && !propagates && self.expr_signedness(expr) != Some(false) {
+            self.emit(Insn::ClearSigned(result));
+        }
+        Some(result)
+    }
+
+    fn compile_expr_inner(
+        &mut self,
+        expr: &Expression,
+        ctx_width: u32,
+        unsigned_context: bool,
+    ) -> Option<RegId> {
         if let Some(id) = self.const_multi_dim_array_elem_signal_id(expr) {
             let dest = self.alloc_reg();
             if self.signal_signed[id] {
@@ -13320,7 +13354,12 @@ impl<'a> BytecodeCompiler<'a> {
                 } else {
                     ctx_width
                 };
-                let src = self.compile_expr(operand, operand_ctx)?;
+                let src = self.compile_expr_typed(
+                    operand,
+                    operand_ctx,
+                    unsigned_context
+                        && matches!(op, UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot),
+                )?;
                 // §11.6.1: `~` and unary `-` are CONTEXT-determined — the
                 // operand is extended to the context width BEFORE the
                 // operation, not after. Passing `operand_ctx` down is not
@@ -13475,7 +13514,40 @@ impl<'a> BytecodeCompiler<'a> {
                 } else {
                     ctx_width
                 };
-                let l = self.compile_expr(left, sub_ctx)?;
+                let is_shift = matches!(
+                    op,
+                    BinaryOp::ShiftLeft
+                        | BinaryOp::ShiftRight
+                        | BinaryOp::ArithShiftLeft
+                        | BinaryOp::ArithShiftRight
+                );
+                let self_determined_operands = matches!(
+                    op,
+                    BinaryOp::LogAnd | BinaryOp::LogOr | BinaryOp::LogImplies | BinaryOp::LogEquiv
+                );
+                let joint_unsigned = !string_cmp
+                    && !self_determined_operands
+                    && ((!is_self_determined && unsigned_context)
+                        || self.expr_signedness(left) == Some(false)
+                        || (!is_shift
+                            && !matches!(op, BinaryOp::Power)
+                            && self.expr_signedness(right) == Some(false)));
+                let sub_ctx = if joint_unsigned
+                    && !is_self_determined
+                    && !is_shift
+                    && !matches!(op, BinaryOp::Power)
+                {
+                    sub_ctx
+                        .max(self.lrm_self_width(left))
+                        .max(self.lrm_self_width(right))
+                } else {
+                    sub_ctx
+                };
+                let left_unsigned =
+                    joint_unsigned && (!is_self_determined || has_context_shift(left));
+                let right_unsigned =
+                    joint_unsigned && (!is_self_determined || has_context_shift(right));
+                let l = self.compile_expr_typed(left, sub_ctx, left_unsigned)?;
                 // §11.4.10: a shift's RIGHT operand is SELF-DETERMINED — its
                 // width never affects the result, so it keeps its own.
                 let is_shift = matches!(
@@ -13485,10 +13557,10 @@ impl<'a> BytecodeCompiler<'a> {
                         | BinaryOp::ArithShiftLeft
                         | BinaryOp::ArithShiftRight
                 );
-                let r = if is_shift {
+                let r = if is_shift || matches!(op, BinaryOp::Power) {
                     self.compile_expr(right, self.expr_max_width(right))?
                 } else {
-                    self.compile_expr(right, sub_ctx)?
+                    self.compile_expr_typed(right, sub_ctx, right_unsigned)?
                 };
                 // Context width resizing for arithmetic / bitwise ops only.
                 // For self-determined comparisons we must NOT resize to
@@ -13516,10 +13588,10 @@ impl<'a> BytecodeCompiler<'a> {
                     let ls = self.expr_signedness(left);
                     let rs = self.expr_signedness(right);
                     if ls == Some(false) || rs == Some(false) {
-                        if !self.operand_scrub_is_noop(left) {
+                        if !left_unsigned && !self.operand_scrub_is_noop(left) {
                             self.emit(Insn::ClearSigned(l));
                         }
-                        if !self.operand_scrub_is_noop(right) {
+                        if !right_unsigned && !self.operand_scrub_is_noop(right) {
                             self.emit(Insn::ClearSigned(r));
                         }
                     }
@@ -13544,10 +13616,10 @@ impl<'a> BytecodeCompiler<'a> {
                         let ls = self.expr_signedness(left);
                         let rs = self.expr_signedness(right);
                         if ls == Some(false) || rs == Some(false) {
-                            if !self.operand_scrub_is_noop(left) {
+                            if !left_unsigned && !self.operand_scrub_is_noop(left) {
                                 self.emit(Insn::ClearSigned(l));
                             }
-                            if !self.operand_scrub_is_noop(right) {
+                            if !right_unsigned && !self.operand_scrub_is_noop(right) {
                                 self.emit(Insn::ClearSigned(r));
                             }
                         }
@@ -13719,8 +13791,18 @@ impl<'a> BytecodeCompiler<'a> {
                 // Evaluate both branches unconditionally so Select can do a
                 // per-bit merge when the condition has X/Z (IEEE 1800 §11.4.11).
                 let cond = self.compile_expr(condition, 0)?;
-                let then_reg = self.compile_expr(then_expr, ctx_width)?;
-                let else_reg = self.compile_expr(else_expr, ctx_width)?;
+                let arms_unsigned = unsigned_context
+                    || self.expr_signedness(then_expr) == Some(false)
+                    || self.expr_signedness(else_expr) == Some(false);
+                let arm_ctx = if arms_unsigned {
+                    ctx_width
+                        .max(self.lrm_self_width(then_expr))
+                        .max(self.lrm_self_width(else_expr))
+                } else {
+                    ctx_width
+                };
+                let then_reg = self.compile_expr_typed(then_expr, arm_ctx, arms_unsigned)?;
+                let else_reg = self.compile_expr_typed(else_expr, arm_ctx, arms_unsigned)?;
                 // §11.8.1: a ternary with ANY unsigned arm is unsigned — both
                 // arms then ZERO-extend (a signed arm sign-extended, so
                 // `c ? sa : b` in a 32-bit context read ffffff9c for
@@ -13731,10 +13813,10 @@ impl<'a> BytecodeCompiler<'a> {
                     let ts = self.expr_signedness(then_expr);
                     let es = self.expr_signedness(else_expr);
                     if ts == Some(false) || es == Some(false) {
-                        if !self.operand_scrub_is_noop(then_expr) {
+                        if !arms_unsigned && !self.operand_scrub_is_noop(then_expr) {
                             self.emit(Insn::ClearSigned(then_reg));
                         }
-                        if !self.operand_scrub_is_noop(else_expr) {
+                        if !arms_unsigned && !self.operand_scrub_is_noop(else_expr) {
                             self.emit(Insn::ClearSigned(else_reg));
                         }
                     }
@@ -13745,7 +13827,7 @@ impl<'a> BytecodeCompiler<'a> {
                 self.emit(Insn::Select(dest, cond, then_reg, else_reg));
                 Some(dest)
             }
-            ExprKind::Paren(inner) => self.compile_expr(inner, ctx_width),
+            ExprKind::Paren(inner) => self.compile_expr_typed(inner, ctx_width, unsigned_context),
             ExprKind::Index { expr, index } => {
                 // Step 8 (string formals): a select on a string formal takes
                 // the interpreter's char-select path (`string_signals`
@@ -27790,4 +27872,50 @@ pub(crate) fn type_name_key(tn: &crate::ast::types::TypeName) -> String {
     }
     k.push_str(&tn.name.name);
     k
+}
+
+/// A shift whose type can be changed by a surrounding integral expression.
+/// Self-determined operands (casts, concatenations, calls and reductions)
+/// stop propagation; a conditional's condition does not determine its type.
+pub(crate) fn has_context_shift(e: &Expression) -> bool {
+    match &e.kind {
+        ExprKind::Binary {
+            op:
+                BinaryOp::ShiftLeft
+                | BinaryOp::ShiftRight
+                | BinaryOp::ArithShiftLeft
+                | BinaryOp::ArithShiftRight,
+            ..
+        } => true,
+        ExprKind::Binary {
+            op:
+                BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Mod
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::BitXnor,
+            left,
+            right,
+        } => has_context_shift(left) || has_context_shift(right),
+        ExprKind::Binary {
+            op: BinaryOp::Power,
+            left,
+            ..
+        } => has_context_shift(left),
+        ExprKind::Unary {
+            op: UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot,
+            operand,
+        }
+        | ExprKind::Paren(operand) => has_context_shift(operand),
+        ExprKind::Conditional {
+            then_expr,
+            else_expr,
+            ..
+        } => has_context_shift(then_expr) || has_context_shift(else_expr),
+        _ => false,
+    }
 }

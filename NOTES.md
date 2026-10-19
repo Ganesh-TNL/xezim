@@ -125,6 +125,50 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (§6.19, §6.21, §7.4.1, §11.5.1).
   (#369, contributed by akashlevy)
 
+* Initializers accepted with `--relax-implicit-static` run once before initial
+  processes and retain their values across calls and activations. Design caches
+  distinguish this lifetime mode from the default policy (§6.21).
+  (#351, reported by akashlevy)
+* Static class calls retain lexical scope and specialization through module
+  type parameters, typedef chains, nested classes and instance handles.
+  Suspended static tasks retain their bindings, and class event OR waits wake
+  once on the selected event (§8.23, §8.25, §9.4.2, §13.4.1, §15.5).
+  Recompile saved designs to refresh scoped class metadata.
+  (#382, reported by Ganesh-TNL)
+* Randomization callbacks reject tasks, non-void returns and argument lists
+  before execution, preserving legal inherited and overridden callbacks
+  (§18.11). (#383, reported by rpjayaraman)
+* Unsigned expression context reaches a shift's left operand before extension
+  and evaluation in compiled and interpreted execution. Self-determined
+  boundaries and function side effects are preserved (§11.8.2, §11.4.10).
+  (#384, reported by akashlevy)
+
+* Concurrent assertions and covers observe clock edges at time zero and
+  four-state clock transitions, using Preponed samples (§16.5, §9.4.2).
+  (#385, reported by akashlevy)
+* Assertion action blocks preserve generated scope and keep their local
+  declarations separate from module variables (§16.14.1, §23.9, §27.4).
+  (#386, reported by akashlevy)
+* Returning an unpacked function-name variable no longer recurses. Dynamic
+  arrays, queues and fixed arrays retain their elements across return,
+  including descending fixed ranges (§13.4.1, §7.6).
+  (#387, reported by Dragon-Git)
+
+
+* Queue elements created from struct-returning expressions retain their
+  string and other members when passed to functions or copied. Arguments
+  run once even when a struct's leaf layout is unavailable
+  (§7.10.2.2, §13.4.1, §13.5.1).
+  (#390, #392, contributed by Ganesh-TNL)
+* Variables declared in `for` headers retain their declared signedness
+  across synchronous and suspended loops, including typedefs and unsigned
+  initializers (§6.11.1, §11.8.1, §12.7.1).
+  (#394, contributed by akashlevy)
+
+* Full-word concatenations preserve value and X/Z bits without overflowing
+  a native shift in debug execution, including nested and wide-block
+  forms (§11.4.12).
+
 **Performance**
 
 * Dense `case` statements with four to seven labels use jump tables, and
