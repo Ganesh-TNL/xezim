@@ -15,6 +15,18 @@ impl Simulator {
     /// `Some(None)` — a declared vif variable with no binding (null).
     /// Only declared vif storage engages — never `iface.signal` selects.
     pub(super) fn vif_operand(&self, e: &Expression) -> Option<Option<String>> {
+        // §25.10: `c.arr[0]` / bare `arr[0]` — the element select rides on the
+        // LAST path segment, so the `obj.prop` arms below key the WHOLE array
+        // and a BOUND element read back as unbound (null). Engage only when the
+        // element classification actually resolves, so ordinary data arrays keep
+        // their value semantics.
+        if let ExprKind::Ident(h) = &e.kind {
+            if h.path.last().is_some_and(|s| s.selects.len() == 1) {
+                if let Some(r) = self.vif_operand_hier_elem(h) {
+                    return Some(r);
+                }
+            }
+        }
         match &e.kind {
             ExprKind::Ident(h) if h.path.len() == 1 => {
                 let raw = &h.path[0].name.name;
@@ -145,8 +157,137 @@ impl Simulator {
                 }
                 None
             }
+            // §25.10: an ELEMENT of an instance vif array or collection —
+            // `c.arr[0]`, `c.iaa["a"]`, `vifs[i]`.
+            ExprKind::Index { expr: base, index } => self.vif_operand_elem(base, index),
             _ => None,
         }
+    }
+
+    /// Element classification for [`vif_operand`]: one element of an instance
+    /// (or static) vif ARRAY or COLLECTION. Without this arm an element was
+    /// unclassifiable, so `c.arr[0] == null` compared "unbound" against
+    /// "unclassifiable" and reported null for a BOUND element (§25.10).
+    fn vif_operand_elem(
+        &self,
+        base: &Expression,
+        index: &Expression,
+    ) -> Option<Option<String>> {
+        // Resolve the base to its receiver and the vif PROPERTY. A multi-segment
+        // flat ident `c.arr` / `d.cfg.vifs` owns its LAST segment: re-entering on
+        // the prefix instead discarded the property name and re-derived the
+        // receiver's own name (`c`), which is never a vif property, so every
+        // module-scope `c.arr[0] == null` classified as unclassifiable.
+        let (owner, name): (Option<Expression>, String) = match &base.kind {
+            ExprKind::Paren(b) => return self.vif_operand_elem(b, index),
+            ExprKind::MemberAccess { expr, member } => {
+                (Some((**expr).clone()), member.name.clone())
+            }
+            ExprKind::Ident(h) if h.root.is_none() => {
+                let last = h.path.last()?;
+                let name = last.name.name.clone();
+                if h.path.len() == 1 {
+                    (None, name)
+                } else {
+                    let mut bh = h.clone();
+                    bh.path.pop();
+                    (
+                        Some(Expression::new(ExprKind::Ident(bh), base.span)),
+                        name,
+                    )
+                }
+            }
+            _ => return None,
+        };
+        if !self.vif_prop_name_possible(&name) {
+            return None;
+        }
+        let owner_ho = match &owner {
+            Some(o) => self.vif_owner_of_expr(o),
+            None => None,
+        };
+        // A bound element classifies as the interface instance it names.
+        if let Some((inst, _)) = self.vif_named_target(owner_ho, &name, Some(index)) {
+            return Some(Some(inst));
+        }
+        // A declared vif property with no binding is the NULL value: report it
+        // as unbound so `== null` reads true instead of falling through to
+        // value semantics over untracked storage.
+        let class_name = match owner_ho {
+            Some((cn, _)) => Some(cn.to_string()),
+            None => {
+                let th = self.this_stack.last().copied().flatten().unwrap_or(0);
+                if th != 0 {
+                    self.heap.get(th)?.as_ref().map(|i| i.class_name.clone())
+                } else {
+                    self.class_context_stack.last().cloned().flatten()
+                }
+            }
+        };
+        match class_name {
+            Some(cn) if self.class_vif_decl(&cn, &name).is_some() => Some(None),
+            _ => None,
+        }
+    }
+
+    /// `c.arr[0]` / bare `arr[0]` — a hierarchical identifier whose LAST
+    /// segment carries the element select. [`vif_operand`]'s `obj.prop` arms
+    /// key the whole array for this shape, so a BOUND element was classified
+    /// as an unbound one and `== null` said true (§25.10).
+    fn vif_operand_hier_elem(
+        &self,
+        h: &crate::ast::expr::HierarchicalIdentifier,
+    ) -> Option<Option<String>> {
+        let (last, owner_segs) = h.path.split_last()?;
+        let sel = match last.selects.as_slice() {
+            [s] => s,
+            _ => return None,
+        };
+        let name = last.name.name.as_str();
+        if !self.vif_prop_name_possible(name) {
+            return None;
+        }
+        let owner_ho = if owner_segs.is_empty() {
+            None
+        } else {
+            self.vif_owner_of_path(owner_segs)
+        };
+        if let Some((inst, _)) = self.vif_named_target(owner_ho, name, Some(sel)) {
+            return Some(Some(inst));
+        }
+        let class_name = match owner_ho {
+            Some((cn, _)) => Some(cn.to_string()),
+            None => {
+                let th = self.this_stack.last().copied().flatten().unwrap_or(0);
+                if th != 0 {
+                    self.heap.get(th)?.as_ref().map(|i| i.class_name.clone())
+                } else {
+                    self.class_context_stack.last().cloned().flatten()
+                }
+            }
+        };
+        match class_name {
+            Some(cn) if self.class_vif_decl(&cn, name).is_some() => Some(None),
+            _ => None,
+        }
+    }
+
+    /// The element-key suffix of a §25.10 vif array / vif collection element:
+    /// the numeric index, or the KEY STRING of a string-keyed associative
+    /// array (`virtual T iaa[string]`). `eval_scalar_self` is numeric-only, so
+    /// a string index failed the read outright while the write collapsed it to
+    /// slot 0 — the two sides never agreed and the element never resolved.
+    fn vif_elem_index_key(&self, ix: &Expression) -> Option<String> {
+        if let ExprKind::StringLiteral(s) = &ix.kind {
+            return Some(s.clone());
+        }
+        if let Some(v) = self.eval_index_value_self(ix) {
+            let s = v.to_sv_string();
+            if !s.is_empty() && !s.bytes().all(|b| b.is_ascii_digit()) {
+                return Some(s);
+            }
+        }
+        self.eval_scalar_self(ix).map(|i| i.to_string())
     }
 
     /// `obj.prop` classification for `vif_operand` — engages only when the
@@ -942,7 +1083,6 @@ impl Simulator {
             // Parses as Index { expr: <obj.prop>, index: <idx_expr> }.
             // Encode the index into the binding's prop key.
             ExprKind::Index { expr: base, index } => {
-                let idx = self.eval_expr(index).to_u64().unwrap_or(0);
                 let (obj_handle, prop_base) = match &base.kind {
                     // d.vif_arr  (MemberAccess on a class handle)
                     ExprKind::MemberAccess {
@@ -1005,7 +1145,14 @@ impl Simulator {
                 {
                     return false;
                 }
-                (obj_handle, format!("{}[{}]", prop_base, idx))
+                // Key the element exactly as the read side does
+                // (`vif_named_target`): a string-keyed associative array of
+                // virtual interfaces collapsed to slot 0 here, so the write
+                // and the read never agreed on the element.
+                let Some(key) = self.vif_elem_index_key(index) else {
+                    return false;
+                };
+                (obj_handle, format!("{}[{}]", prop_base, key))
             }
             _ => return false,
         };
@@ -1924,9 +2071,11 @@ impl Simulator {
         }
         let key: std::borrow::Cow<str> = match elem {
             None => std::borrow::Cow::Borrowed(name),
-            Some(ix) => {
-                std::borrow::Cow::Owned(format!("{}[{}]", name, self.eval_scalar_self(ix)?))
-            }
+            Some(ix) => std::borrow::Cow::Owned(format!(
+                "{}[{}]",
+                name,
+                self.vif_elem_index_key(ix)?
+            )),
         };
         let hit = match owner {
             None => self.vif_bare_target(name, &key),

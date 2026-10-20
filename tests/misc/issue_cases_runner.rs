@@ -436,3 +436,12 @@ fn issue_391_string_cast_concat_padding() {
     assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
     assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
 }
+
+#[test]
+fn issue_427_non_static_vif_elem_null() {
+    let msgs = outputs(
+        include_str!("../issue_cases/non_static_vif_elem_null_427.sv"),
+        100_000,
+    );
+    assert!(msgs.iter().any(|m| m.contains("TEST_PASS")), "{:?}", msgs);
+}
