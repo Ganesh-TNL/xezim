@@ -10,6 +10,37 @@ impl Simulator {
         matches!(head, "this" | "super") || self.eval_ident_handle(head).is_some()
     }
 
+    /// The binding slot of a BARE virtual-interface name used inside a class
+    /// method, when that name is a STATIC vif member of the executing class
+    /// chain. A static property has ONE cell, keyed to the declaring class at
+    /// handle 0, so neither the per-object binding table nor the object's own
+    /// property map can reach it. `vif_slot` is the single place that knows
+    /// which of the two cells a property uses; asking it with handle 0 yields
+    /// a slot only for a static, so an instance property keeps taking the
+    /// per-object path its caller already implements. The receiver class is
+    /// the object's class when a `this` is live, else the class of the
+    /// currently executing method, which is what a static method has.
+    pub(super) fn static_vif_slot_of_bare(&self, name: &str) -> Option<(usize, String)> {
+        if !self.vif_prop_name_possible(name) {
+            return None;
+        }
+        let class_name = self
+            .this_stack
+            .last()
+            .copied()
+            .flatten()
+            .filter(|&th| th != 0)
+            .and_then(|th| {
+                self.heap
+                    .get(th)
+                    .and_then(|o| o.as_ref())
+                    .map(|i| i.class_name.clone())
+            })
+            .or_else(|| self.class_context_stack.last().cloned().flatten())?;
+        let (slot, _) = self.vif_slot(&class_name, 0, name)?;
+        (slot.0 == 0).then_some(slot)
+    }
+
     /// Classify an equality operand as a VIRTUAL-INTERFACE VARIABLE:
     /// `None` — not one; `Some(Some(n))` — bound to instance `n`;
     /// `Some(None)` — a declared vif variable with no binding (null).
@@ -59,6 +90,20 @@ impl Simulator {
                 }
                 if self.is_interface_instance(raw) && !self.data_name_shadows_iface(raw) {
                     return Some(Some(raw.clone()));
+                }
+                // A STATIC vif member read BARE inside a method. Its cell is
+                // the class-scope one, which the per-object table above cannot
+                // see, so the bound static missed; the "declared vif property
+                // of `this`" fallback below then reported it as null. A static
+                // method has no object at all and used to fall out of this arm
+                // entirely, so the read went to `class_static_get` and a bound
+                // static vif again compared equal to null (§25.10).
+                if let Some(slot) = self.static_vif_slot_of_bare(raw) {
+                    return Some(
+                        self.virtual_iface_bindings
+                            .get(&slot)
+                            .map(|(b, _)| b.clone()),
+                    );
                 }
                 // A DECLARED vif property of `this` with no binding: unbound.
                 if let Some(th) = self
@@ -129,6 +174,22 @@ impl Simulator {
                         return self.vif_operand_obj_prop(&bh.path[0].name.name, &member.name);
                     }
                 }
+                // `this.svif` parses as `MemberAccess { expr: This, .. }`, not
+                // as a one-segment ident, so neither the arm above nor
+                // `chain_handle` (which only walks Ident chains) can name the
+                // receiver — the live `this` IS the receiver, and
+                // `vif_operand_handle_prop` resolves the property from the
+                // object's class chain (§25.10).
+                if matches!(expr.kind, ExprKind::This)
+                    && self
+                        .class_member_names()
+                        .vif_props
+                        .contains(member.name.as_str())
+                    && let Some(th) = self.this_stack.last().copied().flatten()
+                    && th != 0
+                {
+                    return self.vif_operand_handle_prop(th, &member.name);
+                }
                 // A NESTED receiver (`e.d.vif` — a vif property of a
                 // handle-valued member, not of a bare variable): resolve
                 // the receiver chain to its object handle and classify from
@@ -154,6 +215,25 @@ impl Simulator {
     pub(super) fn vif_operand_obj_prop(&self, obj: &str, prop: &str) -> Option<Option<String>> {
         if !self.class_member_names().vif_props.contains(prop) {
             return None;
+        }
+        // A CLASS NAME on the left — `Holder::sa`, and equally its typedef
+        // alias `HolderT::sa`, both reaching the simulator as
+        // `Ident([Holder]).sa` — reads a STATIC virtual interface. Its binding
+        // lives at the class scope (handle 0), never on an object, and
+        // `eval_ident_handle` cannot resolve a class name at all. Without this
+        // arm the operand classified as unclassifiable and `==`/`!=` fell
+        // through to value semantics, where every bound static vif is the same
+        // nonzero placeholder: two statics bound to two DIFFERENT interfaces
+        // compared equal, and a static never matched the handle it holds
+        // (§25.10). `vif_slot` yields None for a non-static prop at handle 0,
+        // so instance properties still fall through to the object path.
+        if let Some(cls) = self.vif_class_of_scope_name(obj) {
+            let (slot, _) = self.vif_slot(&cls, 0, prop)?;
+            return Some(
+                self.virtual_iface_bindings
+                    .get(&slot)
+                    .map(|(b, _)| b.clone()),
+            );
         }
         let oh = if obj == "this" {
             self.this_stack.last().copied().flatten().unwrap_or(0)
@@ -188,6 +268,26 @@ impl Simulator {
         }
         if !declared {
             return None;
+        }
+        // A STATIC vif property has ONE cell, keyed to the declaring class at
+        // handle 0, not one per object — so the per-object key below cannot see
+        // it and `this.svif == null` inside an instance method reported a bound
+        // static as null. `vif_slot` is what decides which of the two cells a
+        // property uses; the object key stays the fallback for the cases
+        // `vif_slot` declines to answer (§25.10).
+        let leaf_class = self
+            .heap
+            .get(oh)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        if let Some(cn) = leaf_class.as_deref()
+            && let Some((slot, _)) = self.vif_slot(cn, oh, prop)
+        {
+            return Some(
+                self.virtual_iface_bindings
+                    .get(&slot)
+                    .map(|(b, _)| b.clone()),
+            );
         }
         Some(
             self.virtual_iface_bindings
@@ -898,7 +998,7 @@ impl Simulator {
                     return false;
                 };
                 let oh = self.vif_owner_handle(obj);
-                if oh == 0 && self.module.classes.contains_key(obj) {
+                if oh == 0 && self.vif_class_of_scope_name(obj).is_some() {
                     static_scope = Some(obj.to_string());
                 }
                 (oh, prop)
@@ -919,7 +1019,7 @@ impl Simulator {
                     ExprKind::Ident(h) if h.path.len() == 1 => {
                         let obj = h.path[0].name.name.as_str();
                         let oh = self.vif_owner_handle(obj);
-                        if oh == 0 && self.module.classes.contains_key(obj) {
+                        if oh == 0 && self.vif_class_of_scope_name(obj).is_some() {
                             static_scope = Some(obj.to_string());
                         }
                         oh
@@ -954,7 +1054,7 @@ impl Simulator {
                                 let obj = h.path[0].name.name.as_str();
                                 let oh = self.vif_owner_handle(obj);
                                 // §8.9: `Cls::va[i]` — a static vif array.
-                                if oh == 0 && self.module.classes.contains_key(obj) {
+                                if oh == 0 && self.vif_class_of_scope_name(obj).is_some() {
                                     static_scope = Some(obj.to_string());
                                 }
                                 oh
@@ -981,7 +1081,7 @@ impl Simulator {
                         let obj = h.path[0].name.name.as_str();
                         let prop = h.path[1].name.name.clone();
                         let oh = self.vif_owner_handle(obj);
-                        if oh == 0 && self.module.classes.contains_key(obj) {
+                        if oh == 0 && self.vif_class_of_scope_name(obj).is_some() {
                             static_scope = Some(obj.to_string());
                         }
                         (oh, prop)
@@ -1730,6 +1830,22 @@ impl Simulator {
         None
     }
 
+    /// §6.18: the class a class-scope virtual-interface receiver NAMES, once
+    /// typedef aliases are unwound. `typedef box_c box_t;` makes `box_t::svif`
+    /// the very same member as `box_c::svif`, because a static property
+    /// belongs to the class rather than to the spelling used to reach it.
+    /// `None` means the name resolves to no class at all, so callers keep
+    /// whatever they were about to do. The common case — a real class name —
+    /// costs one hash lookup.
+    pub(super) fn vif_class_of_scope_name(&self, name: &str) -> Option<String> {
+        if self.module.classes.contains_key(name) {
+            return Some(name.to_string());
+        }
+        self.resolve_class_scope_prefix(name)
+            .map(|(base, _)| base)
+            .filter(|base| self.module.classes.contains_key(base))
+    }
+
     /// §25.8/§25.10/§8.9: the `virtual_iface_bindings` slot of the vif
     /// property named by `key` (`prop`, or `prop[i]` for an element of a vif
     /// array) on object `handle` of class `class_name`, with the property's
@@ -1742,6 +1858,13 @@ impl Simulator {
         key: &str,
     ) -> Option<((usize, String), Option<String>)> {
         let base = key.split('[').next().unwrap_or(key);
+        // §6.18: a TYPEDEF ALIAS names the same class, so `box_t::svif` and
+        // `box_c::svif` are ONE cell — a static property belongs to the class,
+        // not to the spelling used to reach it. Canonicalising here, the single
+        // choke point every vif read, write and comparison passes through,
+        // keeps the alias from forking a second cell keyed by its own name.
+        let canon = self.vif_class_of_scope_name(class_name);
+        let class_name = canon.as_deref().unwrap_or(class_name);
         let (decl, (_, modport)) = self.class_vif_decl(class_name, base)?;
         if self
             .module
@@ -1795,7 +1918,7 @@ impl Simulator {
             [] => match self.eval_ident_handle(head) {
                 Some(h) if h != 0 => h,
                 // `Cls::svif` — a class scope owns only its statics.
-                _ if rest.is_empty() && self.module.classes.contains_key(head) => {
+                _ if rest.is_empty() && self.vif_class_of_scope_name(head).is_some() => {
                     return Some((head, 0));
                 }
                 _ => return None,
