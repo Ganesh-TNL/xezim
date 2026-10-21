@@ -24,8 +24,16 @@ impl Simulator {
         if !self.vif_prop_name_possible(name) {
             return None;
         }
-        let class_name = self
-            .this_stack
+        let class_name = self.static_vif_bare_class()?;
+        let (slot, _) = self.vif_slot(&class_name, 0, name)?;
+        (slot.0 == 0).then_some(slot)
+    }
+
+    /// The class whose STATIC virtual-interface property a bare name reads: the
+    /// object's class when a `this` is live, else the class of the currently
+    /// executing method, which is all a static method has.
+    pub(super) fn static_vif_bare_class(&self) -> Option<String> {
+        self.this_stack
             .last()
             .copied()
             .flatten()
@@ -36,9 +44,35 @@ impl Simulator {
                     .and_then(|o| o.as_ref())
                     .map(|i| i.class_name.clone())
             })
-            .or_else(|| self.class_context_stack.last().cloned().flatten())?;
-        let (slot, _) = self.vif_slot(&class_name, 0, name)?;
-        (slot.0 == 0).then_some(slot)
+            .or_else(|| self.class_context_stack.last().cloned().flatten())
+    }
+
+    /// §8.26: the interface bound to the STATIC virtual-interface property
+    /// `prop` of class scope `obj`, asked with the PARAMETERIZED-CLASS
+    /// specialization preserved.
+    ///
+    /// A parameterized class keeps one static cell PER specialization, and the
+    /// write side files it in `static_vif_bindings` under the canonical spec
+    /// key (`C#(T)::p`) that `static_prop_key_spec` builds. `vif_slot`
+    /// canonicalises through `vif_class_of_scope_name`, which drops the
+    /// signature, so the slot it yields asks for `C::p` and misses the
+    /// `C#(T)::p` cell the write filled — a bound static then classifies as
+    /// null. The member-read path DOES resolve the spec, which is why
+    /// `C#(T)::svif.count` reads back correctly while `C#(T)::svif == null`
+    /// still reported null (§25.10).
+    ///
+    /// `None` means "no opinion": a plain class, an unbound property, or an
+    /// instance property, all of which the caller resolves its own way.
+    pub(super) fn static_vif_binding_of_scope(
+        &self,
+        obj: &str,
+        prop: &str,
+        spec_override: Option<&(String, String)>,
+    ) -> Option<String> {
+        let (base, spec) = self.resolve_class_scope_prefix(obj)?;
+        let spec_pair = spec.map(|s| (base.clone(), s));
+        let key = self.static_prop_key_spec(&base, prop, spec_pair.as_ref().or(spec_override))?;
+        self.static_vif_bindings.get(&key).cloned()
     }
 
     /// Classify an equality operand as a VIRTUAL-INTERFACE VARIABLE:
@@ -139,6 +173,29 @@ impl Simulator {
                 // method has no object at all and used to fall out of this arm
                 // entirely, so the read went to `class_static_get` and a bound
                 // static vif again compared equal to null (§25.10).
+                if let Some(cls) = self.static_vif_bare_class() {
+                    // §6.21/§8.4: a LOCAL of the executing frame shadows the
+                    // class static, and this lookup answers straight from the
+                    // class cell, so it has to defer to the frame exactly as
+                    // `static_vif_slot_of_bare` below does. Without it a bound
+                    // static leaked through an uninitialised local here.
+                    if !self
+                        .local_stack
+                        .last()
+                        .is_some_and(|l| l.contains_key(raw.as_str()))
+                    {
+                        // §8.26: inside a static method of a PARAMETERIZED class the
+                        // executing specialization IS the context, and the write
+                        // filed the binding under the spec key. The slot below is
+                        // base-canonical and would miss it, reporting a bound
+                        // static as null.
+                        if let Some(bound) =
+                            self.static_vif_binding_of_scope(&cls, raw, self.current_spec.as_ref())
+                        {
+                            return Some(Some(bound));
+                        }
+                    }
+                }
                 if let Some(slot) = self.static_vif_slot_of_bare(raw) {
                     return Some(
                         self.virtual_iface_bindings
@@ -205,6 +262,24 @@ impl Simulator {
                 None
             }
             ExprKind::MemberAccess { expr, member } => {
+                // §8.26/§25.10: `C#(T)::svif` — a static virtual interface of a
+                // SPECIALIZATION. The receiver is a `Specialization` node, so no
+                // Ident/This arm below can name it, and the operand classified as
+                // unclassifiable: `==`/`!=` fell through to value semantics, where
+                // a bound static is an opaque placeholder that never matches null.
+                // Ask the static map through the same key builder the write used;
+                // `vif_recv_target` already does this for the member-read path,
+                // which is why `C#(T)::svif.count` read back correctly while
+                // `C#(T)::svif == null` did not.
+                if matches!(expr.kind, ExprKind::Specialization { .. })
+                    && self
+                        .class_member_names()
+                        .vif_props
+                        .contains(member.name.as_str())
+                    && let Some(b) = self.static_vif_binding(e)
+                {
+                    return Some(Some(b));
+                }
                 if let ExprKind::Ident(bh) = &expr.kind {
                     if bh.path.len() == 1 && !self.is_interface_instance(&bh.path[0].name.name) {
                         if self.is_interface_instance(&member.name)
@@ -269,6 +344,11 @@ impl Simulator {
         // (§25.10). `vif_slot` yields None for a non-static prop at handle 0,
         // so instance properties still fall through to the object path.
         if let Some(cls) = self.vif_class_of_scope_name(obj) {
+            // §8.26: ask with the specialization preserved before the
+            // base-canonical slot, which misses a parameterized class's cell.
+            if let Some(bound) = self.static_vif_binding_of_scope(obj, prop, None) {
+                return Some(Some(bound));
+            }
             let (slot, _) = self.vif_slot(&cls, 0, prop)?;
             return Some(
                 self.virtual_iface_bindings
@@ -616,7 +696,9 @@ impl Simulator {
     /// virtual interface (see `bind_static_vif`)? A name test only.
     pub(super) fn static_vif_target_possible(&self, lv: &Expression) -> bool {
         let leaf = match &lv.kind {
-            ExprKind::Ident(h) if h.path.len() <= 2 => h.path.last().map(|s| s.name.name.as_str()),
+            // `C::p` and `pkg::C::p` (§8.3.6-1, §26.3) both name a static
+            // property; the leaf is the property either way.
+            ExprKind::Ident(h) if h.path.len() <= 3 => h.path.last().map(|s| s.name.name.as_str()),
             ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
             _ => None,
         };
@@ -750,6 +832,17 @@ impl Simulator {
                         let cls = self.heap.get(oh)?.as_ref()?.class_name.clone();
                         keyed(&cls, None, p)
                     }
+                    [_pkg, cls_seg, prop] => {
+                        // §26.3: `pkg::C::p` — the parser keeps the package as
+                        // a leading path segment, so the class is the MIDDLE
+                        // segment and the property the last.
+                        let p = prop.name.name.as_str();
+                        if !static_name(p) {
+                            return None;
+                        }
+                        let (cls, spec) = class_head(&cls_seg.name.name)?;
+                        keyed(&cls, spec, p)
+                    }
                     _ => None,
                 }
             }
@@ -779,6 +872,15 @@ impl Simulator {
                         let cls = self.heap.get(th)?.as_ref()?.class_name.clone();
                         keyed(&cls, None, p)
                     }
+                    // §26.3: `pkg::C::p` — the class head is itself a member
+                    // access whose OUTERMOST member names the class, the same
+                    // head `extract_call_spec` reads for `pkg::C#(args)::p`.
+                    // The READ side parses this way; the write side keeps the
+                    // package as a leading Ident path segment (arm above).
+                    ExprKind::MemberAccess { member: head, .. } => match class_head(&head.name) {
+                        Some((cls, spec)) => keyed(&cls, spec, p),
+                        None => None,
+                    },
                     _ => None,
                 }
             }
@@ -2066,6 +2168,22 @@ impl Simulator {
         handle: usize,
         key: &str,
     ) -> Option<(String, Option<String>)> {
+        // §8.9/§25.10: a CLASS-SCOPE read (handle 0) names the STATIC cell,
+        // which `static_vif_bindings` owns — the per-object table below cannot
+        // hold it. A package-qualified or plain `Cls::p` spelling reaches the
+        // same cell, so consult it before the instance map.
+        if handle == 0 {
+            if let Some(b) = self
+                .static_vif_bindings
+                .get(&format!("{class_name}::{key}"))
+            {
+                let modport = self
+                    .vif_slot(class_name, handle, key)
+                    .map(|(_, mp)| mp)
+                    .unwrap_or(None);
+                return Some((b.clone(), modport));
+            }
+        }
         let (slot, modport) = self.vif_slot(class_name, handle, key)?;
         let (bound, _) = self.virtual_iface_bindings.get(&slot)?;
         Some((bound.clone(), modport))
@@ -2101,6 +2219,15 @@ impl Simulator {
                 // `Cls::svif` — a class scope owns only its statics.
                 _ if rest.is_empty() && self.vif_class_of_scope_name(head).is_some() => {
                     return Some((head, 0));
+                }
+                // §26.3: `pkg::Cls::p` — a PACKAGE-qualified class scope. The
+                // class is the LAST segment of the owner path, the same head
+                // `extract_call_spec` reads for `pkg::Cls#(args)::p`.
+                _ if rest.len() == 1
+                    && rest.iter().all(|s| s.selects.is_empty())
+                    && self.module.classes.contains_key(rest[0].name.name.as_str()) =>
+                {
+                    return Some((rest[0].name.name.as_str(), 0));
                 }
                 _ => return None,
             },
@@ -2164,13 +2291,35 @@ impl Simulator {
         if let Some(b) = self.iface_alias_for(key) {
             return Some((b, None));
         }
-        if self.virtual_iface_bindings.is_empty()
-            || !self.vif_prop_name_possible(name)
-            || self
-                .local_stack
-                .last()
-                .is_some_and(|l| l.contains_key(name))
+        if self
+            .local_stack
+            .last()
+            .is_some_and(|l| l.contains_key(name))
         {
+            return None;
+        }
+        // §8.26: a static virtual interface of a PARAMETERIZED class has one
+        // cell PER SPECIALIZATION, and the write files the binding in
+        // `static_vif_bindings` under the canonical spec key `C#(T)::p`. Inside
+        // a static method the executing specialization IS the context, so ask
+        // with it BEFORE the per-object table below — a design whose only bound
+        // virtual interfaces are class statics never fills
+        // `virtual_iface_bindings` at all, and the emptiness gate that lookup
+        // used to sit behind declined the read outright. `vif_prop_target`
+        // canonicalises the class and asks for `C::p`, missing the spec cell:
+        // that is why the same static read back fine through the qualified
+        // spelling but not bare. A miss is no opinion, and the paths below run
+        // exactly as before.
+        if key == name
+            && self.vif_prop_name_possible(name)
+            && let Some(ctx) = self.class_context_stack.last().cloned().flatten()
+            && let Some(b) =
+                self.static_vif_binding_of_scope(&ctx, name, self.current_spec.as_ref())
+        {
+            let modport = self.vif_slot(&ctx, 0, key).and_then(|(_, mp)| mp);
+            return Some((b, modport));
+        }
+        if self.virtual_iface_bindings.is_empty() || !self.vif_prop_name_possible(name) {
             return None;
         }
         match self.this_stack.last().copied().flatten() {
@@ -2396,9 +2545,18 @@ impl Simulator {
             } => {
                 // §8.25/§25.9: a static vif of a specialization,
                 // `G#(virtual pif)::one`, binds per specialization.
-                if matches!(owner.kind, ExprKind::Specialization { .. })
-                    && let Some(b) = self.static_vif_binding(recv)
-                {
+                // §26.3: a static vif of a PACKAGE-qualified class,
+                // `pkg::G::one`, reaches the same class-scope cell; neither
+                // spelling resolves an owner HANDLE, so consult the static
+                // binding directly instead of walking a nonexistent chain.
+                let class_scope_head = match &owner.kind {
+                    ExprKind::Specialization { .. } => true,
+                    ExprKind::MemberAccess { member, .. } => {
+                        self.module.classes.contains_key(member.name.as_str())
+                    }
+                    _ => false,
+                };
+                if class_scope_head && let Some(b) = self.static_vif_binding(recv) {
                     return Some((b, None));
                 }
                 if !self.vif_prop_name_possible(&member.name) {
@@ -2559,6 +2717,7 @@ impl Simulator {
         let returned_possible = !self.recv_call_memo.is_empty();
         if !alias_possible
             && self.virtual_iface_bindings.is_empty()
+            && self.static_vif_bindings.is_empty()
             && !self.vif_tokens_stored
             && !returned_possible
         {
