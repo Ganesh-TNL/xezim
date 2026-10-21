@@ -350,6 +350,24 @@ impl Simulator {
         }
     }
 
+    /// §6.20.2/§26.3 (issue #425): the qualified key `pkg::leaf` when it names
+    /// a COLLECTION. Unpacked-array package localparams keep their QUALIFIED
+    /// registration only — the `pkg::LIM` shape key plus per-element signals
+    /// `pkg::LIM[i]` — because a bare hoist would leak the name past the
+    /// import machinery (§26.2.2) and collide with a module's own same-named
+    /// array; contested package variables likewise get their own `pkg::name`
+    /// storage. `None` when the qualified spelling names no collection
+    /// (ordinary package variables hoist bare as before).
+    pub(super) fn pkg_qual_collection_key(&self, pkg: &str, leaf: &str) -> Option<String> {
+        let q = format!("{}::{}", pkg, leaf);
+        (self.module.arrays.contains_key(&q)
+            || self.module.arrays_2d.contains_key(&q)
+            || self.module.arrays_nd.contains_key(&q)
+            || self.module.dynamic_arrays.contains(&q)
+            || self.module.associative_arrays.contains_key(&q))
+        .then_some(q)
+    }
+
     pub(super) fn resolve_hier_name<'h>(
         &self,
         hier: &'h HierarchicalIdentifier,
@@ -626,7 +644,24 @@ impl Simulator {
             && !self.signals.contains_key(&hier.path[0].name.name)
         {
             // §26.3: a contested package variable has its own storage.
-            let qual = self.pkg_var_storage(&hier.path[0].name.name, &hier.path[1].name.name);
+            let mut qual = self.pkg_var_storage(&hier.path[0].name.name, &hier.path[1].name.name);
+            // §6.20.2/§26.3 (issue #425): an UNPACKED-ARRAY package
+            // localparam keeps its QUALIFIED registration only — the
+            // `pkg::LIM` shape key plus per-element signals `pkg::LIM[i]` —
+            // because a bare hoist would leak the name past the import
+            // machinery (§26.2.2) and collide with a module's own
+            // same-named array. Stripping the package prefix here resolved
+            // `pkg::LIM[3]` to a bare `LIM` that exists nowhere, so the
+            // element select fell through to a bit-select of a phantom
+            // scalar and read 0 at run time (the const paths were already
+            // fixed). Keep the qualified spelling when it names a
+            // collection; package VARIABLES still hoist bare as before.
+            if qual.is_none() {
+                qual = self.pkg_qual_collection_key(
+                    &hier.path[0].name.name,
+                    &hier.path[1].name.name,
+                );
+            }
             let stripped: String = qual
                 .as_deref()
                 .into_iter()

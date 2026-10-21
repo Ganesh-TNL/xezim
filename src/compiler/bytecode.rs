@@ -10537,6 +10537,23 @@ impl<'a> BytecodeCompiler<'a> {
                 return dense(leaf).then_some(leaf.clone());
             }
         }
+        // §6.20.2/§26.3 (issue #425): an UNPACKED-ARRAY package localparam
+        // registers under its QUALIFIED key only (`pkg::LIM`, elements
+        // `pkg::LIM[i]`) — bare visibility stays with the import machinery,
+        // unlike package variables, which hoist bare. `hier_raw_name` joins
+        // with '.', so `pkg::LIM` probed as "pkg.LIM" and missed, and the
+        // element read degraded to a bit-select of a phantom scalar. Probe
+        // the '::'-joined two-segment spelling; a dotted hierarchical name
+        // never contains '::', so this cannot capture another name.
+        if hier.path.len() == 2
+            && hier.path.iter().all(|s| s.selects.is_empty())
+            && hier.root.is_none()
+        {
+            let q = format!("{}::{}", hier.path[0].name.name, hier.path[1].name.name);
+            if self.arrays.contains_key(&q) {
+                return dense(&q).then_some(q);
+            }
+        }
         // Top-prefix strip, as `resolve_signal_id` does for scalars: an
         // absolute `<top>.<inst>.<mem>` path names the array registered as
         // `<inst>.<mem>` (top-level instances carry no prefix). Without it a

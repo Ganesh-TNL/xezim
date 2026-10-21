@@ -2062,15 +2062,67 @@ impl Simulator {
         // prefix and re-enter, as the identifier spelling does below. Scalar
         // `pkg::x` reads keep their own arm (parameters of two packages must
         // not collide through the bare name).
+        //
+        // §6.20.2/§26.3 (issue #425): an UNPACKED-ARRAY package localparam
+        // keeps its QUALIFIED registration only (`pkg::LIM` plus per-element
+        // `pkg::LIM[i]`); stripping the head here resolved the element select
+        // to a bare `LIM` that exists nowhere and read 0. Keep the qualified
+        // spelling when it names a collection — the indexed arms below
+        // resolve the base through `resolve_hier_name`, which returns the
+        // qualified key (package variables still hoist bare as before).
+        let pkg_qual_collection = match &expr.kind {
+            ExprKind::Index { expr: base, .. } | ExprKind::RangeSelect { expr: base, .. } => {
+                match &base.kind {
+                    ExprKind::Ident(h)
+                        if h.path.len() == 2
+                            && h.path[0].selects.is_empty()
+                            && self.module.packages.contains(&h.path[0].name.name) =>
+                    {
+                        self.pkg_qual_collection_key(
+                            &h.path[0].name.name,
+                            &h.path[1].name.name,
+                        )
+                        .is_some()
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
         if !self.module.packages.is_empty()
             && matches!(
                 expr.kind,
                 ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
             )
+            && !pkg_qual_collection
         {
             if let Some(stripped) = self.strip_package_lvalue(expr) {
                 return self.eval_expr_ctx(&stripped, ctx_width);
             }
+        }
+        // §6.20.2/§26.3 (issue #425): `(pkg::LIM)[3]` — the Paren wrapper is
+        // semantically transparent, but it defeats every base-shape probe
+        // above and below (including the package strip), so the select fell
+        // through to a bit-select of the whole-array read and returned 0.
+        // Unwrap the wrapper for the package-collection shape and re-enter.
+        if let ExprKind::Index { expr: base, index } = &expr.kind
+            && let ExprKind::Paren(inner) = &base.kind
+            && let ExprKind::Ident(h) = &inner.kind
+            && h.path.len() == 2
+            && h.path[0].selects.is_empty()
+            && self.module.packages.contains(&h.path[0].name.name)
+            && self
+                .pkg_qual_collection_key(&h.path[0].name.name, &h.path[1].name.name)
+                .is_some()
+        {
+            let rewritten = Expression::new(
+                ExprKind::Index {
+                    expr: inner.clone(),
+                    index: index.clone(),
+                },
+                expr.span,
+            );
+            return self.eval_expr_ctx(&rewritten, ctx_width);
         }
         // §13.5.2: an indexed / part-selected read through a `ref` formal
         // reads the caller's actual (see `ref_formal_redirect_hier`).
