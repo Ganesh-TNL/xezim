@@ -500,3 +500,24 @@ fn issue_432_static_vif_instance_method() {
     assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
     assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
 }
+
+/// #433: a frame-local virtual interface failed to shadow the class static of
+/// the same name. A static property has one cell, keyed to the declaring class
+/// at handle 0, and a bare vif name inside a method resolved against it on
+/// BOTH sides without ever asking the executing frame (§6.21/§8.4). The read
+/// side fell back to the class cell, so A's never-assigned local read the
+/// bound static; the write side resolved a static method's missing `this` to
+/// handle 0 and CLEARED that cell, so a declaration's synthesised initializer
+/// assignment (`virtual counter_if svif = null;`) destroyed the binding for
+/// every later reader — which is why D, a method with no local at all, failed.
+/// The controls keep the fix honest: C and D must still reach the class
+/// static, so neither guard may widen to "a bare name never reaches a static".
+#[test]
+fn static_vif_local_shadow_433() {
+    let msgs = outputs(
+        include_str!("../issue_cases/static_vif_local_shadow_433.sv"),
+        100_000,
+    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
+    assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
+}

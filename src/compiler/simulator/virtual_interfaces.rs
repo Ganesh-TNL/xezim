@@ -21,6 +21,19 @@ impl Simulator {
     /// the object's class when a `this` is live, else the class of the
     /// currently executing method, which is what a static method has.
     pub(super) fn static_vif_slot_of_bare(&self, name: &str) -> Option<(usize, String)> {
+        // §6.21/§8.4: a LOCAL of the executing frame shadows the class static.
+        // `virtual counter_if svif;` declared inside the method reads THAT
+        // frame's (unbound) handle, not the class cell the static binding
+        // lives in; without this filter a bound static leaked through an
+        // uninitialised local and `svif == null` read false. Mirrors the local
+        // filter `static_vif_key` applies on the write side.
+        if self
+            .local_stack
+            .last()
+            .is_some_and(|l| l.contains_key(name))
+        {
+            return None;
+        }
         if !self.vif_prop_name_possible(name) {
             return None;
         }
@@ -1059,6 +1072,22 @@ impl Simulator {
             // Bare `v = ...` inside a method — `v` is `this.<v>` (a class vif
             // property). The prop_info check below filters non-vif locals.
             ExprKind::Ident(h) if h.path.len() == 1 => {
+                // §6.21/§8.4: a LOCAL of the executing frame shadows the class
+                // static, and it must shadow the WRITE as well as the read.
+                // A static method has no `this`, so `handle` is 0 and the name
+                // below resolves to the CLASS cell; without this filter the
+                // initializer of a frame-local declaration — `virtual
+                // counter_if svif = null;`, whose assignment the declaration
+                // statement synthesises — cleared the static binding for every
+                // later reader, not just for its own frame. Mirrors the local
+                // filters `static_vif_key` and `static_vif_slot_of_bare` apply.
+                if self
+                    .local_stack
+                    .last()
+                    .is_some_and(|l| l.contains_key(h.path[0].name.name.as_str()))
+                {
+                    return false;
+                }
                 let handle = self.this_stack.last().copied().flatten().unwrap_or(0);
                 if handle == 0 {
                     static_scope = self.class_context_stack.last().cloned().flatten();
