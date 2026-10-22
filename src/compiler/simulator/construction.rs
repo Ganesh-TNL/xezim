@@ -1593,6 +1593,60 @@ impl Simulator {
         out
     }
 
+    /// The names an initializer READS that could be sibling fields of the same
+    /// object: a bare `Ident` (`h`) and a `this.h` member access.  A deeper
+    /// hierarchical reference (`pkg.h`, `u.h`) names another scope, and an
+    /// expression with selects (`q[i]`) is not a plain field read, so neither is
+    /// collected — pulling those in would re-run an initializer that never
+    /// depended on this object's field.
+    fn collect_field_reads(e: &Expression, out: &mut Vec<String>) {
+        match &e.kind {
+            ExprKind::Ident(hier) => {
+                if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
+                    out.push(hier.path[0].name.name.clone());
+                }
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                if matches!(expr.kind, ExprKind::This) {
+                    out.push(member.name.clone());
+                } else {
+                    Self::collect_field_reads(expr, out);
+                }
+            }
+            ExprKind::Unary { operand, .. } => Self::collect_field_reads(operand, out),
+            ExprKind::Binary { left, right, .. } => {
+                Self::collect_field_reads(left, out);
+                Self::collect_field_reads(right, out);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::collect_field_reads(condition, out);
+                Self::collect_field_reads(then_expr, out);
+                Self::collect_field_reads(else_expr, out);
+            }
+            ExprKind::Concatenation(parts) => {
+                for p in parts {
+                    Self::collect_field_reads(p, out);
+                }
+            }
+            ExprKind::Replication { count, exprs } => {
+                Self::collect_field_reads(count, out);
+                for e in exprs {
+                    Self::collect_field_reads(e, out);
+                }
+            }
+            ExprKind::Paren(inner) => Self::collect_field_reads(inner, out),
+            ExprKind::Index { expr, index } => {
+                Self::collect_field_reads(expr, out);
+                Self::collect_field_reads(index, out);
+            }
+            _ => {}
+        }
+    }
+
     /// Evaluate an instance-property initializer that contains a function call
     /// (`uvm_root r = uvm_root::get()`, `uvm_factory f = cs.get_factory()`,
     /// etc.) at CONSTRUCTION time and store the result on the instance.
@@ -2959,6 +3013,11 @@ impl Simulator {
                 .map(|(k, v)| (k.clone(), v))
                 .collect();
             let mut deferred_call_inits: Vec<(String, Expression, String)> = Vec::new();
+            // §8.7 companion: the scalar initializers that contain NO call and so
+            // were evaluated in the loop below.  Recorded so the ones that READ a
+            // deferred field can be re-evaluated after it (see the note there).
+            // (pname, init, slot)
+            let mut plain_inits: Vec<(String, Expression, String)> = Vec::new();
             for (pname, init) in inits {
                 // A STATIC member is shared across all instances (it lives in
                 // `class_statics`, not per-instance), so it must NOT be
@@ -3247,6 +3306,10 @@ impl Simulator {
                         continue;
                     }
                 }
+                // This is the plain scalar path: remember it (pname, init, slot)
+                // so a field that reads a deferred initializer can be redone
+                // after that initializer has run.
+                plain_inits.push((pname.clone(), init.clone(), slot.clone()));
                 let mut val = self.eval_expr(&init);
                 // §11.8.1: the re-evaluated initializer must be stamped with
                 // the PROPERTY's declared signedness and width, not the
@@ -3304,6 +3367,44 @@ impl Simulator {
                 });
                 for (_, init, slot) in &deferred_call_inits {
                     self.evaluate_call_init_at_construct(handle, slot, init, chain_is_param);
+                }
+            }
+            // §8.7 companion: a field whose initializer merely READS one of the
+            // deferred fields (`string h2 = {h, ".d"}` written after
+            // `string h = $sformatf("%m")`) contains no call, so the
+            // `expr_contains_call` filter above never revisits it — it kept the
+            // value folded while `h` still held its elaborate-time placeholder.
+            // Pull those readers in transitively (`d2` reads `d1` reads `d`) and
+            // evaluate each EXACTLY ONCE, in the order the dependencies settle,
+            // which is declaration order for a legal chain (§8.7: a field may
+            // only read an earlier one).
+            if !deferred_call_inits.is_empty() && !plain_inits.is_empty() {
+                let mut settled: Vec<String> = deferred_call_inits
+                    .iter()
+                    .map(|(p, _, _)| p.clone())
+                    .collect();
+                loop {
+                    let mut progressed = false;
+                    for (pname, init, slot) in &plain_inits {
+                        if settled.iter().any(|s| s == pname) {
+                            continue;
+                        }
+                        let mut reads: Vec<String> = Vec::new();
+                        Self::collect_field_reads(init, &mut reads);
+                        if reads.iter().any(|n| settled.iter().any(|s| s == n)) {
+                            self.evaluate_call_init_at_construct(
+                                handle,
+                                slot,
+                                init,
+                                chain_is_param,
+                            );
+                            settled.push(pname.clone());
+                            progressed = true;
+                        }
+                    }
+                    if !progressed {
+                        break;
+                    }
                 }
             }
             self.class_context_stack.pop();
