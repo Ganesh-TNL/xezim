@@ -4719,6 +4719,22 @@ impl Simulator {
                         None => Value::new(ew),
                     };
                 }
+                // §8.25/§6.20.2 (issue #423): an element read of a
+                // class-scope ARRAY constant — a header value parameter
+                // with unpacked dims (`C#(..)::TBL[i]`), a class localparam
+                // array (`C#(..)::LP[i]`, bare `LP[i]` inside a static
+                // method of the specialization), or a static array
+                // property spelled past two segments
+                // (`pkg::Cls::ARR[i]`). No arm above sees these: the value
+                // parameter folds to a scalar default, the localparam
+                // registers only as per-INSTANCE const properties, and the
+                // static-fixed arm above matches only the 2-segment
+                // `Cls::S` Ident — so the base resolved to a phantom
+                // scalar and the select read a bit of it. Materialize the
+                // specialization's elements on first read.
+                if let Some(v) = self.class_param_array_element(expr, index) {
+                    return v;
+                }
                 // §7.4.6 / §11.5.1: an x/z index reads x at the ELEMENT width,
                 // NOT element 0. `to_u64`/`to_i64` mask x bits to zero and
                 // never fail, so every `unwrap_or` below silently addressed

@@ -2837,6 +2837,271 @@ impl Simulator {
         None
     }
 
+    /// §8.25/§6.20.2 (issue #423): the element a `base[index]` read selects
+    /// when `base` names a class-scope ARRAY constant — a header VALUE
+    /// parameter declared with unpacked dimensions (`C#(..)::TBL[i]`), a
+    /// class-body `localparam` array (`C#(..)::LP[i]`, bare `LP[i]` inside
+    /// a static method of the specialization), or a STATIC array property
+    /// (`pkg::Cls::ARR[i]`, bare `ARR[i]` in a static method). None when
+    /// the base names nothing of the sort, so ordinary indexed reads pay
+    /// only a flatten plus a prefix probe.
+    pub(super) fn class_param_array_element(
+        &mut self,
+        base: &Expression,
+        index: &Expression,
+    ) -> Option<Value> {
+        // Peel a `C#(args)` wrapper off the base first: the Index arm runs
+        // before the base's own Specialization handling, which would
+        // evaluate the base as a scalar and restore `current_spec`.
+        let (spec, stripped) = if Self::expr_has_specialization(base) {
+            let saved = self.current_spec.clone();
+            let sp = self.resolve_call_spec_params(Self::extract_call_spec(base), &saved);
+            if let Some((ref b, ref s)) = sp {
+                self.ensure_spec_statics(b, s);
+            }
+            (sp, Self::strip_spec_shape(base))
+        } else {
+            (None, base.clone())
+        };
+        let segs = Self::flatten_member_path(&stripped)?;
+        let n = segs.len();
+        if n == 0 {
+            return None;
+        }
+        let leaf = segs[n - 1].clone();
+        // The class the prefix denotes — longest class part first, so a
+        // nested `outer::inner::LP` prefers the scoped key while a
+        // package-qualified `pkg::Cls::LP` falls through to `Cls`.
+        let mut start: Option<(String, Option<String>)> = None;
+        if n >= 2 {
+            for k in 0..n - 1 {
+                if let Some(r) = self.resolve_class_scope_prefix(&segs[k..n - 1].join("::")) {
+                    start = Some(r);
+                    break;
+                }
+            }
+        }
+        if start.is_none() && n == 1 {
+            // Bare `LP[i]`: the enclosing specialization (a static method
+            // of the specialization set it) or class context names the
+            // scope. A bare name that resolves to a module-scope array or
+            // signal is not class-scope — leave it to the ordinary arms.
+            if self.module.arrays.contains_key(&leaf)
+                || self.signal_name_to_id.contains_key(&leaf)
+            {
+                return None;
+            }
+            if let Some((b, s)) = self.current_spec.clone() {
+                start = Some((b, Some(s)));
+            } else if let Some(cls) = self.class_context_stack.last().cloned().flatten() {
+                start = Some((cls, None));
+            }
+        }
+        let (start_class, _) = start?;
+        // The active spec: the peeled `#(...)` wrapper wins; else the
+        // enclosing one when it denotes the same class.
+        let spec = spec.or_else(|| self.current_spec.clone().filter(|(b, _)| *b == start_class));
+        // Walk the chain for the DECLARING class.
+        let mut cur: Option<String> = Some(start_class);
+        let mut guard = 0;
+        while let Some(cn) = cur {
+            guard += 1;
+            if guard > 64 {
+                return None;
+            }
+            // A class-scope ARRAY constant is an `array_properties` entry
+            // that is either a const PROPERTY (the localparam-array
+            // registration) or a header parameter (`param_order`) — an
+            // ordinary instance array property is neither, and a static
+            // fixed array property lives in `static_fixed_arrays` instead.
+            let (param_arr, static_fixed, extends) = {
+                let Some(cd) = self.module.classes.get(&cn) else {
+                    return None;
+                };
+                (
+                    cd.array_properties.contains_key(&leaf)
+                        && (cd.properties.get(&leaf).is_some_and(|s| s.is_const)
+                            || cd.param_order.iter().any(|p| *p == leaf)),
+                    cd.static_fixed_arrays.iter().any(|(nm, ..)| *nm == leaf),
+                    cd.extends.clone(),
+                )
+            };
+            if param_arr {
+                let key = self.materialize_class_param_array(&cn, &leaf, spec.as_ref())?;
+                let (lo, hi, ew) = {
+                    let arr = self.class_param_arrays.get(&key)?;
+                    (arr.lo, arr.hi, arr.ew)
+                };
+                let iv = self.eval_expr(index);
+                return match iv.to_i64().filter(|_| !iv.has_xz()) {
+                    Some(i) if i >= lo && i <= hi => self
+                        .class_param_arrays
+                        .get(&key)
+                        .and_then(|arr| arr.elems.get((i - lo) as usize).cloned()),
+                    _ => Some(Value::new(ew.max(1))),
+                };
+            }
+            if static_fixed {
+                // The 2-segment `Cls::S[i]` shape is read by the
+                // static-fixed arm in the Index evaluator; this covers the
+                // package-qualified and bare-in-method spellings, from the
+                // same per-element cells.
+                let key = format!("{}::{}", cn, leaf);
+                let ew = self.module.arrays.get(&key).map(|t| t.2)?;
+                let iv = self.eval_expr(index);
+                return match iv.to_i64().filter(|_| !iv.has_xz()) {
+                    Some(i) => Some(
+                        self.get_signal_value_by_name(&format!("{}[{}]", key, i))
+                            .unwrap_or_else(|| Value::new(ew.max(1))),
+                    ),
+                    None => Some(Value::new(ew.max(1))),
+                };
+            }
+            cur = extends;
+        }
+        None
+    }
+
+    /// Build (once) the per-specialization elements of the class-scope
+    /// ARRAY constant `dcls::leaf` — shape from the core-recorded
+    /// `array_properties`, initializer from `property_inits` — and return
+    /// its `class_param_arrays` key. `spec` is the active
+    /// `(base, canon_sig)` when one is; None materializes the default
+    /// bindings. Element sources, in order: an explicit `#(...)` pattern
+    /// argument at the parameter's position (header value parameters),
+    /// else the recorded initializer — both evaluated with the declaring
+    /// specialization active, so items may reference the specialization's
+    /// value parameters (`'{N, N+1, ...}`).
+    fn materialize_class_param_array(
+        &mut self,
+        dcls: &str,
+        leaf: &str,
+        spec: Option<&(String, String)>,
+    ) -> Option<String> {
+        // An inherited constant belongs to the DECLARING class's
+        // specialization (mirrors `run_one_spec_statics`).
+        let canon_sig = match spec {
+            Some((b, s)) => {
+                let canon = self.canonicalize_spec_sig(b, s);
+                if b == dcls {
+                    canon
+                } else {
+                    self.ancestor_spec(b, &canon, dcls).unwrap_or(canon)
+                }
+            }
+            None => self.canonicalize_spec_sig(dcls, ""),
+        };
+        let key = format!("{}#{}::{}", dcls, canon_sig, leaf);
+        if self.class_param_arrays.contains_key(&key) {
+            return Some(key);
+        }
+        let (bounds, init, header_pos) = {
+            let Some(cd) = self.module.classes.get(dcls) else {
+                return None;
+            };
+            (
+                cd.array_properties.get(leaf).copied(),
+                cd.property_inits.get(leaf).cloned(),
+                cd.param_order.iter().position(|p| p == leaf),
+            )
+        };
+        let Some((lo, hi, ew)) = bounds else {
+            return None;
+        };
+        let saved_spec = self.current_spec.clone();
+        self.current_spec = Some((dcls.to_string(), canon_sig.clone()));
+        self.class_context_stack.push(Some(dcls.to_string()));
+        self.this_stack.push(None);
+        let built =
+            self.build_class_param_array_elems(leaf, &canon_sig, lo, hi, ew, &init, header_pos);
+        self.this_stack.pop();
+        self.class_context_stack.pop();
+        self.current_spec = saved_spec;
+        let (lo, hi, elems) = built?;
+        self.class_param_arrays
+            .insert(key.clone(), ClassParamArray { lo, hi, ew, elems });
+        Some(key)
+    }
+
+    /// Bounds + element evaluation with the declaring specialization
+    /// active (caller sets up / tears down the context).
+    fn build_class_param_array_elems(
+        &mut self,
+        leaf: &str,
+        canon_sig: &str,
+        lo: i64,
+        hi: i64,
+        ew: u32,
+        init: &Option<Expression>,
+        header_pos: Option<usize>,
+    ) -> Option<(i64, i64, Vec<Value>)> {
+        let count = (hi - lo + 1).max(0) as usize;
+        let mut elems: Vec<Value> = Vec::with_capacity(count);
+        // Source 1: an explicit `#(...)` pattern argument at the
+        // parameter's position (header value parameters only). A slot
+        // spelled as the parameter's own name is one a named list left at
+        // its default — use the initializer below instead.
+        if let Some(pos) = header_pos {
+            if let Some(frag) = Self::spec_arg_at(canon_sig, pos).map(str::trim) {
+                if frag != leaf {
+                    if let Some(pat) = Self::parse_spec_arg_expr(frag) {
+                        if let ExprKind::AssignmentPattern(items) = &pat.kind {
+                            for it in items {
+                                elems.push(self.eval_expr(it.expr()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Source 2: the recorded initializer (the default for a header
+        // param, the value for a localparam).
+        if elems.is_empty() {
+            if let Some(Expression { kind: ExprKind::AssignmentPattern(items), .. }) = init {
+                for it in items {
+                    elems.push(self.eval_expr(it.expr()));
+                }
+            }
+        }
+        elems.resize(count, Value::zero(ew));
+        Some((lo, hi, elems))
+    }
+
+    /// Parse a specialization-argument fragment into an `Expression` by
+    /// wrapping it in a scratch `localparam` declaration (the same trick
+    /// `param_default_fragment` uses). Needed for assignment-pattern
+    /// arguments (`#(4, '{9, 8, 7, 6})`) whose element expressions the
+    /// scalar fragment evaluator cannot spell.
+    fn parse_spec_arg_expr(text: &str) -> Option<Expression> {
+        use crate::ast::decl::{ModuleItem, ParameterKind};
+        let src = format!(
+            "module __xezim_spec_arg; localparam int __xezim_v [1] = {};\nendmodule\n",
+            text
+        );
+        let tokens = crate::lexer::Lexer::new(&src).tokenize();
+        let mut parser = sv_parser::parse::Parser::new(tokens);
+        let parsed = parser.parse_source_text();
+        if parser
+            .diagnostics()
+            .iter()
+            .any(|d| d.severity == sv_parser::diagnostics::Severity::Error)
+        {
+            return None;
+        }
+        let crate::ast::Description::Module(m) = parsed.descriptions.into_iter().next()? else {
+            return None;
+        };
+        m.items.into_iter().find_map(|it| match it {
+            ModuleItem::LocalparamDeclaration(pd) => match pd.kind {
+                ParameterKind::Data { assignments, .. } => {
+                    assignments.into_iter().next().and_then(|a| a.init)
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+
     /// Read a static class property, lazily seeding its shared cell from
     /// the declaring class's initial value on first access.
     /// For a class that is NOT parameterized itself, the specialization of

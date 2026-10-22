@@ -3294,6 +3294,22 @@ impl StaticMap {
     }
 }
 
+/// §8.25/§6.20.2 (issue #423): the materialized elements of one class-scope
+/// ARRAY constant of one specialization — a header VALUE parameter declared
+/// with unpacked dimensions (`class C #(int unsigned TBL [4] = '{...})`,
+/// read `C#(..)::TBL[i]`) or a class-body `localparam` array (`LP[i]`).
+/// Lazily built on first element read by
+/// `Simulator::materialize_class_param_array`; `lo`/`hi`/`ew` mirror what
+/// `module.arrays` holds for a module-scope array so bounds/x-z handling
+/// matches the ordinary fixed-array read arms.
+#[derive(Debug, Clone)]
+struct ClassParamArray {
+    lo: i64,
+    hi: i64,
+    ew: u32,
+    elems: Vec<Value>,
+}
+
 impl std::ops::Deref for StaticMap {
     type Target = HashMap<String, Value>;
     fn deref(&self) -> &Self::Target {
@@ -6872,6 +6888,13 @@ pub struct Simulator {
     /// keyed `"ClassName::propname"` where ClassName is the class that
     /// declared the static property.
     class_statics: StaticMap,
+    /// §8.25/§6.20.2 (issue #423): lazily materialized per-specialization
+    /// elements of class-scope ARRAY constants (header value parameters
+    /// with unpacked dims, class localparam arrays), keyed
+    /// `DeclClass#canon_sig::name` — or `DeclClass::name`-shaped default
+    /// bindings when no specialization is active. See
+    /// `materialize_class_param_array`.
+    class_param_arrays: HashMap<String, ClassParamArray>,
     /// Per-frame overlay for class/typedef types of frame-locals. The
     /// global var_class_types/var_typedef_types are keyed by BARE name and
     /// shared across every process, so a class-typed local declared in one

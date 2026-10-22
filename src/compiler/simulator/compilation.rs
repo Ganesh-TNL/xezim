@@ -499,6 +499,52 @@ impl Simulator {
             }
         }
 
+        // §8.9 (issue #423): a static fixed array property with an
+        // INITIALIZER (`static int unsigned ARR [3] = '{10, 20, 30};`)
+        // got its shape and default cells above, but the pattern's values
+        // were never distributed — `Cls::ARR[i]` (and a static method's
+        // bare `ARR[i]`) read the startup default (0/x) forever.
+        // Evaluate the initializer per element into the cells.
+        // Parameterized classes are skipped: their static initializers
+        // run per specialization (see the static_call_inits note below)
+        // and these shared cells cannot hold per-spec values.
+        let static_fixed_inits: Vec<(String, String, Expression)> = self
+            .module
+            .classes
+            .iter()
+            .filter(|(cn, _)| !self.class_is_parameterized(cn))
+            .flat_map(|(cn, cd)| {
+                cd.property_inits
+                    .iter()
+                    .filter(|(p, _)| {
+                        cd.static_fixed_arrays.iter().any(|(n, ..)| n.as_str() == p.as_str())
+                    })
+                    .map(|(p, e)| (cn.clone(), p.clone(), e.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for (cn, prop, init) in static_fixed_inits {
+            let Some(&(_, lo, hi, ew)) = self
+                .module
+                .classes
+                .get(&cn)
+                .and_then(|cd| cd.static_fixed_arrays.iter().find(|(n, ..)| *n == prop))
+            else {
+                continue;
+            };
+            let items: Vec<&Expression> = match &init.kind {
+                ExprKind::AssignmentPattern(items) => items.iter().map(|it| it.expr()).collect(),
+                _ => continue,
+            };
+            let key = format!("{}::{}", cn, prop);
+            self.class_context_stack.push(Some(cn.clone()));
+            for (i, item) in (lo..=hi).zip(items.iter()) {
+                let v = self.eval_expr(item).resize(ew.max(1));
+                self.signals.insert(format!("{}[{}]", key, i), v);
+            }
+            self.class_context_stack.pop();
+        }
+
         // Run static property initializers that call functions, e.g. riscv-dv's
         // per-instruction `static bit _ = riscv_instr::register(NAME)` (the
         // DEFINE_INSTR registration). The lazy static-init path only stores the
