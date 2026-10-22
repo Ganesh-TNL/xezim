@@ -4093,6 +4093,30 @@ impl Simulator {
                         }
                     }
                 }
+                // §8.4: `tb.u_leaf.obj.field = v` writes the OBJECT.  The dotted
+                // name used to fall through to the signal table, which resolves
+                // the leaf flat and landed on tb's own `field` — the object kept
+                // its old value while a read through a handle showed the new one.
+                // Only taken when the parent really is a live object that declares
+                // the member, so struct/net lvalues are untouched.
+                if hier.path.len() >= 2 && hier.path.iter().all(|s| s.selects.is_empty()) {
+                    if let Some(h) = self.hier_parent_handle(hier) {
+                        let member_name = hier.path[hier.path.len() - 1].name.name.as_str();
+                        if self.read_member_value(h, member_name).is_some() {
+                            if let Some(ok) = self.static_write_via_handle(
+                                h,
+                                None,
+                                None,
+                                member_name,
+                                val.clone(),
+                            ) {
+                                return ok;
+                            }
+                            let fitted = self.fit_class_prop(h, member_name, &val);
+                            return self.set_prop_if_changed(h, member_name, fitted);
+                        }
+                    }
+                }
                 if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
                     let name = &hier.path[0].name.name;
                     // Check local stack
