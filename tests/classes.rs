@@ -783,6 +783,9 @@ mod class_assignment_types_499;
 #[path = "classes/class_param_array_reads_503.rs"]
 mod class_param_array_reads_503;
 
+#[path = "classes/randomize_std_static_subroutine_locals_513.rs"]
+mod randomize_std_static_subroutine_locals;
+
 #[path = "classes/class_field_dependency_order.rs"]
 mod class_field_dependency_order;
 #[path = "classes/hier_class_member_access.rs"]

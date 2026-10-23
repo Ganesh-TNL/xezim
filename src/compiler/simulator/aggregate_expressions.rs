@@ -1862,25 +1862,49 @@ impl Simulator {
                 arrays.push((written, nm, idx, w.max(1), signed, ev));
                 continue;
             }
-            if let Some((root, _)) = name.split_once('.') {
+            if let Some((parent, _)) = name.rsplit_once('.') {
                 // A field of a packed struct that is itself a target: a view
-                // of that variable, not a variable of its own.
-                if targets.iter().any(|(n, _)| n == root) {
+                // of that variable, not a variable of its own.  Compare the
+                // IMMEDIATE parent: a static subroutine local's resolved name
+                // is dotted the same way (`<fn>.<var>`), and matching only the
+                // FIRST segment never matched `<fn>.<var>`'s parent, so every
+                // static local was mistaken for a field view and dropped the
+                // whole call out of the joint solver.
+                if targets.iter().any(|(n, _)| n == parent) {
                     continue;
                 }
-                return Err(rand_csp::CspOutcome::NotApplicable);
             }
             if !matches!(lv.kind, ExprKind::Ident(_)) {
+                // `obj.f` / `s.g.h` — a field access this solve does not model.
+                // A plain identifier is only *scope*-qualified (`<fn>.<var>`),
+                // which is a real variable of the call and joins below.
                 return Err(rand_csp::CspOutcome::NotApplicable);
             }
             let cur = self.eval_expr(lv);
             if cur.is_real {
                 return Err(rand_csp::CspOutcome::NotApplicable);
             }
+            // The name the constraints write this variable by.  A static
+            // subroutine local resolves to `<fn>.<var>`, but the `with {…}`
+            // block names it `<var>`; the solve matches operands by the name
+            // as written (`csp_solve_path`) and reads and writes through `lv`
+            // (`csp.scope`), so it registers under the written name — exactly
+            // as the array path above does.
+            let written = match &lv.kind {
+                ExprKind::Ident(h)
+                    if h.root.is_none()
+                        && h.path.len() == 1
+                        && h.path[0].selects.is_empty()
+                        && h.path[0].name.name != *name =>
+                {
+                    h.path[0].name.name.clone()
+                }
+                _ => name.clone(),
+            };
             // A local wider than 64 bits joins as segments (`csp_scope`).
             let ev = enum_vals(self, name);
             scalars.push((
-                name.clone(),
+                written,
                 lv.clone(),
                 cur.width.max(1),
                 cur.is_signed,
