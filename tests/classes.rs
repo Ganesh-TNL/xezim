@@ -388,6 +388,8 @@ mod randomize_wide_open;
 mod randomize_shift_mask_wide_peer;
 #[path = "classes/randomize_inside_range.rs"]
 mod randomize_inside_range;
+#[path = "classes/randomize_std_failed_restores_arrays.rs"]
+mod randomize_std_failed_restores_arrays;
 #[path = "classes/randomize_object_arrays.rs"]
 mod randomize_object_arrays;
 #[path = "classes/randomize_issue_255_full.rs"]

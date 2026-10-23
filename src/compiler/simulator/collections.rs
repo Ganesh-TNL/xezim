@@ -3883,7 +3883,38 @@ impl Simulator {
                             // assignments below write the targets, so keep
                             // the integral scalar ones to put back.
                             let mut snapshot: Vec<(Expression, Value)> = Vec::new();
+                            // The array targets are written by the same trial
+                            // draws, and the solver commits an array element by
+                            // element, so a failed call used to leave the
+                            // rejected draw behind. Keep every element too.
+                            let mut array_snapshot: Vec<(String, i64, Value)> = Vec::new();
                             for a in args {
+                                if let Some(nm) = self.array_operand_name(a) {
+                                    let idx: Vec<i64> = if self
+                                        .module
+                                        .dynamic_arrays
+                                        .contains(&nm)
+                                        || self
+                                            .signals
+                                            .contains_key(&Self::name_with_suffix(&nm, ".size"))
+                                    {
+                                        (0..self.get_queue_size(&nm) as i64).collect()
+                                    } else if let Some(&(lo, hi, _)) =
+                                        self.module.arrays.get(&nm)
+                                    {
+                                        (lo.min(hi)..=lo.max(hi)).collect()
+                                    } else {
+                                        continue;
+                                    };
+                                    for i in idx {
+                                        if let Some(v) =
+                                            self.get_signal_value_by_name(&format!("{nm}[{i}]"))
+                                        {
+                                            array_snapshot.push((nm.clone(), i, v));
+                                        }
+                                    }
+                                    continue;
+                                }
                                 if matches!(a.kind, ExprKind::Ident(_))
                                     && self.array_operand_name(a).is_none()
                                     && self.lrm_self_width(a).is_some_and(|w| w <= 64)
@@ -4119,6 +4150,15 @@ impl Simulator {
                                 self.rand_fail_warn_std(constraints);
                                 for (lv, v) in &snapshot {
                                     self.assign_value(lv, v);
+                                }
+                                // §18.12: the array targets are put back too.
+                                // A failed call leaves every variable exactly
+                                // as it was, arrays included.
+                                for (nm, i, v) in &array_snapshot {
+                                    self.set_signal_value_by_name(
+                                        &format!("{nm}[{i}]"),
+                                        v.clone(),
+                                    );
                                 }
                             }
                             return Value::from_u64(if satisfied { 1 } else { 0 }, 32);
