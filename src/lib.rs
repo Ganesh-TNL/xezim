@@ -604,6 +604,109 @@ fn make_bare_ident(name: &str, span: ast::Span) -> ast::expr::Expression {
     )
 }
 
+/// Bare (single-segment, unselected) identifiers an expression READS.
+/// Hierarchical references (`u.x`, `pkg.y`) are deliberately not collected:
+/// they name another scope, and a declaration pulled in because of one would
+/// have its initializer run a second time for no benefit.
+fn collect_bare_reads(e: &ast::expr::Expression, out: &mut Vec<String>) {
+    use ast::expr::ExprKind;
+    match &e.kind {
+        ExprKind::Ident(hier) => {
+            if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
+                out.push(hier.path[0].name.name.clone());
+            }
+        }
+        ExprKind::Unary { operand, .. } => collect_bare_reads(operand, out),
+        ExprKind::Binary { left, right, .. } => {
+            collect_bare_reads(left, out);
+            collect_bare_reads(right, out);
+        }
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            collect_bare_reads(condition, out);
+            collect_bare_reads(then_expr, out);
+            collect_bare_reads(else_expr, out);
+        }
+        ExprKind::Concatenation(parts) => {
+            for p in parts {
+                collect_bare_reads(p, out);
+            }
+        }
+        ExprKind::Replication { count, exprs } => {
+            collect_bare_reads(count, out);
+            for e in exprs {
+                collect_bare_reads(e, out);
+            }
+        }
+        ExprKind::Paren(inner) => collect_bare_reads(inner, out),
+        ExprKind::MemberAccess { expr, .. } => collect_bare_reads(expr, out),
+        ExprKind::Index { expr, index } => {
+            collect_bare_reads(expr, out);
+            collect_bare_reads(index, out);
+        }
+        _ => {}
+    }
+}
+
+/// Does the expression call anything (system function or user function)?
+/// A reader that does is left to elaboration's own non-const path: re-issuing
+/// it would run a potentially side-effecting call a second time.
+fn contains_any_call(e: &ast::expr::Expression) -> bool {
+    use ast::expr::ExprKind;
+    match &e.kind {
+        // Any call at all disqualifies a reader (see the caller's note).
+        ExprKind::SystemCall { .. } | ExprKind::Call { .. } => true,
+        ExprKind::Unary { operand, .. } => contains_any_call(operand),
+        ExprKind::Binary { left, right, .. } => contains_any_call(left) || contains_any_call(right),
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            contains_any_call(condition)
+                || contains_any_call(then_expr)
+                || contains_any_call(else_expr)
+        }
+        ExprKind::Concatenation(parts) => parts.iter().any(contains_any_call),
+        ExprKind::Paren(inner) => contains_any_call(inner),
+        ExprKind::MemberAccess { expr, .. } => contains_any_call(expr),
+        ExprKind::Index { expr, index } => contains_any_call(expr) || contains_any_call(index),
+        _ => false,
+    }
+}
+
+/// This scope's declarators that could be re-issued, in declaration order,
+/// skipping unpacked-array declarators (elaboration's assignment-pattern path
+/// makes those always procedural).  A `generate` region shares the enclosing
+/// scope, so its declarations are collected too.
+fn collect_static_init_candidates<'a>(
+    items: &'a [ast::decl::ModuleItem],
+    out: &mut Vec<(&'a ast::stmt::VarDeclarator, &'a ast::expr::Expression)>,
+    depth: u32,
+) {
+    use ast::decl::ModuleItem;
+    if depth > 64 {
+        return;
+    }
+    for item in items {
+        if let ModuleItem::DataDeclaration(dd) = item {
+            for d in &dd.declarators {
+                if !d.dimensions.is_empty() {
+                    continue;
+                }
+                if let Some(init) = &d.init {
+                    out.push((d, init));
+                }
+            }
+        } else if let ModuleItem::GenerateRegion(gr) = item {
+            collect_static_init_candidates(&gr.items, out, depth + 1);
+        }
+    }
+}
+
 fn walk_module_static_inits(
     items: &[ast::decl::ModuleItem],
     elab: &elaborate::ElaboratedModule,
@@ -611,41 +714,66 @@ fn walk_module_static_inits(
     depth: u32,
     out: &mut Vec<elaborate::InitialBlock>,
 ) {
-    use ast::decl::ModuleItem;
     use ast::stmt::{Statement, StatementKind};
     if depth > 64 {
         return; // defensive recursion cap
     }
-    for item in items {
-        match item {
-            ModuleItem::DataDeclaration(dd) => {
-                for d in &dd.declarators {
-                    // Unpacked-array declarators take elaboration's
-                    // assignment-pattern path (always procedural) — skip.
-                    if !d.dimensions.is_empty() {
-                        continue;
-                    }
-                    let Some(init) = &d.init else { continue };
-                    if contains_simtime_syscall(init) && elab_classifies_const(init, elab, scope) {
-                        out.push(elaborate::InitialBlock {
-                            stmt: Statement::new(
-                                StatementKind::BlockingAssign {
-                                    lvalue: make_bare_ident(&d.name.name, d.name.span),
-                                    rvalue: init.clone(),
-                                },
-                                d.name.span,
-                            ),
-                            scope: scope.to_string(),
-                        });
-                    }
-                }
+    // Gather the whole scope first (a `generate` region is the same scope):
+    // deciding what to re-issue is a property of the scope, not of one item.
+    let mut cand: Vec<(&ast::stmt::VarDeclarator, &ast::expr::Expression)> = Vec::new();
+    collect_static_init_candidates(items, &mut cand, depth);
+    if cand.is_empty() {
+        return;
+    }
+    // Seed: the initializer itself calls a simulation-time system function that
+    // elaboration folded to 0/"".
+    let is_seed = |init: &ast::expr::Expression| -> bool {
+        contains_simtime_syscall(init) && elab_classifies_const(init, elab, scope)
+    };
+    // §6.21 companion: a declaration that merely READS a re-issued declaration
+    // was folded while that name still held its placeholder, so it must be
+    // re-issued too — after it.  Take the readers to a fixpoint (`t2` reads
+    // `t1`, `t3` reads `t2`).  Readers containing a call are left alone: they
+    // are already non-const for elaboration, which schedules them itself, and
+    // re-running one could duplicate a side effect.
+    let mut reissue: Vec<String> = cand
+        .iter()
+        .filter(|(_, init)| is_seed(init))
+        .map(|(d, _)| d.name.name.clone())
+        .collect();
+    loop {
+        let mut changed = false;
+        for (d, init) in &cand {
+            if contains_any_call(init) || reissue.iter().any(|r| r == &d.name.name) {
+                continue;
             }
-            // Unconditional `generate ... endgenerate` region — same scope.
-            ModuleItem::GenerateRegion(gr) => {
-                walk_module_static_inits(&gr.items, elab, scope, depth + 1, out);
+            let mut reads = Vec::new();
+            collect_bare_reads(init, &mut reads);
+            if reads.iter().any(|n| reissue.iter().any(|r| r == n)) {
+                reissue.push(d.name.name.clone());
+                changed = true;
             }
-            _ => {}
         }
+        if !changed {
+            break;
+        }
+    }
+    // Emit in DECLARATION order, so every re-issued reader follows the names it
+    // reads (the blocks run in this order at time 0).
+    for (d, init) in &cand {
+        if !is_seed(init) && !reissue.iter().any(|r| r == &d.name.name) {
+            continue;
+        }
+        out.push(elaborate::InitialBlock {
+            stmt: Statement::new(
+                StatementKind::BlockingAssign {
+                    lvalue: make_bare_ident(&d.name.name, d.name.span),
+                    rvalue: (*init).clone(),
+                },
+                d.name.span,
+            ),
+            scope: scope.to_string(),
+        });
     }
 }
 

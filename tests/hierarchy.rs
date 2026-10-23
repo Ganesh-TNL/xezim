@@ -322,3 +322,6 @@ mod package_array_params;
 
 #[path = "hierarchy/vif_defaults_469.rs"]
 mod vif_defaults_469;
+
+#[path = "hierarchy/static_init_dependency_order.rs"]
+mod static_init_dependency_order;
