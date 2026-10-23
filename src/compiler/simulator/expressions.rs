@@ -6222,6 +6222,24 @@ impl Simulator {
                                 }
                                 continue;
                             }
+                            // §8.3.2/§6.20.2 (issue #388): a class-scope ARRAY
+                            // constant operand (`v inside {pkg::Cls::T}`,
+                            // `{Cls::T}` from a foreign class, bare `{T}` in
+                            // a method of the declaring class) is set
+                            // membership over its elements, like any other
+                            // array operand — the whole-array reference has
+                            // no scalar value, so the direct compare below
+                            // matched against a zero.
+                            if let Some(c) = self.resolve_class_scope_array_const(r) {
+                                for i in c.lo..=c.hi {
+                                    if let Some(ev) = self.class_scope_array_const_elem(&c, i) {
+                                        if val.wildcard_eq(&ev).is_true() {
+                                            return Value::from_u64(1, 1);
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
                             // §11.4.13: a set element is compared with the
                             // tested expression using WILDCARD equality, so x/z
                             // bits in the element are don't-cares — exactly what

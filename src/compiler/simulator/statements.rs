@@ -637,6 +637,50 @@ impl Simulator {
                 self.auto_loop_vars.push(nm.clone());
             }
         }
+        // §8.3.2/§6.20.2 (issue #388): `foreach (pkg::Cls::T[k])` —
+        // `foreach (Cls::T[k])` from a foreign class, bare `foreach (T[k])`
+        // in a method of the declaring class — iterates a class-scope ARRAY
+        // constant (localparam array, header value-parameter array, static
+        // fixed-array property). The constant has no module-scope
+        // collection cell, so the generic arms below found no rows and the
+        // body never ran.
+        if vars.len() == 1 {
+            if let Some(c) = self.resolve_class_scope_array_const(array) {
+                let iv = vars[0].as_ref().map(|v| v.name.clone());
+                if let Some(n) = &iv {
+                    self.widths.insert(n.clone(), 32);
+                }
+                // §12.7.3: visit the indices in DECLARED order — a
+                // descending `[5:4]` constant iterates 5 then 4, not the
+                // normalized ascending pair.
+                let order: Vec<i64> = if c.left > c.right {
+                    (c.right..=c.left).rev().collect()
+                } else {
+                    (c.left..=c.right).collect()
+                };
+                'csc: for i in order {
+                    if self.finished {
+                        break 'csc;
+                    }
+                    if let Some(n) = &iv {
+                        self.set_loop_var(n, Self::signed_loop_val(i));
+                    }
+                    self.continue_flag = false;
+                    *iterations = iterations.saturating_add(1);
+                    self.exec_statement(body);
+                    if self.break_flag {
+                        break 'csc;
+                    }
+                    self.continue_flag = false;
+                }
+                self.auto_loop_vars.truncate(fe_auto_len);
+                self.restore_loop_vars(&fe_saved);
+                if !self.return_flag && self.disable_target.is_none() {
+                    self.break_flag = false;
+                }
+                return;
+            }
+        }
         // §12.7.3/§7.4.5: `foreach (a[i, j])` over a fixed array of queues
         // walks each row's own size.
         if vars.len() == 2

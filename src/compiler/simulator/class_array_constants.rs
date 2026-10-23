@@ -479,7 +479,7 @@ impl Simulator {
         value
     }
 
-    fn materialize_class_param_array(
+    pub(super) fn materialize_class_param_array(
         &mut self,
         class: &str,
         leaf: &str,

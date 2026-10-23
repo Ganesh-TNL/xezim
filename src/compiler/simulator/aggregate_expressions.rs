@@ -3808,6 +3808,42 @@ impl Simulator {
                     if let Some(rv) = self.member_array_query(&sn, arg, dim) {
                         return rv;
                     }
+                    // §8.3.2/§6.20.2 (issue #388): the query on a class-scope
+                    // ARRAY constant — `$size(pkg::Cls::T)`, `$size(Cls::T)`
+                    // (which parses as a MemberAccess when the prefix is a
+                    // plain class), bare `$size(T)` in a method of the
+                    // declaring class. The constant has no module-scope shape
+                    // row, so the query fell through to the operand's packed
+                    // width (32) while the element reads were right.
+                    if dim == 1 {
+                        if let Some(c) = self.resolve_class_scope_array_const(arg) {
+                            let size = (c.hi - c.lo + 1).max(0) as u64;
+                            // Declared bounds in source order: a descending
+                            // `[5:4]` constant reports `$left` 5 / `$right` 4
+                            // and `$increment` -1 (§20.7); the normalized
+                            // (lo, hi) pair covers `$low`/`$high`/`$size`.
+                            // Falls back to the normalized pair (ascending)
+                            // when no declared-dimension row was recorded.
+                            let result = match sn.as_str() {
+                                "$left" => c.left as u64,
+                                "$right" => c.right as u64,
+                                "$high" => c.hi as u64,
+                                "$low" => c.lo as u64,
+                                "$size" => size,
+                                "$increment" => {
+                                    if c.left > c.right {
+                                        0u64.wrapping_sub(1)
+                                    } else {
+                                        1
+                                    }
+                                }
+                                _ => 0,
+                            };
+                            let mut rv = Value::from_u64(result & 0xFFFF_FFFF, 32);
+                            rv.is_signed = true;
+                            return rv;
+                        }
+                    }
                     // Resolve the operand to the name its declared bounds
                     // are registered under. A plain / hierarchical Ident
                     // resolves as it always did; a HANDLE-QUALIFIED member

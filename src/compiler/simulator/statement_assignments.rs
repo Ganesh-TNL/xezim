@@ -3886,6 +3886,31 @@ impl Simulator {
                 self.settle_after_proc_write();
                 return;
             }
+            // §8.3.2/§6.20.2 (issue #388): `dst = pkg::Cls::T` — whole-array
+            // copy from a class-scope ARRAY constant (`Cls::T` from a
+            // foreign class, bare `T` in a method of the declaring class).
+            // The RHS has no module-scope shape row, so the fixed-to-fixed
+            // arm above never fired; the assign fell through to a scalar
+            // store and left the destination's elements at their defaults.
+            if self.module.arrays.contains_key(&*lname)
+                && !self.module.dynamic_arrays.contains(&*lname)
+            {
+                if let Some(c) = self.resolve_class_scope_array_const(rvalue) {
+                    let (llo, lhi, _) = self.module.arrays[&*lname];
+                    let count = (lhi - llo + 1).min(c.hi - c.lo + 1).max(0) as usize;
+                    for i in 0..count {
+                        let rval = self
+                            .class_scope_array_const_elem(&c, c.lo + i as i64)
+                            .unwrap_or(Value::zero(32));
+                        self.set_signal_value_by_name(
+                            &format!("{}[{}]", lname, llo + i as i64),
+                            rval,
+                        );
+                    }
+                    self.settle_after_proc_write();
+                    return;
+                }
+            }
         }
         if let ExprKind::Ident(lhier) = &lvalue.kind {
             let mut lname = if self.ident_shadowed_by_non_collection(lhier) {
@@ -3910,6 +3935,32 @@ impl Simulator {
             {
                 lname = std::borrow::Cow::Owned(n);
                 class_dyn = true;
+            }
+            // §8.3.2/§6.20.2 (issue #388): `arr_fld = pkg::T` inside a
+            // method — the lvalue resolves to the instance-scoped
+            // `<handle>#arr_fld` row (or a module array), while the RHS
+            // parses as MemberAccess in a method body, so the Ident/Ident
+            // fixed-to-fixed arm above never matched and the assign fell
+            // through to a scalar store. Copy element-wise from the
+            // class-/package-scope constant like any whole-array source.
+            if self.module.arrays.contains_key(&*lname)
+                && !self.module.dynamic_arrays.contains(&*lname)
+            {
+                if let Some(c) = self.resolve_class_scope_array_const(rvalue) {
+                    let (llo, lhi, _) = self.module.arrays[&*lname];
+                    let count = (lhi - llo + 1).min(c.hi - c.lo + 1).max(0) as usize;
+                    for i in 0..count {
+                        let rval = self
+                            .class_scope_array_const_elem(&c, c.lo + i as i64)
+                            .unwrap_or(Value::zero(32));
+                        self.set_signal_value_by_name(
+                            &format!("{}[{}]", lname, llo + i as i64),
+                            rval,
+                        );
+                    }
+                    self.settle_after_proc_write();
+                    return;
+                }
             }
             if self.module.arrays.contains_key(&*lname) || class_dyn {
                 // Queue/array slice assignment: lq = rq[a:b]

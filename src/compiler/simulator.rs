@@ -3312,6 +3312,27 @@ struct ClassParamArray {
     elems: Vec<Value>,
 }
 
+/// §8.3.2/§6.20.2 (issue #388): a class-scope ARRAY constant resolved for a
+/// WHOLE-COLLECTION context — `$size`, `inside`, `foreach`, whole-array copy —
+/// spelled `pkg::Cls::T`, `Cls::T` from a foreign class, or bare `T` inside a
+/// method of the declaring class. Holds the bounds plus the element source:
+/// `param_cell` constants (class-body `localparam` arrays, header value
+/// parameters with unpacked dims) read the materialized `class_param_arrays`
+/// cell named by `key`; a static fixed-array property reads its per-element
+/// signals `Cls::name[i]` (also named by `key`).
+struct ClassScopeArrayConst {
+    key: String,
+    /// Normalized bounds (min, max) — the indexing domain.
+    lo: i64,
+    hi: i64,
+    /// Declared bounds in source order (`[5:4]` gives (5, 4)) — drives
+    /// `$left`/`$right`/`$increment` and the `foreach` visit order. Falls
+    /// back to the normalized pair when no declared-dimension row exists.
+    left: i64,
+    right: i64,
+    param_cell: bool,
+}
+
 impl std::ops::Deref for StaticMap {
     type Target = HashMap<String, Value>;
     fn deref(&self) -> &Self::Target {
