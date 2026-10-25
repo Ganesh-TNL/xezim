@@ -1322,6 +1322,22 @@ impl Simulator {
                         }
                     }
                     let frag = self.expr_to_spec_fragment(e)?;
+                    // §8.25: a bare SELF-REFERENCE — the argument names the
+                    // class whose specialization context we are resolving in
+                    // (`uvm_object_registry#(C,"C") type_id`, written by
+                    // `uvm_object_utils(C)`) — denotes the CURRENT
+                    // specialization `C#(sig)`, not the default. Without
+                    // this, a static method entered through a specialization
+                    // (`C#(T2)::get_type()`, or `v.get_type()` on a null `v`
+                    // declared `C#(T2)`) keyed the registry on the default
+                    // `C`, so the factory created default-specialized objects
+                    // and the `$cast` in `uvm_create_on` correctly rejected
+                    // them.
+                    if let Some((b, s)) = &self.current_spec {
+                        if frag == *b {
+                            return Some(format!("{}#({})", b, s));
+                        }
+                    }
                     // Resolve bare type-param names (e.g. `T`, `this_type`)
                     // through the active specialization so the typedef's
                     // specialization carries concrete values.

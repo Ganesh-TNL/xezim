@@ -416,6 +416,8 @@ mod randomize_soft_solver_gave_up;
 mod randomize_solve_before;
 #[path = "classes/randomize_with_this_and_subset.rs"]
 mod randomize_with_this_and_subset;
+#[path = "classes/null_receiver_static_spec_544.rs"]
+mod null_receiver_static_spec;
 #[path = "classes/randomize_work_budget.rs"]
 mod randomize_work_budget;
 #[path = "classes/scope_randomize_dist_and_foreach.rs"]
