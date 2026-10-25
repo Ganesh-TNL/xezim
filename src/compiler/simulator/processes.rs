@@ -1246,6 +1246,21 @@ impl Simulator {
         *self.name_resolve_hint.borrow_mut() = saved_hint;
     }
 
+    /// #35/#t0-comb-defer: the full settle that consumes
+    /// `deferred_proc_entries` (the cont-assign updates a yielding process
+    /// deferred). The drained entries must evaluate in a NEUTRAL scope: a
+    /// process's name-resolve hint (its instance path) would anchor a
+    /// same-named cont-assign LHS into the instance — the u_h.t
+    /// self-assign hazard (see tests/hierarchy/same_name_port_hop.rs).
+    pub(super) fn drain_deferred_proc_settle(&mut self) {
+        if self.deferred_proc_entries.is_empty() || self.proc_settle_defer {
+            return;
+        }
+        let saved_hint = self.name_resolve_hint.borrow_mut().take();
+        self.settle_combinatorial();
+        *self.name_resolve_hint.borrow_mut() = saved_hint;
+    }
+
     /// Dispatch a scheduled payload, recognizing the empty marker used by a
     /// retained dynamic-delay always assignment.
     pub(super) fn run_process_payload(&mut self, pid: usize, stmts: &ProcCont) {
@@ -1268,15 +1283,17 @@ impl Simulator {
         // #35: the process just YIELDED (parked or finished) — the
         // cont-assign update events its writes scheduled become runnable
         // now (§10.3), so the deferred entries drain before anything else
-        // in the slot observes the nets.
-        if !self.deferred_proc_entries.is_empty() && !self.proc_settle_defer {
-            // The drained entries must evaluate in a NEUTRAL scope: the
-            // process's name-resolve hint (its instance path) would anchor a
-            // same-named cont-assign LHS into the instance — the u_h.t
-            // self-assign hazard (see tests/hierarchy/same_name_port_hop.rs).
-            let saved_hint = self.name_resolve_hint.borrow_mut().take();
-            self.settle_combinatorial();
-            *self.name_resolve_hint.borrow_mut() = saved_hint;
+        // in the slot observes the nets — EXCEPT during the time-0 start
+        // batch (#t0-comb-defer): a commercial simulator keeps those update
+        // events behind the ENTIRE batch (active-region FIFO), so a
+        // source-later blocking-body `always` is parked and armed before
+        // the propagation fires. Draining per-process here would fire the
+        // edge while later starts have not run yet and silently lose it.
+        if !self.deferred_proc_entries.is_empty()
+            && !self.proc_settle_defer
+            && self.t0_starts_remaining == 0
+        {
+            self.drain_deferred_proc_settle();
         }
     }
 

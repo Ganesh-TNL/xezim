@@ -3060,6 +3060,13 @@ impl TimingWheel {
         event
     }
 
+    /// Events currently queued at `time` (wheel slot + overflow). Captured
+    /// once, before the first pop, to size the time-0 start batch for
+    /// `t0_starts_remaining`.
+    fn slot_len(&self, time: u64) -> usize {
+        self.wheel[Self::slot(time)].len() + self.overflow.get(&time).map_or(0, |v| v.len())
+    }
+
     /// Remove and return all events at the given time.
     fn remove(&mut self, time: u64) -> EventList {
         self.current_time = time;
@@ -6754,6 +6761,15 @@ pub struct Simulator {
     /// normal dependency machinery — entry INDICES would go stale across the
     /// topo reorder / lazy materialization of `comb_entries`.
     deferred_proc_entries: Vec<u32>,
+    /// (#t0-comb-defer) Compile-time process starts still unrun in the
+    /// time-0 slot. A commercial simulator queues the cont-assign /
+    /// port-connect update events that a time-0 process write schedules
+    /// BEHIND every start activation of the slot (active-region FIFO), so a
+    /// source-later blocking-body `always` parked on the propagated signal
+    /// is armed before the propagation fires. While positive, the #35
+    /// deferred-entry drain is held; it releases once, when the last start
+    /// of the batch has run.
+    t0_starts_remaining: usize,
     /// Maximum snapshot→apply_nba→settle→check_edges rounds per event-loop
     /// iter (see drain_edge_cascade). Cached at sim init; override via
     /// XEZIM_CASCADE_LIMIT env var.

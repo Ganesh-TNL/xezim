@@ -534,6 +534,11 @@ impl Simulator {
         for (p, c) in inact {
             self.event_queue.schedule(ft, p, c);
         }
+        // #t0-comb-defer: the abandoned slot's unrun starts are re-dated to
+        // `ft` — they are no longer time-0 starts, so reopen the deferred
+        // drain (a stuck counter would hold every cont-assign propagation
+        // forever).
+        self.t0_starts_remaining = 0;
         // Close out the slot being abandoned before the clock jumps. Every
         // other time advance services the postponed region first; this
         // recovery path is the last one that did not, and skipping it would
@@ -1447,6 +1452,19 @@ impl Simulator {
                 if !self.is_pid_suspended(pid) {
                     self.child_finished(pid);
                 }
+                // #t0-comb-defer: this pop consumed one of the compile-time
+                // time-0 starts (fork children re-queued at the front are not
+                // starts — `last_pop_front` marks them). When the LAST start
+                // has run, the batch is complete and the cont-assign /
+                // port-connect updates deferred from its writes become
+                // runnable, matching the commercial FIFO that queues them
+                // after every start activation of the slot.
+                if self.t0_starts_remaining > 0 && !self.event_queue.last_pop_front {
+                    self.t0_starts_remaining -= 1;
+                    if self.t0_starts_remaining == 0 {
+                        self.drain_deferred_proc_settle();
+                    }
+                }
             }
             // §4.4.2 interleave (reference-simulator verified): a clock
             // generator is a process whose toggle was scheduled at its
@@ -1935,6 +1953,12 @@ impl Simulator {
         // skip that slot, so the combinational logic read the old value until
         // the next one and toggle coverage never saw the written value as a
         // baseline. `start` holds the loop at time 0 until that slot has run.
+        // #t0-comb-defer: capture the size of the time-0 start batch (the
+        // compile-time process activations) before the first pop. Entries
+        // APPENDED while the batch runs (wakeups, continuations) are not
+        // starts; plain FIFO keeps them behind the batch anyway, and
+        // `schedule_front` fork children are exempted at pop time.
+        self.t0_starts_remaining = self.event_queue.slot_len(0);
         while !self.finished && iters < max_iters {
             iters += 1;
             if HANG_REPORT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)

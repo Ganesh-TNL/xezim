@@ -33,6 +33,8 @@ mod adaptive_edge_skip;
 mod always_comb_sensitivity_audit;
 #[path = "scheduling/always_iff_guard.rs"]
 mod always_iff_guard;
+#[path = "scheduling/t0_comb_defer_start_batch_550.rs"]
+mod t0_comb_defer_start_batch;
 #[path = "scheduling/always_level_delay.rs"]
 mod always_level_delay;
 #[path = "scheduling/armed_array_element_inputs.rs"]
