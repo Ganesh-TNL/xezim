@@ -418,6 +418,8 @@ mod randomize_solve_before;
 mod randomize_with_this_and_subset;
 #[path = "classes/randomize_work_budget.rs"]
 mod randomize_work_budget;
+#[path = "classes/enum_string_valued_scope_546.rs"]
+mod enum_string_valued_scope;
 #[path = "classes/scope_randomize_dist_and_foreach.rs"]
 mod scope_randomize_dist_and_foreach;
 #[path = "classes/shadowed_property_storage.rs"]

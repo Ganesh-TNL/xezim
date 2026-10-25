@@ -1516,6 +1516,43 @@ impl Simulator {
             // A bare or member reference whose declared type is `string`, or an
             // element of a string-typed queue/array.
             ExprKind::Ident(h) => {
+                // The `string_signals` set is flat and name-global. Inside a
+                // class method a bare property of `this` shadows same-named
+                // module-scope signals (§6.21), and the flat set cannot
+                // distinguish specializations of a parameterized class: a
+                // string-typed `T val` formal of `uvm_resource_db#(string)`
+                // poisons the bare name for `uvm_resource#(<enum>)`'s `val`
+                // property, routing an enum `val == t` through the TEXT
+                // comparison where `X == 0` compares equal. When the name is
+                // a property of the current instance's class (and no local
+                // formal shadows it), the class-aware probes below decide.
+                if h.path.len() == 1
+                    && self.class_context_stack.last().is_some()
+                    && self.string_signals.contains(&*self.resolve_hier_name(h))
+                {
+                    let name = h.path[0].name.name.as_str();
+                    let local_shadows = self
+                        .local_stack
+                        .iter()
+                        .rev()
+                        .any(|m| m.contains_key(name));
+                    let is_class_prop = !local_shadows
+                        && self
+                            .this_stack
+                            .last()
+                            .copied()
+                            .flatten()
+                            .and_then(|hh| self.heap.get(hh).and_then(|c| c.as_ref()))
+                            .is_some_and(|inst| {
+                                self.class_declares_property(&inst.class_name, name)
+                            });
+                    if is_class_prop {
+                        return self.class_member_is_string(expr)
+                            || self.ident_type_is_string(h, expr)
+                            || self.local_struct_member_is_string(h)
+                            || self.member_chain_is_string(expr);
+                    }
+                }
                 self.string_signals.contains(&*self.resolve_hier_name(h))
                     || self.class_member_is_string(expr)
                     || self.ident_type_is_string(h, expr)

@@ -1210,6 +1210,38 @@ impl Simulator {
         props
     }
 
+    /// Whether `class_name` or an ancestor declares a property (of any
+    /// kind: scalar, queue, associative, static, ...) named `prop`.
+    ///
+    /// Scopes the flat, name-global `string_signals` set inside
+    /// `expr_is_string_valued`: a bare property reference in a class
+    /// method shadows same-named module-scope signals (§6.21), and the
+    /// flat set cannot distinguish specializations of a parameterized
+    /// class — a string-typed `T val` formal of `uvm_resource_db#(string)`
+    /// poisons the bare name for `uvm_resource#(<enum>)`'s `val` property,
+    /// which routed an enum `val == t` through the TEXT comparison and
+    /// made `X == 0` compare equal (skipping `uvm_resource#(T)::write`'s
+    /// `if (val == t) return;` early-out, so the stored value stayed X).
+    pub(super) fn class_declares_property(&self, class_name: &str, prop: &str) -> bool {
+        let mut cur: Option<&str> = Some(class_name);
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(cn) else {
+                break;
+            };
+            if cd.properties.contains_key(prop)
+                || cd.queue_properties.contains_key(prop)
+                || cd.assoc_properties.contains_key(prop)
+                || cd.array_properties.contains_key(prop)
+                || cd.array_nd_properties.contains_key(prop)
+                || cd.static_properties.contains(prop)
+            {
+                return true;
+            }
+            cur = cd.extends.as_deref();
+        }
+        false
+    }
+
     pub(super) fn exec_method_in_class_hierarchy(
         &mut self,
         handle: usize,
