@@ -422,6 +422,8 @@ mod randomize_work_budget;
 mod scope_randomize_dist_and_foreach;
 #[path = "classes/shadowed_property_storage.rs"]
 mod shadowed_property_storage;
+#[path = "classes/spec_key_class_spelling_542.rs"]
+mod spec_key_class_spelling;
 #[path = "classes/static_member_method_collision.rs"]
 mod static_member_method_collision;
 #[path = "classes/std_randomize_struct.rs"]

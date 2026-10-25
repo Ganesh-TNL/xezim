@@ -3558,7 +3558,19 @@ impl Simulator {
                 dfrag.to_string()
             };
             let dfrag_resolved = dfrag_resolved.trim().to_string();
-            if canon(&dfrag_resolved) != canon(sval) {
+            // A typedef spelling and the class it stands for are the same
+            // type (§6.18): the dest fragment may come from the
+            // specialization signature's canonical spelling while the
+            // instance binding records the source spelling (`gp_t` vs
+            // `uvm_tlm_generic_payload`), or vice versa. Follow typedefs
+            // on both sides before comparing.
+            let dfrag_resolved = self
+                .typedef_alias_frag(&dfrag_resolved)
+                .unwrap_or(dfrag_resolved);
+            let sval_resolved = self
+                .typedef_alias_frag(sval)
+                .unwrap_or_else(|| sval.to_string());
+            if canon(&dfrag_resolved) != canon(&sval_resolved) {
                 return false;
             }
         }

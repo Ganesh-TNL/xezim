@@ -1766,6 +1766,15 @@ impl Simulator {
             v
         } else {
             let short = frag_norm.to_string();
+            // §8.25/§6.18: a class named through any of its registered
+            // spellings (`Cfg` via an import, `my_pkg::Cfg`, `Outer::Inner`,
+            // `my_pkg::Outer::Inner`) is ONE type argument. Resolve the
+            // fragment to the declaring spelling so the specialization
+            // signature — and with it every per-specialization static —
+            // is shared however the argument was written.
+            if let Some(canon) = self.canonical_class_frag(&short) {
+                return canon;
+            }
             if let Some(cd) = self.get_class_def(&short) {
                 if !cd.param_order.is_empty() {
                     let canon_inner_sig = self.canonicalize_spec_sig(&short, "");
@@ -1776,6 +1785,80 @@ impl Simulator {
             }
             short
         }
+    }
+
+    /// §8.25: map a class-name fragment — however spelled — to the ONE
+    /// canonical key of the class it names, so specializations keyed by
+    /// that argument share their statics. The elaborator registers a
+    /// package class under both `Name` and `pkg::Name` (and a nested
+    /// class under `Outer::Inner` and `pkg::Outer::Inner`), all mapping
+    /// to the same `Arc<ElaboratedClass>`; the DECLARING spelling
+    /// (`name`, or `enclosing::name` for a class nested in another) is
+    /// the canonical one. A leaf name taken by a DIFFERENT class (two
+    /// packages each declaring `Cfg`, a second nested `Inner`) is told
+    /// apart by `Arc` identity and left unmerged.
+    /// The class a plain type-argument fragment names. A direct key hit
+    /// first; a `pkg::A::B` that is not a key falls back to `A::B`. The
+    /// pkg_scope collision pass renames a nested class whose leaf name is
+    /// declared in several packages to the mangled `A::B` (registered
+    /// under `A::B`, `A::A::B` and `pkg::A::A::B`), so a source spelling
+    /// that kept the unmangled `pkg::A::B` form misses the direct lookup
+    /// although the stripped form is one of its registered aliases.
+    fn class_arc_for_frag(&self, frag: &str) -> Option<std::sync::Arc<crate::compiler::elaborate::ElaboratedClass>> {
+        if let Some(arc) = self.module.classes.get(frag) {
+            return Some(arc.clone());
+        }
+        let mut parts: Vec<&str> = frag.split("::").collect();
+        if parts.len() >= 3 {
+            parts.remove(0);
+            let stripped = parts.join("::");
+            return self.module.classes.get(&stripped).cloned();
+        }
+        None
+    }
+
+    fn canonical_class_frag(&self, frag: &str) -> Option<String> {
+        // Plain (possibly `::`-scoped) identifiers only: anything with
+        // `#`, `[`, whitespace or operators is another branch's job.
+        if frag.is_empty()
+            || !frag
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+        {
+            return None;
+        }
+        let arc = self.class_arc_for_frag(frag)?;
+        let declared = match &arc.enclosing {
+            Some(outer) => format!("{}::{}", outer, arc.name),
+            None => arc.name.clone(),
+        };
+        if declared == frag {
+            return None; // already the declaring spelling
+        }
+        // Merge only when the declaring spelling names the SAME class.
+        // `Arc::ptr_eq` on the class itself is not enough: specialization
+        // bookkeeping mutates entries through `classes.get_mut(..).map(
+        // Arc::make_mut)`, which — the key being aliased — swaps ONE of the
+        // spellings to a fresh Arc and splits pointer identity although
+        // both entries still name the same class. Such a split clones the
+        // class struct but SHARES its `methods` table, so pointer identity
+        // there is the stable same-class test; two genuinely different
+        // classes that happen to share a leaf name never share one.
+        let declared_arc = self.module.classes.get(&declared)?;
+        let same_class = std::sync::Arc::ptr_eq(&arc, declared_arc)
+            || std::sync::Arc::ptr_eq(&arc.methods, &declared_arc.methods);
+        if !same_class {
+            return None;
+        }
+        // A parameterized class keeps the default-argument completion the
+        // final branch below applies (`box` -> `box#(int)`).
+        if !arc.param_order.is_empty() {
+            let sig = self.canonicalize_spec_sig(&declared, "");
+            if !sig.is_empty() {
+                return Some(format!("{}#({})", declared, sig));
+            }
+        }
+        Some(declared)
     }
 
     /// §8.25: specializations match when their value arguments have the SAME
