@@ -35,6 +35,8 @@ mod class_formal_typedef_widen;
 mod class_interface_same_name;
 #[path = "classes/class_member_name_clash.rs"]
 mod class_member_name_clash;
+#[path = "classes/class_member_operand_width_553.rs"]
+mod class_member_operand_width;
 #[path = "classes/class_method_named_put_from_function.rs"]
 mod class_method_named_put_from_function;
 #[path = "classes/class_scope_array_const_whole_refs.rs"]
