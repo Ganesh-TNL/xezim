@@ -33,6 +33,10 @@ mod class_formal_named_like_struct;
 mod class_formal_typedef_widen;
 #[path = "classes/class_interface_same_name.rs"]
 mod class_interface_same_name;
+#[path = "classes/class_member_operand_width_555.rs"]
+mod class_member_operand_width;
+#[path = "classes/bytecode_wider_formal_width_555.rs"]
+mod bytecode_wider_formal_width;
 #[path = "classes/class_member_name_clash.rs"]
 mod class_member_name_clash;
 #[path = "classes/class_method_named_put_from_function.rs"]
