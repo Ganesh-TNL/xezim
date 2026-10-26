@@ -619,6 +619,46 @@ impl Simulator {
                         return Some(w);
                     }
                 }
+                // §11.6.1: ELABORATION FLATTENS an owner-qualified name. `E::ta`
+                // does not stay a `MemberAccess` node — it arrives as a single
+                // `Ident` whose path is ["E","ta"]. Every probe above keys on a
+                // signal name or a live receiver, so a class-STATIC property read
+                // from module scope matches none of them: the operand fell back to
+                // its self-determined width and `s === E::ta + E::tb` compared the
+                // 9-bit 300 against an 8-bit 44.
+                //
+                // Ask the class declaration table directly. `class_prop_width_impl`
+                // with `handle = None` is the static path — no object, no
+                // evaluation — so the §13.4 rule that a sizing probe must never RUN
+                // a method still holds, and it stays None for every shape it cannot
+                // size, which is what the single-segment cases above rely on.
+                if h.root.is_none()
+                    && h.path.len() > 1
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                {
+                    // The owner is the first segment and the property the last --
+                    // exactly what joining the path with '.' and re-splitting it
+                    // would yield, without the Vec and String allocation on a path
+                    // this hot (`lrm_self_width` runs per operand per evaluation).
+                    let owner = h
+                        .path
+                        .first()
+                        .map(|s| s.name.name.as_str())
+                        .unwrap_or("");
+                    let prop = h
+                        .path
+                        .last()
+                        .map(|s| s.name.name.as_str())
+                        .unwrap_or("");
+                    if !owner.is_empty() && !prop.is_empty() && owner != prop {
+                        if let Some(w) = self
+                            .class_prop_width_impl(owner, None, prop)
+                            .filter(|w| *w > 0)
+                        {
+                            return Some(w);
+                        }
+                    }
+                }
                 None
             }
             ExprKind::Unary { op, operand } => match op {

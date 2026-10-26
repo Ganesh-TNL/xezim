@@ -153,6 +153,8 @@ mod vif_output_actual_property;
 mod virtual_method_in_binary_is_evaluated_once;
 #[path = "classes/wait_level_sensitive_inactive_delta.rs"]
 mod wait_level_sensitive_inactive_delta;
+#[path = "classes/owner_qualified_operand_width_559.rs"]
+mod owner_qualified_operand_width;
 
 #[path = "classes/bare_parameterless_method_call.rs"]
 mod bare_parameterless_method_call;
