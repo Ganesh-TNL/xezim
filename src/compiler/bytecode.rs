@@ -1746,6 +1746,16 @@ pub struct BytecodeCompiler<'a> {
     /// Step 9f: BARE-call static targets — non-virtual method name -> the
     /// first defining class from the lexical chain (§8.20).
     static_bare_targets: HashMap<String, String>,
+    /// LRM 11.6/11.8.2: declared width of every input port of every method
+    /// visible in the enclosing class chain, keyed by method name.  A call
+    /// ACTUAL is context-determined by the callee's declared formal — with
+    /// `function bit wide9(logic [8:0] v)`, the call site `wide9(a + b)`
+    /// must evaluate `a + b` at 9 bits (300), not at its 8-bit self width
+    /// (44).  The inline path already gets this from `port_effective_width`;
+    /// the CallMethod/CallScopedMethod lowerings compile their actuals
+    /// against `ctx_width = 0` and so silently truncated.  Missing entry or
+    /// width 0 = keep the old self-determined behavior.
+    method_formal_widths: HashMap<String, Vec<u32>>,
     /// Step 9g: WRITABLE static-property names (bare) of the enclosing
     /// class chain — reads AND stores lower to Load/StoreClassStatic.
     static_member_names: HashSet<String>,
@@ -2139,6 +2149,7 @@ impl<'a> BytecodeCompiler<'a> {
             super_method_names: HashSet::default(),
             method_class_parent: None,
             static_bare_targets: HashMap::default(),
+            method_formal_widths: HashMap::default(),
             static_member_names: HashSet::default(),
             class_const_names: HashSet::default(),
             new_type_map: HashMap::default(),
@@ -15608,12 +15619,29 @@ impl<'a> BytecodeCompiler<'a> {
                         self.bail("bare_call_no_this");
                         return None;
                     };
+                    // LRM 11.6/11.8.2: a call ACTUAL is context-determined
+                    // by the callee's DECLARED formal, exactly like the
+                    // operand of a comparison.  `wide9(a + b)` against
+                    // `function bit wide9(logic [8:0] v)` must evaluate
+                    // `a + b` at 9 bits (300); compiling it self-determined
+                    // yields 8-bit 44 and the callee compares 44 !== 300.
+                    // Mirrors the inline path, which binds with
+                    // `port_effective_width`.  Unknown callee / non-scalar
+                    // port = width 0 = the previous self-determined behavior.
+                    let callee_widths: Option<Vec<u32>> = self
+                        .method_formal_widths
+                        .get(h.path[0].name.name.as_str())
+                        .cloned();
                     let call_start = self.insns.len();
                     let call_next = self.next_reg;
                     let mut ok = true;
                     let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
-                    for a in args {
-                        match self.compile_expr(a, 0) {
+                    for (ai, a) in args.iter().enumerate() {
+                        let ctx = callee_widths
+                            .as_ref()
+                            .and_then(|w| w.get(ai).copied())
+                            .unwrap_or(0);
+                        match self.compile_expr(a, ctx) {
                             Some(r) => arg_values.push(r),
                             None => {
                                 ok = false;
@@ -19170,6 +19198,7 @@ impl<'a> BytecodeCompiler<'a> {
         super_method_names: &HashSet<String>,
         method_class_parent: &Option<String>,
         static_bare_targets: &HashMap<String, String>,
+        method_formal_widths: &HashMap<String, Vec<u32>>,
         static_member_names: &HashSet<String>,
         class_const_names: &HashSet<String>,
         new_type_map: &HashMap<String, String>,
@@ -19316,6 +19345,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.super_method_names = super_method_names.clone();
         self.method_class_parent = method_class_parent.clone();
         self.static_bare_targets = static_bare_targets.clone();
+        self.method_formal_widths = method_formal_widths.clone();
         // class-perf P2 (typed handle roots): declared class per handle
         // formal / class-typed local, consulted by
         // `method_handle_chain_class` so `sched.m_parent.get_pt()` admits.
@@ -19451,6 +19481,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.method_class = None;
             self.handle_member_types = None;
             self.class_method_names.clear();
+            self.method_formal_widths.clear();
             self.method_result_reg = None;
             self.method_return_val_reg = None;
             self.method_result_width = None;
@@ -23160,6 +23191,7 @@ mod tests {
             &HashSet::default(),
             &None,
             &HashMap::default(),
+            &HashMap::default(),
             &HashSet::default(),
             &HashSet::default(),
             &HashMap::default(),
@@ -23257,6 +23289,7 @@ mod tests {
             &HashSet::default(),
             &None,
             &HashMap::default(),
+            &HashMap::default(),
             &HashSet::default(),
             &HashSet::default(),
             &HashMap::default(),
@@ -23332,6 +23365,7 @@ mod tests {
                     &HashSet::default(),
                     &HashSet::default(),
                     &None,
+                    &HashMap::default(),
                     &HashMap::default(),
                     &HashSet::default(),
                     &HashSet::default(),

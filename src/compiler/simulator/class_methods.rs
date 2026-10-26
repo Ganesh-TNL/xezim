@@ -1630,8 +1630,21 @@ impl Simulator {
                             continue;
                         }
                     }
+                    // §11.6.1/§11.8.2: a call ACTUAL is CONTEXT-DETERMINED by
+                    // the callee's declared formal, exactly like the operand of
+                    // a comparison (see `actual_ctx_shape`). Gated to the shape
+                    // `resize_for_assign` already understands, and the width is
+                    // read from the cached plan rather than recomputed.
+                    let actual_ctx = if arg_supplied(i) && Self::actual_ctx_shape(port) {
+                        plan.ports[i].fixed_width.filter(|w| *w > 0)
+                    } else {
+                        None
+                    };
                     let mut val = if arg_supplied(i) {
-                        let value = self.eval_expr(&args[i]);
+                        let value = match actual_ctx {
+                            Some(w) => self.eval_expr_ctx(&args[i], w),
+                            None => self.eval_expr(&args[i]),
+                        };
                         self.vif_argument_value(port, &args[i], value)
                     } else if let Some(def) = &port.default {
                         // Caller omitted this arg → apply the formal's

@@ -736,6 +736,64 @@ impl Simulator {
         out
     }
 
+    /// LRM 11.6 / 11.8.2: the declared input-port widths of every method
+    /// visible from `cname`, keyed by method name.
+    ///
+    /// A call ACTUAL is CONTEXT-determined by the callee's declared formal,
+    /// exactly like the operand of a comparison: with
+    /// `function bit wide9(logic [8:0] v)`, the call site `wide9(a + b)`
+    /// must evaluate `a + b` at 9 bits (300), not at its 8-bit self width
+    /// (44).  The inline path already binds actuals with
+    /// `port_effective_width`; the `CallMethod` / `CallScopedMethod`
+    /// lowerings have no class table in scope and compiled every actual
+    /// against `ctx_width = 0`, so the widths have to be resolved here.
+    ///
+    /// Non-input, dimensioned, or non-scalar-integral ports contribute 0,
+    /// which is the "keep the source width" sentinel the compiler already
+    /// uses — those calls behave exactly as before this resolution existed.
+    /// First definition in the lexical chain wins: §8.20 binds a non-virtual
+    /// bare call to the first defining class, and a virtual override may only
+    /// redeclare the same prototype.
+    pub(super) fn class_method_formal_widths(&self, cname: &str) -> HashMap<String, Vec<u32>> {
+        use crate::ast::decl::ClassMethodKind as Kind;
+        use crate::ast::types::PortDirection;
+        let mut out: HashMap<String, Vec<u32>> = HashMap::default();
+        let mut seen: HashSet<String> = HashSet::default();
+        let mut cur = cname.to_string();
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                break;
+            }
+            for (mname, md) in cd.methods.iter() {
+                if out.contains_key(mname.as_str()) {
+                    continue;
+                }
+                let ports = match &md.kind {
+                    Kind::Function(f) | Kind::Extern(f) | Kind::PureVirtual(f) => &f.ports,
+                    Kind::Task(t) => &t.ports,
+                };
+                let widths = ports
+                    .iter()
+                    .map(|p| {
+                        if p.direction == PortDirection::Input && p.dimensions.is_empty() {
+                            self.scalar_formal_integral(&p.data_type)
+                                .map(|(w, _)| w)
+                                .unwrap_or(0)
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
+                out.insert(mname.clone(), widths);
+            }
+            match &cd.extends {
+                Some(b) => cur = b.clone(),
+                None => break,
+            }
+        }
+        out
+    }
+
     /// class-perf Step 9f: the `super.m(...)` admission set — method
     /// names visible in the PARENT chain of `cname` (the class lexically
     /// containing the call), plus `new` (super.new is ctor chaining, always
@@ -1609,6 +1667,10 @@ impl Simulator {
                 // Step 9e: method-name admission set for bare this-bounded
                 // calls.
                 let method_name_set = self.class_method_name_set(cname);
+                // LRM 11.6/11.8.2: declared input widths of every callee
+                // visible from this class, so the CallMethod lowerings can
+                // give each ACTUAL its formal's context width.
+                let method_formal_widths = self.class_method_formal_widths(cname);
                 // Step 9f: parent-chain method names for `super.m` admission.
                 let super_method_set = self.super_method_name_set(cname);
                 // Step 9f: baked dispatch inputs — the defining class's
@@ -2173,6 +2235,7 @@ impl Simulator {
                         &super_method_set,
                         &class_parent,
                         &bare_targets,
+                        &method_formal_widths,
                         &static_members,
                         &const_names,
                         &new_type_map,

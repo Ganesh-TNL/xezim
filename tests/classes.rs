@@ -23,6 +23,8 @@ mod block_local_shadows_enclosing;
 mod blocking_task_super_dispatch;
 #[path = "classes/blocklocal_struct_named_like_member.rs"]
 mod blocklocal_struct_named_like_member;
+#[path = "classes/call_actual_formal_width_557.rs"]
+mod call_actual_formal_width;
 #[path = "classes/class_assoc_struct_string_keys.rs"]
 mod class_assoc_struct_string_keys;
 #[path = "classes/class_descending_array_members.rs"]
@@ -35,6 +37,8 @@ mod class_formal_typedef_widen;
 mod class_interface_same_name;
 #[path = "classes/class_member_name_clash.rs"]
 mod class_member_name_clash;
+#[path = "classes/class_member_operand_width_557.rs"]
+mod class_member_operand_width;
 #[path = "classes/class_method_named_put_from_function.rs"]
 mod class_method_named_put_from_function;
 #[path = "classes/class_scope_array_const_whole_refs.rs"]
@@ -156,6 +160,8 @@ mod wait_level_sensitive_inactive_delta;
 
 #[path = "classes/bare_parameterless_method_call.rs"]
 mod bare_parameterless_method_call;
+#[path = "classes/bytecode_wider_formal_width_557.rs"]
+mod bytecode_wider_formal_width;
 #[path = "classes/blocking_method_keyed_method_local_base.rs"]
 mod blocking_method_keyed_method_local_base;
 #[path = "classes/chained_member_element_access.rs"]
