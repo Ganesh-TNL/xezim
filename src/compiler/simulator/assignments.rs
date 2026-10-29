@@ -1001,27 +1001,79 @@ impl Simulator {
     /// field and corrupts the packed value. Here each item is resized to its
     /// own member width and dropped at its absolute bit offset instead; nested
     /// patterns on sub-struct members recurse. Returns false (caller falls back
-    /// to the generic path) when the lvalue is not a registered packed struct.
+    /// to the generic path) when the lvalue is neither a registered packed
+    /// struct, a packed-struct class property (`obj.prop`, `this.prop`, or a
+    /// bare property inside a method), nor a packed-struct element of a fixed
+    /// array resolved through its declared type.
     pub(super) fn try_assign_packed_struct_pattern(
         &mut self,
         lvalue: &Expression,
         items: &[AssignmentPatternItem],
     ) -> bool {
-        let Some((obj_name, prefix, layout, _base_off, _w)) =
+        if let Some((obj_name, prefix, layout, _base_off, _w)) =
             self.resolve_packed_struct_target(lvalue, items)
-        else {
-            return false;
-        };
-        // Write straight into the whole base value at absolute offsets, so a
-        // member assign leaves its sibling members untouched.
-        let Some(mut acc) = self.get_local_or_signal(&obj_name) else {
-            return false;
-        };
-        if !self.apply_packed_struct_pattern(&mut acc, &layout, &prefix, 0, items) {
+        {
+            // Write straight into the whole base value at absolute offsets, so a
+            // member assign leaves its sibling members untouched.
+            if let Some(mut acc) = self.get_local_or_signal(&obj_name)
+                && self.apply_packed_struct_pattern(&mut acc, &layout, &prefix, 0, items)
+            {
+                self.set_local_or_signal(&obj_name, acc);
+                return true;
+            }
+        }
+        // Class-property destination (`obj.prop = '{...}`, `this.prop`, or a
+        // bare `prop` inside a method): the storage is the heap object's
+        // `properties` cell, which the registered-signal path above cannot
+        // see (`packed_struct_fields` has no entry for a dotted class
+        // property). Lay the pattern out at the property's declared member
+        // offsets so later member reads — which use those offsets — agree.
+        if let Some((handle, prop, layout)) = self.class_prop_pattern_target(lvalue, items) {
+            let total = layout.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+            let mut acc = Value::zero(total);
+            if let Some(seed) = self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .and_then(|i| i.properties.get(&prop))
+            {
+                for b in 0..total {
+                    acc.set_bit(b as usize, seed.get_bit(b as usize));
+                }
+            }
+            if self.apply_packed_struct_pattern(&mut acc, &layout, "", 0, items) {
+                // `set_prop_if_changed` reports whether the VALUE changed, not
+                // whether the assignment was handled — a pattern equal to the
+                // current contents (e.g. re-assigning the same literal) must
+                // still count as handled, or the caller falls back to the
+                // generic path and clobbers the correctly-laid-out value.
+                self.set_prop_if_changed(handle, &prop, acc);
+                return true;
+            }
             return false;
         }
-        self.set_local_or_signal(&obj_name, acc);
-        true
+        // Declared-type destination the registered-signal table cannot name:
+        // a whole packed-struct element of a fixed array on an instance
+        // (`u_ctrl.cfg_arr[2] = '{...}`, packed or unpacked). Resolve through
+        // the read-side `declared_packed_access` so the write lands at the
+        // same bit offsets the reads use.
+        if let Some((storage, off, width, layout)) = self.declared_elem_pattern_target(lvalue, items)
+        {
+            if let Some(mut base_val) = self.get_local_or_signal(&storage) {
+                let mut acc = Value::zero(width);
+                for b in 0..width {
+                    acc.set_bit(b as usize, base_val.get_bit((off + b) as usize));
+                }
+                if self.apply_packed_struct_pattern(&mut acc, &layout, "", 0, items) {
+                    for b in 0..width {
+                        base_val.set_bit((off + b) as usize, acc.get_bit(b as usize));
+                    }
+                    self.set_local_or_signal(&storage, base_val);
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Evaluate a named/ordered/default assignment pattern targeting a PACKED
@@ -1029,26 +1081,224 @@ impl Simulator {
     /// own width (0-based within the target field). For NBA / continuous
     /// assigns, whose scheduling drives the resolved (possibly sub-member)
     /// target — driving the whole base signal instead would clobber sibling
-    /// members updated in the same step. Returns None when the lvalue is not a
-    /// registered packed struct.
+    /// members updated in the same step. Returns None when the lvalue is not
+    /// a registered packed struct, a packed-struct class property, or a
+    /// packed-struct element of a fixed array.
     pub(super) fn eval_packed_struct_pattern(
         &mut self,
         lvalue: &Expression,
         items: &[AssignmentPatternItem],
     ) -> Option<Value> {
-        let (obj_name, prefix, layout, base_off, width) =
-            self.resolve_packed_struct_target(lvalue, items)?;
-        // Seed from the current field value so members the pattern omits keep
-        // their prior contents.
-        let base_val = self.get_local_or_signal(&obj_name)?;
-        let mut acc = Value::zero(width);
-        for b in 0..width {
-            acc.set_bit(b as usize, base_val.get_bit((base_off + b) as usize));
+        if let Some((obj_name, prefix, layout, base_off, width)) =
+            self.resolve_packed_struct_target(lvalue, items)
+        {
+            // Seed from the current field value so members the pattern omits keep
+            // their prior contents.
+            if let Some(base_val) = self.get_local_or_signal(&obj_name) {
+                let mut acc = Value::zero(width);
+                for b in 0..width {
+                    acc.set_bit(b as usize, base_val.get_bit((base_off + b) as usize));
+                }
+                if self.apply_packed_struct_pattern(&mut acc, &layout, &prefix, base_off, items) {
+                    return Some(acc);
+                }
+            }
         }
-        if !self.apply_packed_struct_pattern(&mut acc, &layout, &prefix, base_off, items) {
+        // Class-property destination: evaluate at the property's declared
+        // layout, seeded from the current property value. The scheduled
+        // store (NBA / settling) then writes this value through the normal
+        // class-property path.
+        if let Some((handle, prop, layout)) = self.class_prop_pattern_target(lvalue, items) {
+            let total = layout.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+            let mut acc = Value::zero(total);
+            if let Some(seed) = self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .and_then(|i| i.properties.get(&prop))
+            {
+                for b in 0..total {
+                    acc.set_bit(b as usize, seed.get_bit(b as usize));
+                }
+            }
+            if self.apply_packed_struct_pattern(&mut acc, &layout, "", 0, items) {
+                return Some(acc);
+            }
             return None;
         }
-        Some(acc)
+        // Declared-type destination (a fixed-array struct element on an
+        // instance): evaluate at the element's own layout, 0-based within
+        // the element — the scheduled store places the value.
+        if let Some((storage, off, width, layout)) = self.declared_elem_pattern_target(lvalue, items)
+        {
+            if let Some(base_val) = self.get_local_or_signal(&storage) {
+                let mut acc = Value::zero(width);
+                for b in 0..width {
+                    acc.set_bit(b as usize, base_val.get_bit((off + b) as usize));
+                }
+                if self.apply_packed_struct_pattern(&mut acc, &layout, "", 0, items) {
+                    return Some(acc);
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve a class-property destination for a packed-struct assignment
+    /// pattern: `obj.prop = '{...}` (a handle-valued name), `this.prop` /
+    /// `super.prop`, or a bare `prop` inside a method. Returns the heap
+    /// handle, the property's storage key, and the property's declared
+    /// packed-struct member layout. The registered-signal path cannot see
+    /// these destinations: their storage is the heap object's `properties`
+    /// cell, not a signal, and `packed_struct_fields` has no entry for a
+    /// dotted class-property name.
+    fn class_prop_pattern_target(
+        &mut self,
+        lvalue: &Expression,
+        items: &[AssignmentPatternItem],
+    ) -> Option<(usize, String, Vec<(String, u32, u32)>)> {
+        // Keyed/Typed items denote associative or type-keyed aggregates, not
+        // a by-member struct pack — leave those to the existing paths.
+        if items.iter().any(|it| {
+            matches!(
+                it,
+                AssignmentPatternItem::Keyed(..) | AssignmentPatternItem::Typed(..)
+            )
+        }) {
+            return None;
+        }
+        let cand: Option<(usize, String)> = match &lvalue.kind {
+            // `obj.prop` as a dotted identifier.
+            ExprKind::Ident(hier)
+                if hier.path.len() == 2 && hier.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let head = hier_prefix(hier);
+                if !self.head_denotes_class_object(&head) {
+                    return None;
+                }
+                let handle = self
+                    .eval_expr(&Expression::new(ExprKind::Ident(head), lvalue.span))
+                    .to_u64()? as usize;
+                Some((handle, hier.path[1].name.name.clone()))
+            }
+            // `recv.prop` where `recv` is a bare handle name or `this`/`super`.
+            ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    let name = h.path[0].name.name.as_str();
+                    if name == "this" || name == "super" {
+                        self.this_stack
+                            .last()
+                            .copied()
+                            .flatten()
+                            .map(|hd| (hd, member.name.clone()))
+                    } else {
+                        // Only a genuine class channel: a plain integral
+                        // value must not be misread as a heap handle.
+                        if !self.bare_name_is_class_channel(name) {
+                            return None;
+                        }
+                        self.eval_ident_handle(name).map(|hd| (hd, member.name.clone()))
+                    }
+                }
+                _ => None,
+            },
+            // Bare `prop` inside a method: the current `this` object. A
+            // shadowing local/argument was already served by the
+            // registered-signal path above; only a real property remains.
+            ExprKind::Ident(hier) if hier.path.len() == 1 && hier.path[0].selects.is_empty() => {
+                let handle = self.this_stack.last().copied().flatten()?;
+                let name = hier.path[0].name.name.clone();
+                let key = self.shadowed_prop_key(&name, false).unwrap_or(name);
+                if !self
+                    .heap
+                    .get(handle)?
+                    .as_ref()?
+                    .properties
+                    .contains_key(&key)
+                {
+                    return None;
+                }
+                Some((handle, key))
+            }
+            _ => None,
+        };
+        let (handle, prop) = cand?;
+        // A live object holding this property, whose declared type is a
+        // packed struct.
+        if !self
+            .heap
+            .get(handle)?
+            .as_ref()?
+            .properties
+            .contains_key(&prop)
+        {
+            return None;
+        }
+        let su = self.class_prop_struct(handle, &prop)?;
+        if !su.packed {
+            return None;
+        }
+        let layout = super::elaborate::packed_struct_field_layout(
+            &DataType::Struct(su),
+            &self.module.parameters,
+            &self.module.typedefs,
+            &self.module.typedef_types,
+        )?;
+        Some((handle, prop, layout))
+    }
+
+    /// Resolve a declared-type destination for a packed-struct assignment
+    /// pattern that the registered-signal table cannot name: a whole
+    /// packed-struct element of a FIXED array (`u_ctrl.cfg_arr[2] = '{...}`,
+    /// packed or unpacked). Uses the read-side resolver
+    /// (`declared_packed_access`) so the write lands at the same bit offsets
+    /// the reads use. Returns the storage signal, the element's bit offset
+    /// and width within it, and the element type's member layout.
+    fn declared_elem_pattern_target(
+        &mut self,
+        lvalue: &Expression,
+        items: &[AssignmentPatternItem],
+    ) -> Option<(String, u32, u32, Vec<(String, u32, u32)>)> {
+        if items.iter().any(|it| {
+            matches!(
+                it,
+                AssignmentPatternItem::Keyed(..) | AssignmentPatternItem::Typed(..)
+            )
+        }) {
+            return None;
+        }
+        let access = self.declared_packed_access(lvalue)?;
+        // A whole packed struct: no remaining packed dimensions, and not an
+        // element still inside an unpacked dimension run.
+        if access.unpacked != 0 || !access.dimensions.is_empty() {
+            return None;
+        }
+        // Queue / dynamic / associative element writes maintain sizes and
+        // have their own pattern paths — do not bypass them here.
+        let base = match access.storage.rfind('[') {
+            Some(i) => access.storage[..i].to_string(),
+            None => access.storage.clone(),
+        };
+        if self.module.queue_vars.contains(&base)
+            || self.module.dynamic_arrays.contains(&base)
+            || self.module.associative_arrays.contains_key(&base)
+        {
+            return None;
+        }
+        if !matches!(&access.element_type, DataType::Struct(su) if su.packed) {
+            return None;
+        }
+        let layout = super::elaborate::packed_struct_field_layout(
+            &access.element_type,
+            &self.module.parameters,
+            &self.module.typedefs,
+            &self.module.typedef_types,
+        )?;
+        let total = layout.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+        if total == 0 || total != access.width {
+            return None;
+        }
+        Some((access.storage, access.offset, access.width, layout))
     }
 
     /// Write each member of a packed-struct assignment pattern into `acc` at
