@@ -1172,17 +1172,38 @@ impl Simulator {
             ExprKind::Ident(hier)
                 if hier.path.len() == 2 && hier.path.iter().all(|s| s.selects.is_empty()) =>
             {
-                let head = hier_prefix(hier);
-                if !self.head_denotes_class_object(&head) {
-                    return None;
+                // `this.prop` / `super.prop` fold into a dotted identifier
+                // whose head is the keyword, not a handle variable: the head
+                // cannot be evaluated by name, so resolve it through
+                // this_stack (the object `super` denotes here as well).
+                if hier.path[0].name.name.as_str() == "this"
+                    || hier.path[0].name.name.as_str() == "super"
+                {
+                    self.this_stack
+                        .last()
+                        .copied()
+                        .flatten()
+                        .map(|hd| (hd, hier.path[1].name.name.clone()))
+                } else {
+                    let head = hier_prefix(hier);
+                    if !self.head_denotes_class_object(&head) {
+                        return None;
+                    }
+                    let handle = self
+                        .eval_expr(&Expression::new(ExprKind::Ident(head), lvalue.span))
+                        .to_u64()? as usize;
+                    Some((handle, hier.path[1].name.name.clone()))
                 }
-                let handle = self
-                    .eval_expr(&Expression::new(ExprKind::Ident(head), lvalue.span))
-                    .to_u64()? as usize;
-                Some((handle, hier.path[1].name.name.clone()))
             }
             // `recv.prop` where `recv` is a bare handle name or `this`/`super`.
             ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                // `this.prop` with the keyword as its own expression form.
+                ExprKind::This => self
+                    .this_stack
+                    .last()
+                    .copied()
+                    .flatten()
+                    .map(|hd| (hd, member.name.clone())),
                 ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
                     let name = h.path[0].name.name.as_str();
                     if name == "this" || name == "super" {

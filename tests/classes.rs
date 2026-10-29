@@ -864,6 +864,8 @@ mod randomize_nested_dyn_scope;
 mod shadowed_member_same_named_formal;
 #[path = "classes/member_multidim_copy.rs"]
 mod member_multidim_copy;
+#[path = "classes/packed_struct_pattern_class_vif_dest_587.rs"]
+mod packed_struct_pattern_class_vif_dest;
 #[path = "classes/member_new_owner_spec_596.rs"]
 mod member_new_owner_spec_596;
 #[path = "classes/super_call_formal_widths_593.rs"]
