@@ -866,6 +866,8 @@ mod shadowed_member_same_named_formal;
 mod member_multidim_copy;
 #[path = "classes/packed_struct_pattern_class_vif_dest_587.rs"]
 mod packed_struct_pattern_class_vif_dest;
+#[path = "classes/rand_wide_elem_draw_sum_588.rs"]
+mod rand_wide_elem_draw_sum;
 #[path = "classes/member_new_owner_spec_596.rs"]
 mod member_new_owner_spec_596;
 #[path = "classes/super_call_formal_widths_593.rs"]
