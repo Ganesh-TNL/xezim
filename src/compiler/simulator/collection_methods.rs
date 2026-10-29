@@ -1484,7 +1484,11 @@ impl Simulator {
             .last()
             .and_then(|f| f.get("item.index").cloned());
         let iter_index = iter.map(|nm| format!("{}.index", nm));
-        let mut acc: Option<i64> = None;
+        // §7.12.3: accumulate at 128 bits — the `with` expression's type can
+        // be wider than 64 bits (`q.sum() with (item)` over `logic [95:0]`),
+        // and an i64 accumulator wrapped there, building a result capped at
+        // `expr_w.min(64)` that could never equal a wide target.
+        let mut acc: Option<i128> = None;
         // §7.12.3: with a `with` clause the result type is the type of the
         // EXPRESSION, so the accumulation wraps at that width. A 1-bit
         // predicate like `q.sum with (item > 4)` therefore counts modulo 2 —
@@ -1533,11 +1537,17 @@ impl Simulator {
                 expr_w = fv.width.max(1);
                 expr_s = fv.is_signed;
             }
-            let v = fv.to_i64().unwrap_or(0);
+            // Read the item's value at its own width: `to_i64` gives only the
+            // low word of a wide (>64-bit) element.
+            let mut raw = fv.to_u128();
+            if fv.is_signed && fv.width > 0 && fv.width < 128 && (raw >> (fv.width - 1)) & 1 == 1 {
+                raw |= !0u128 << (fv.width - 1);
+            }
+            let v = raw as i128;
             acc = Some(match (acc, method) {
                 (None, _) => v,
-                (Some(a), "sum") => a + v,
-                (Some(a), "product") => a * v,
+                (Some(a), "sum") => a.wrapping_add(v),
+                (Some(a), "product") => a.wrapping_mul(v),
                 (Some(a), "min") => a.min(v),
                 (Some(a), "max") => a.max(v),
                 (Some(a), "and") => a & v,
@@ -1577,9 +1587,9 @@ impl Simulator {
         // Truncate to the expression's width for the accumulating reductions;
         // min/max/and/or/xor cannot exceed an operand and need no masking.
         let w = if expr_w == 0 { 32 } else { expr_w };
-        let raw = acc.unwrap_or(0) as u64;
-        let out = if matches!(method, "sum" | "product") && w < 64 {
-            raw & ((1u64 << w) - 1)
+        let raw = acc.unwrap_or(0) as u128;
+        let out = if matches!(method, "sum" | "product") && w < 128 {
+            raw & ((1u128 << w) - 1)
         } else {
             raw
         };
@@ -1587,12 +1597,13 @@ impl Simulator {
         // width (`$bits(a.sum() with (16'(item)))` is 16) and signedness
         // (`sb.sum() with (item) == -56` over bytes holds).
         if matches!(method, "sum" | "product" | "and" | "or" | "xor") && expr_w > 0 {
-            let w = expr_w.min(64);
-            let mut v = Value::from_u64(if w < 64 { out & ((1u64 << w) - 1) } else { out }, w);
+            let w = expr_w.min(128);
+            let mut v =
+                Value::from_u128(if w < 128 { out & ((1u128 << w) - 1) } else { out }, w);
             v.is_signed = expr_s;
             return v;
         }
-        Value::from_u64(out, w.max(32))
+        Value::from_u64(out as u64, w.max(32))
     }
 
     /// The subroutine call a method-call receiver is reached through
@@ -2809,6 +2820,36 @@ impl Simulator {
         }
         if matches!(bm, BuiltinM::Sum | BuiltinM::Product) {
             let (w, signed) = self.array_elem_sign_width(obj_name);
+            // §7.12.3: the reduction is computed at the element's own width
+            // and wraps there. A wide (>64-bit) element type needs a 128-bit
+            // accumulator: the u64 one wrapped every partial sum at 64 bits
+            // and the result was built at `w.min(64)`, so a 96-bit target
+            // like `ws.sum() == 96'h1_0000_0000_0000_0000` could never hold
+            // (the sum read as its low word, 0).
+            if w > 64 {
+                let mut total: u128 = if bm == BuiltinM::Sum { 0 } else { 1 };
+                for elem in self.reduction_elem_names(obj_name) {
+                    if let Some(v) = self.get_signal_value_by_name(&elem) {
+                        let mut x = v.to_u128();
+                        if signed && w < 128 && (x >> (w - 1)) & 1 == 1 {
+                            x |= !0u128 << (w - 1);
+                        }
+                        total = if bm == BuiltinM::Sum {
+                            total.wrapping_add(x)
+                        } else {
+                            total.wrapping_mul(x)
+                        };
+                    }
+                }
+                let out = if w < 128 {
+                    total & ((1u128 << w) - 1)
+                } else {
+                    total
+                };
+                let mut val = Value::from_u128(out, w);
+                val.is_signed = signed;
+                return Some(val);
+            }
             let mut total: u64 = if bm == BuiltinM::Sum { 0 } else { 1 };
             for elem in self.reduction_elem_names(obj_name) {
                 if let Some(v) = self.get_signal_value_by_name(&elem) {

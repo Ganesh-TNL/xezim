@@ -1365,7 +1365,28 @@ impl Simulator {
                 v = self.rng.r#gen::<u64>() & mask;
             }
         }
-        Value::from_u64(v, width)
+        if width <= 64 {
+            return Value::from_u64(v, width);
+        }
+        // §18.4: an element wider than 64 bits is drawn across its FULL
+        // width. `from_u64` zero-fills every bit above 63, so routing a
+        // wide element through it silently pinned the high half to 0 — the
+        // low word still looked freshly drawn, and only a check of the high
+        // bits (`wda[i][95:64] != 0`) could catch it. Keep the re-rolled
+        // low word above, then draw the remaining bits fresh.
+        let mut acc = Value::from_u64(v, width);
+        let mut bit = 64u32;
+        while bit < width {
+            let chunk: u64 = self.rng.r#gen();
+            let n = (width - bit).min(64);
+            for k in 0..n {
+                if (chunk >> k) & 1 == 1 {
+                    acc.set_bit((bit + k) as usize, LogicBit::One);
+                }
+            }
+            bit += n;
+        }
+        acc
     }
 
     /// The value ranges an element of `prop` is restricted to by
@@ -1619,6 +1640,14 @@ impl Simulator {
         let allowed = self.elem_allowed_ranges(prop, constraints);
         let saved = self.read_coll_elem(elem_key);
         for _ in 0..256 {
+            // +xezim_rand_timeout deadline was armed at randomize() entry but
+            // only checked at trial boundaries — a single element's retry
+            // loop could grind unboundedly past it. Each retry costs a full
+            // interpreted constraint check, so polling the clock here is
+            // negligible and bounds the loop by the budget.
+            if self.rand_past_deadline() {
+                break;
+            }
             let cand = if allowed.is_empty() {
                 self.draw_elem(width, None)
             } else {
@@ -1636,6 +1665,9 @@ impl Simulator {
         // (or proves there is none) rather than leaving a random value.
         if width <= 16 {
             for v in 0..(1u64 << width) {
+                if self.rand_past_deadline() {
+                    break;
+                }
                 self.write_coll_elem(elem_key, Value::from_u64(v, width));
                 if self.item_holds(handle, body) {
                     return pinned;
@@ -1968,10 +2000,21 @@ impl Simulator {
             {
                 continue;
             }
-            let Some(k) = self.eval_expr(const_side).to_i64() else {
+            // The target may be wider than 64 bits (`ws.sum() == 96'h1_…`):
+            // `to_i64` reads only the low word of a wide Value, which turned
+            // 2^64 into 0 and made the distributor below pin the sum to a
+            // wrong, always-failing target. Read the full 128 bits (the
+            // distributor works in i128); anything wider or unknown is left
+            // to the trial checker.
+            let tv = self.eval_expr(const_side);
+            if tv.width > 128 || tv.has_xz() {
                 continue;
-            };
-            return Some((c, k as i128));
+            }
+            let mut raw = tv.to_u128();
+            if tv.is_signed && tv.width > 0 && (raw >> (tv.width - 1)) & 1 == 1 {
+                raw |= !0u128 << (tv.width - 1);
+            }
+            return Some((c, raw as i128));
         }
         None
     }
@@ -1993,12 +2036,16 @@ impl Simulator {
         let keys = self.coll_elem_keys(c);
         let ranges = self.elem_allowed_ranges(&c.prop, constraints);
         let (lo, hi): (i128, i128) = if ranges.is_empty() {
-            let hi = if c.width >= 64 {
-                u64::MAX
+            // The element's full domain is 2^width - 1, which for a wide
+            // (>64-bit) element exceeds u64::MAX — capping there made every
+            // wide point-target above 2^64 look infeasible, so the distributor
+            // never ran and the trial loop ground through its retries.
+            let hi = if c.width >= 127 {
+                i128::MAX
             } else {
-                (1u64 << c.width) - 1
+                (1i128 << c.width) - 1
             };
-            (0, hi as i128)
+            (0, hi)
         } else {
             (
                 ranges.iter().map(|(l, _)| *l as i128).min().unwrap(),
@@ -2028,7 +2075,11 @@ impl Simulator {
         let mut free: Vec<String> = Vec::new();
         for k in keys {
             if pinned.contains(k) {
-                fixed_sum += self.read_coll_elem(k).and_then(|v| v.to_u64()).unwrap_or(0) as i128;
+                // A pinned wide element contributes its full 128 bits —
+                // `to_u64` would count only the low word and the residual
+                // handed to the free elements would be wrong.
+                let v = self.read_coll_elem(k).map(|v| v.to_u128()).unwrap_or(0);
+                fixed_sum += v as i128;
             } else {
                 free.push(k.clone());
             }
@@ -2063,7 +2114,17 @@ impl Simulator {
                 }
             };
             rem -= give;
-            self.write_coll_elem(&free[idx], Value::from_u64((lo + give) as u64, width));
+            // A distributed share can exceed u64::MAX for wide elements
+            // (`lo + give` counts up to the 2^width domain); `from_u64`
+            // would truncate it back to the low word and the sum would
+            // silently miss its target.
+            let share = lo + give;
+            let val = if width > 64 {
+                Value::from_u128(share as u128, width)
+            } else {
+                Value::from_u64(share as u64, width)
+            };
+            self.write_coll_elem(&free[idx], val);
             pinned.insert(free[idx].clone());
         }
     }
@@ -2990,6 +3051,15 @@ impl Simulator {
         if self.randomize_budget_depth == 0 {
             self.randomize_budget_deadline = None;
         }
+    }
+
+    /// True when the current randomize() call has passed its
+    /// `+xezim_rand_timeout` deadline (no deadline armed → false). Used
+    /// inside long per-element retry/sweep loops so a single trial cannot
+    /// grind unboundedly past the budget.
+    pub(super) fn rand_past_deadline(&self) -> bool {
+        self.randomize_budget_deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
     }
 
     pub(super) fn take_randomize_budget(

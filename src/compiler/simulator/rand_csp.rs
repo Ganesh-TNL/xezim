@@ -5358,6 +5358,133 @@ impl Simulator {
         })
     }
 
+    /// `LHS REL (expr << v)` (either way round) with `v` a solver variable
+    /// of a small domain: a shift by a variable amount is not affine, so
+    /// the relation would drop to a `Fun` node that only narrows its
+    /// variable once every variable the shift reads is fixed — a pinned
+    /// left side (`xfer_byte_cnt == (req.len + 1) << req.size` with
+    /// `req.len <= 255` and `req.size <= 4`) then defeats the search,
+    /// which cannot refute the relation within its budget although
+    /// reasoning over the cases proves it instantly. Per value `k` of `v`
+    /// the shift is by a constant, so the case is the affine
+    /// `LHS REL expr * 2**k` (§11.4.10, `csp_ae`); the guard `v == k`
+    /// makes it hold only at that value, and a refuted case refutes its
+    /// guard, so propagation alone settles the relation. The cases cover
+    /// the whole declared domain of `v`, so the split is exact.
+    #[allow(clippy::too_many_arguments)]
+    fn csp_shl_split(
+        &mut self,
+        csp: &mut Csp,
+        whole: &Expression,
+        op: BinaryOp,
+        left: &Expression,
+        right: &Expression,
+        env: &Env,
+        neg: bool,
+    ) -> Option<Node> {
+        // The shift on one side; the relation keeps its direction, since
+        // each case rebuilds the same comparison with the amount replaced.
+        let (shift, shift_left) = match &Self::unparen(left).kind {
+            ExprKind::Binary {
+                op: BinaryOp::ShiftLeft | BinaryOp::ArithShiftLeft,
+                ..
+            } => (left, true),
+            _ => match &Self::unparen(right).kind {
+                ExprKind::Binary {
+                    op: BinaryOp::ShiftLeft | BinaryOp::ArithShiftLeft,
+                    ..
+                } => (right, false),
+                _ => return None,
+            },
+        };
+        let ExprKind::Binary {
+            op: shift_op,
+            left: base,
+            right: amt,
+        } = &Self::unparen(shift).kind
+        else {
+            return None;
+        };
+        // A variable amount: a constant one is already affine (`csp_ae`).
+        if self.csp_free(csp, amt, env) {
+            return None;
+        }
+        // The amount must be one solver variable of a small domain of
+        // non-negative values below 63: the cases enumerate it, and the
+        // constant arm reads `a << k` as `a * 2**k` only for such a k.
+        let Ae::Var(v, ..) = self.csp_ae(csp, amt, env)? else {
+            return None;
+        };
+        let dom = csp.dom0[v].clone();
+        if dom_size(&dom) > 64 || dom.iter().any(|&(l, h)| l < 0 || h >= 63) {
+            return None;
+        }
+        let ph = "__xz_shl_ix";
+        let amt_ph = Self::csp_ph_ident(ph, whole.span);
+        // `v == k`: the guard of the case for `k`.
+        let cond = Expression::new(
+            ExprKind::Binary {
+                op: BinaryOp::Eq,
+                left: amt.clone(),
+                right: Box::new(amt_ph.clone()),
+            },
+            whole.span,
+        );
+        // The relation with the amount replaced by the placeholder, which
+        // the case binds to its value.
+        let body = |amt_ph: Expression| {
+            let shifted = Expression::new(
+                ExprKind::Binary {
+                    op: *shift_op,
+                    left: base.clone(),
+                    right: Box::new(amt_ph),
+                },
+                whole.span,
+            );
+            let (l, r) = if shift_left {
+                (shifted, right.clone())
+            } else {
+                (left.clone(), shifted)
+            };
+            Expression::new(
+                ExprKind::Binary {
+                    op,
+                    left: Box::new(l),
+                    right: Box::new(r),
+                },
+                whole.span,
+            )
+        };
+        let mut out = Vec::new();
+        for &(l, h) in &dom {
+            for k in l..=h {
+                let mut ek = env.clone();
+                ek.binds
+                    .push((ph.to_string(), Self::signed_loop_val(k as i64)));
+                let c = self.csp_bool(csp, &cond, &ek, false)?;
+                if matches!(c, Node::False) {
+                    continue;
+                }
+                let then = self.csp_bool(csp, &body(amt_ph.clone()), &ek.guarded(&c), neg)?;
+                if matches!(then, Node::True) {
+                    continue;
+                }
+                if matches!(c, Node::True) {
+                    out.push(then);
+                    continue;
+                }
+                let nc = self.csp_bool(csp, &cond, &ek, true)?;
+                out.push(Node::If {
+                    cond: Box::new(c),
+                    ncond: Box::new(nc),
+                    then: Box::new(then),
+                    els: Box::new(Node::True),
+                });
+            }
+        }
+        Some(Self::csp_and(out))
+    }
+
     /// `left op right` (§11.6.1: both sides extended to the context width
     /// and signedness).
     #[allow(clippy::too_many_arguments)]
@@ -5402,6 +5529,13 @@ impl Simulator {
         // randomize() reports failure (issue #229) even though `x < 256`,
         // its exact equivalent, solves instantly.
         if !wide && let Some(n) = self.csp_shr_rel(csp, whole, op, left, right, env, neg) {
+            return Some(n);
+        }
+        // A shift by a VARIABLE amount on one side: split it over the
+        // amount's values (`csp_shl_split`) before the affine attempt
+        // below fails on it and the relation drops to a late `Fun` node
+        // that cannot refute a pinned web.
+        if !wide && let Some(n) = self.csp_shl_split(csp, whole, op, left, right, env, neg) {
             return Some(n);
         }
         if matches!(op, BinaryOp::Eq | BinaryOp::CaseEq) && !neg && !wide {
